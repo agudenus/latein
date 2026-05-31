@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-terminal-bg text-terminal-text font-mono;
+    margin: 0;
+  }
+}
+
+@layer utilities {
+  /* tabular numbers so columns of figures align */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+}
