@@ -12,8 +12,9 @@ The core idea: prediction market prices represent implied probabilities. When re
 
 **Early stage — no code yet.** The repository was repurposed from a previous project. The owner is providing research material about Polymarket and arbitrage strategies, which informs the architecture and implementation. Do not assume implementation details described below are final until code exists.
 
-Research collected so far lives in `docs/research/`:
+Research collected so far lives in `research/`:
 - `awesome-prediction-market-tools.md` — survey of the prediction-market tool ecosystem: existing arbitrage tools (competitive landscape), data/API providers, and open-source projects worth studying (Polymarket JB Bot, PMXT, TREMOR, pykalshi).
+- `arbitrage-analysis-polymarket-nba.md` — summary of arXiv:2605.00864 (UCLA): single-market YES/NO arbitrage is nearly extinct (7 episodes, ~3.6s median); combinatorial arbitrage between logically dependent markets (moneyline vs. spread) is the real opportunity (~101 bps median) but is depth-constrained to retail size. Key design consequences: depth-aware profit math is mandatory, and cross-market logical-dependency detection matters more than single-market scanning.
 
 ## Domain Context
 
@@ -37,4 +38,4 @@ Execution/trading automation is out of scope unless the owner explicitly request
 
 - Tech stack is not yet decided; propose one when implementation begins and confirm with the owner if the choice is significant.
 - Never commit API keys, private keys, or wallet credentials. Use environment variables and keep a `.env` in `.gitignore`.
-- Research documents provided by the owner should be stored under `docs/research/` and treated as the source of truth for strategy details.
+- Research documents provided by the owner should be stored under `research/` and treated as the source of truth for strategy details.
