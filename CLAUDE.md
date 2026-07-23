@@ -10,7 +10,10 @@ The core idea: prediction market prices represent implied probabilities. When re
 
 ## Current Status
 
-**Early stage — no code yet.** The repository was repurposed from a previous project. The owner will provide research material about Polymarket and arbitrage strategies, which will inform the architecture and implementation. Do not assume implementation details described below are final until code exists.
+**Early stage — no code yet.** The repository was repurposed from a previous project. The owner is providing research material about Polymarket and arbitrage strategies, which informs the architecture and implementation. Do not assume implementation details described below are final until code exists.
+
+Research collected so far lives in `docs/research/`:
+- `awesome-prediction-market-tools.md` — survey of the prediction-market tool ecosystem: existing arbitrage tools (competitive landscape), data/API providers, and open-source projects worth studying (Polymarket JB Bot, PMXT, TREMOR, pykalshi).
 
 ## Domain Context
 
