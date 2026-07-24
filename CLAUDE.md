@@ -28,13 +28,19 @@ Key concepts Claude should know when working here:
 - **CLOB API**: Polymarket runs a central limit order book. Public REST/WebSocket APIs expose markets, order books, and prices (see https://docs.polymarket.com).
 - **Practical frictions** that any arbitrage math must account for: order book depth/slippage, gas/transaction fees, resolution risk, capital lockup until resolution, and API rate limits.
 
-## Planned Scope (subject to change once research is provided)
+## Planned Scope
 
 1. **Market data ingestion** — fetch markets and order books from Polymarket's public APIs.
-2. **Arbitrage detection** — scan for intra-market (YES/NO sum), cross-outcome (negative-risk), and potentially cross-platform mispricings.
+2. **Arbitrage detection** — scan for intra-market (YES/NO sum), cross-outcome (negative-risk), and combinatorial mispricings, filtered through the execution-cost model in `research/execution-costs-and-arb-filtering.md`.
 3. **Opportunity reporting** — surface opportunities with expected profit, required capital, depth-adjusted sizing, and risk notes.
+4. **Execution** — the owner has explicitly requested trading automation (2026-07): the bot will trade detected arbs with a dedicated wallet funded by the owner. Execution must ship behind a dry-run mode first, with per-trade and total exposure caps, and live trading only enabled by an explicit config flag.
 
-Execution/trading automation is out of scope unless the owner explicitly requests it.
+## Wallet & Security Rules (non-negotiable)
+
+- The trading wallet is a **dedicated hot wallet funded only with capital the owner can afford to lose** — never a main wallet.
+- Private keys and API credentials live **only in environment variables / deployment secrets** (`.env` is gitignored). Never in code, config files, logs, chat, or commits.
+- Every execution path must respect: max order size, max total exposure, max open positions, and a global kill switch.
+- Default mode is **dry-run** (log intended orders, don't send). Live mode requires an explicit opt-in flag.
 
 ## Conventions
 
