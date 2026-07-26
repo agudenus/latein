@@ -343,15 +343,20 @@ mod tests {
     #[test]
     fn net_floor_falls_back_to_default() {
         let cfg = Config::default();
-        assert_eq!(cfg.net_floor_for(&Category::new("geopolitics")), dec!(0.003));
+        assert_eq!(
+            cfg.net_floor_for(&Category::new("geopolitics")),
+            dec!(0.003)
+        );
         assert_eq!(cfg.net_floor_for(&Category::new("politics")), dec!(0.005));
         assert_eq!(cfg.net_floor_for(&Category::new("nonsense")), dec!(0.005));
     }
 
     #[test]
     fn live_mode_is_rejected_in_phase_a() {
-        let mut cfg = Config::default();
-        cfg.mode = "live".into();
+        let cfg = Config {
+            mode: "live".into(),
+            ..Config::default()
+        };
         assert!(cfg.validate().is_err());
     }
 

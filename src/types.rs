@@ -61,8 +61,8 @@ impl Category {
             "finance" | "business" | "stocks" | "markets" => "finance",
             "tech" | "technology" | "ai" => "tech",
             "mentions" | "mention" => "mentions",
-            "sports" | "nba" | "nfl" | "mlb" | "nhl" | "soccer" | "football" | "tennis"
-            | "epl" | "ufc" => "sports",
+            "sports" | "nba" | "nfl" | "mlb" | "nhl" | "soccer" | "football" | "tennis" | "epl"
+            | "ufc" => "sports",
             "economics" | "economy" | "econ" | "inflation" | "fed" => "economics",
             "culture" | "pop-culture" | "pop culture" | "entertainment" | "movies" | "music" => {
                 "culture"
@@ -149,11 +149,15 @@ impl OrderBook {
     }
 
     pub fn best_bid(&self) -> Option<Decimal> {
-        self.bids.first().map(|l| l.price)
+        self.best(Side::Bid)
     }
 
     pub fn best_ask(&self) -> Option<Decimal> {
-        self.asks.first().map(|l| l.price)
+        self.best(Side::Ask)
+    }
+
+    pub fn best(&self, side: Side) -> Option<Decimal> {
+        self.levels(side).first().map(|l| l.price)
     }
 
     pub fn spread(&self) -> Option<Decimal> {

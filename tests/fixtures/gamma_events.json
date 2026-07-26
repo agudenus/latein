@@ -1,0 +1,121 @@
+[
+  {
+    "id": "12345",
+    "slug": "presidential-election-2028",
+    "title": "Presidential Election Winner 2028",
+    "negRisk": true,
+    "category": "Politics",
+    "active": true,
+    "closed": false,
+    "liquidity": "184213.44",
+    "volume": "9182734.11",
+    "tags": [
+      { "id": "2", "label": "Politics", "slug": "politics" },
+      { "id": "9", "label": "Elections", "slug": "elections" }
+    ],
+    "markets": [
+      {
+        "id": "500123",
+        "conditionId": "0xaaa1111111111111111111111111111111111111111111111111111111111111",
+        "question": "Will candidate A win the 2028 presidential election?",
+        "clobTokenIds": "[\"1001\",\"1002\"]",
+        "outcomes": "[\"Yes\",\"No\"]",
+        "outcomePrices": "[\"0.42\",\"0.58\"]",
+        "active": true,
+        "closed": false,
+        "enableOrderBook": true,
+        "orderPriceMinTickSize": 0.01,
+        "someFutureField": { "we": "ignore this" }
+      },
+      {
+        "id": "500124",
+        "conditionId": "0xbbb2222222222222222222222222222222222222222222222222222222222222",
+        "question": "Will candidate B win the 2028 presidential election?",
+        "clobTokenIds": "[\"1003\",\"1004\"]",
+        "outcomes": "[\"Yes\",\"No\"]",
+        "active": true,
+        "closed": false,
+        "enableOrderBook": true
+      },
+      {
+        "id": "500125",
+        "conditionId": "0xccc3333333333333333333333333333333333333333333333333333333333333",
+        "question": "Will candidate C (withdrawn) win the 2028 presidential election?",
+        "clobTokenIds": "[\"1005\",\"1006\"]",
+        "outcomes": "[\"Yes\",\"No\"]",
+        "active": false,
+        "closed": true,
+        "enableOrderBook": true
+      }
+    ]
+  },
+  {
+    "id": 21055,
+    "slug": "nfl-week-1-team-x-vs-team-y",
+    "title": "Team X vs Team Y",
+    "negRisk": false,
+    "active": true,
+    "closed": false,
+    "tags": [{ "id": "1", "label": "Sports", "slug": "sports" }],
+    "markets": [
+      {
+        "id": "500200",
+        "conditionId": "0xddd4444444444444444444444444444444444444444444444444444444444444",
+        "question": "Will Team X beat Team Y?",
+        "clobTokenIds": ["2001", "2002"],
+        "outcomes": ["Yes", "No"],
+        "active": true,
+        "closed": false,
+        "enableOrderBook": true
+      }
+    ]
+  },
+  {
+    "id": "31000",
+    "slug": "already-resolved-event",
+    "title": "Already resolved",
+    "negRisk": true,
+    "category": "Crypto",
+    "active": false,
+    "closed": true,
+    "markets": [
+      {
+        "id": "500300",
+        "conditionId": "0xeee5555555555555555555555555555555555555555555555555555555555555",
+        "question": "Resolved already?",
+        "clobTokenIds": "[\"3001\",\"3002\"]",
+        "outcomes": "[\"Yes\",\"No\"]",
+        "active": false,
+        "closed": true
+      }
+    ]
+  },
+  {
+    "id": "41000",
+    "slug": "malformed-market-event",
+    "title": "Event whose markets cannot be priced",
+    "negRisk": false,
+    "category": "Geopolitics",
+    "active": true,
+    "closed": false,
+    "markets": [
+      {
+        "id": "500400",
+        "conditionId": "0xfff6666666666666666666666666666666666666666666666666666666666666",
+        "question": "Only one token id?",
+        "clobTokenIds": "[\"4001\"]",
+        "outcomes": "[\"Yes\",\"No\"]",
+        "active": true,
+        "closed": false
+      },
+      {
+        "id": "500401",
+        "question": "No conditionId at all",
+        "clobTokenIds": "[\"4002\",\"4003\"]",
+        "outcomes": "[\"Yes\",\"No\"]",
+        "active": true,
+        "closed": false
+      }
+    ]
+  }
+]
