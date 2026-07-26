@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
@@ -291,6 +291,7 @@ impl Store {
     }
 
     /// In-memory database — used by the tests.
+    #[cfg(test)]
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(|source| StoreError::Sqlite {
             path: ":memory:".to_string(),
@@ -590,17 +591,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn daily_summary(&self, day: NaiveDate) -> Result<Option<String>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT markdown FROM daily_summaries WHERE day = ?1",
-            params![day.to_string()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| self.err(e))
-    }
-
     /// Any row still `open` — used at startup to close out rows a crash left behind.
     pub fn close_stale_open_rows(&self, now: DateTime<Utc>) -> Result<usize> {
         let conn = self.lock();
@@ -745,11 +735,9 @@ fn day_bounds(day: NaiveDate) -> (String, String) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::types::{
-        Category, Label, Leg, OpportunityKind, OrderBook, PriceLevel, TokenId,
-    };
+    use crate::types::{Category, Label, Leg, OpportunityKind, OrderBook, PriceLevel, TokenId};
     use rust_decimal_macros::dec as d;
 
     pub(crate) fn sample_opportunity() -> Opportunity {
@@ -919,7 +907,13 @@ mod tests {
         assert!(a.is_new());
         assert!(!b.is_new() && !c.is_new());
         assert_eq!(a.id(), b.id());
-        assert_eq!(c, Recorded::Repeat { id: a.id(), seen_count: 3 });
+        assert_eq!(
+            c,
+            Recorded::Repeat {
+                id: a.id(),
+                seen_count: 3
+            }
+        );
 
         let rows = store
             .opportunities_for_day(t0.date_naive())
@@ -1007,9 +1001,7 @@ mod tests {
             )
             .expect("record cycle");
 
-        let totals = store
-            .scan_totals_for_day(t0.date_naive())
-            .expect("totals");
+        let totals = store.scan_totals_for_day(t0.date_naive()).expect("totals");
         assert_eq!(totals.cycles, 4);
         assert_eq!(totals.errors, 1);
         assert_eq!(totals.duration_ms_total, 100 + 110 + 120 + 90);

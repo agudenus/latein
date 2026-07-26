@@ -44,6 +44,24 @@ Key concepts Claude should know when working here:
 - Every execution path must respect: max order size, max total exposure, max open positions, and a global kill switch.
 - Default mode is **dry-run** (log intended orders, don't send). Live mode requires an explicit opt-in flag.
 
+## Codebase Layout
+
+Rust binary crate `polyarb` (Phase A: scanner + dry-run only; no wallet/key code exists).
+
+- `src/main.rs` — CLI: `markets` (universe discovery), `scan` (one-shot detection), `run` (dry-run daemon; refuses any mode other than `dry-run`), `report [--date]` (daily summary).
+- `src/gamma.rs` / `src/clob.rs` / `src/http.rs` — Gamma `/events` discovery, CLOB batch book fetch, shared throttled/retrying transport.
+- `src/types.rs` — Decimal-only domain types (**no f64 in any money path — enforced convention**).
+- `src/costs.rs` — verified fee curve + cost decomposition (`net_maker = gross_gap + spread_cost` identity).
+- `src/detect.rs` — binary, NegRisk YES-side, NegRisk NO-side detectors; depth-walked joint sizing.
+- `src/risk.rs` — per-trade cap (Phase A scope).
+- `src/store.rs` — SQLite persistence; money stored as TEXT Decimal strings, never REAL.
+- `src/dryrun.rs` — daemon loop, opportunity lifecycle (filled_simulated vs vanished decided by first re-poll, never revised), daily summaries.
+- `src/alert.rs` — Telegram send-only alerts with JSONL fallback + circuit breaker; token never logged.
+- `config/default.toml` — all knobs; secrets only via env (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
+- `tests/fixtures/` — recorded API-shape fixtures (live Polymarket APIs unreachable from dev container; `TODO(verify-live)` markers track unverified API shape assumptions).
+
+Quality gate for every change: `cargo build && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check`.
+
 ## Conventions
 
 - Tech stack is not yet decided; propose one when implementation begins and confirm with the owner if the choice is significant.

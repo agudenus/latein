@@ -10,6 +10,14 @@
 #   POLYARB_PER_TRADE_CAP_USD   risk.per_trade_cap_usd
 #   POLYARB_NET_FLOOR_DEFAULT   scan.net_floor.default
 #   POLYARB_MODE                mode
+#   POLYARB_DB_PATH             storage.database_path
+#   POLYARB_LOG_DIR             storage.log_dir
+#   POLYARB_REPORT_DIR          storage.report_dir
+#   POLYARB_SCAN_INTERVAL_SECS  daemon.scan_interval_secs
+#   POLYARB_ALERT_MIN_NET       alerts.alert_min_net_per_share
+#
+# Alert credentials are read from the environment only and never appear here:
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # Only "dry-run" is implemented. Live execution is a later milestone behind an
 # explicit opt-in flag.
@@ -51,6 +59,47 @@ geopolitics = 0.003
 [risk]
 # Hard per-opportunity capital cap in USDC, applied inside the depth walker.
 per_trade_cap_usd = 50
+
+# ---------------------------------------------------------------------------------
+# M3 — `polyarb run` dry-run daemon
+# ---------------------------------------------------------------------------------
+
+[daemon]
+# Books are re-fetched and re-scanned this often.
+scan_interval_secs = 5
+# The market universe (Gamma /events) is refreshed on a much slower cadence.
+universe_refresh_secs = 600
+# UTC time-of-day at which the daily summary is generated, stored and alerted.
+daily_summary_utc = "23:55"
+
+[lifecycle]
+# After detection an opportunity's legs are re-polled on this cadence, for this long,
+# to measure how long it actually persisted and whether the walked fills survived.
+repoll_interval_secs = 2
+repoll_window_secs = 30
+# Cap on simultaneously tracked opportunities; the excess is recorded as "untracked"
+# rather than quietly biasing the persistence statistics.
+max_concurrent = 32
+
+[alerts]
+enabled = true
+# Minimum net profit per share before an opportunity is alerted (maker net is used for
+# maker-only constructions). Everything detected is still written to the event log.
+alert_min_net_per_share = 0.01
+# Anti-spam spacing between opportunity alerts; daily summaries ignore it.
+min_seconds_between_alerts = 30
+# Consecutive Telegram failures before the circuit breaker opens, and how long it stays
+# open before one alert is let through as a re-probe.
+failure_circuit_break = 3
+circuit_reprobe_secs = 900
+telegram_api_base = "https://api.telegram.org"
+request_timeout_secs = 10
+
+[storage]
+# All three are gitignored.
+database_path = "data/polyarb.sqlite"
+log_dir = "logs"
+report_dir = "reports"
 
 # Taker fee rates: fee = shares * rate * p * (1 - p). Makers pay zero.
 # Verified against https://docs.polymarket.com/trading/fees (2026-07). Re-check

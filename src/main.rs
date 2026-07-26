@@ -1,15 +1,18 @@
 //! polyarb — Polymarket arbitrage scanner.
 //!
-//! Phase A, milestones M1 (`markets`) and M2 (`scan`). Read-only: this binary never
-//! signs, never places orders, and needs no wallet or API credentials.
+//! Phase A, milestones M1 (`markets`), M2 (`scan`) and M3 (`run`, `report`). Read-only:
+//! this binary never signs, never places orders, and needs no wallet or API credentials.
 
+mod alert;
 mod clob;
 mod config;
 mod costs;
 mod detect;
+mod dryrun;
 mod gamma;
 mod http;
 mod risk;
+mod store;
 mod types;
 
 use std::collections::BTreeMap;
@@ -66,6 +69,26 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Continuous dry-run daemon: scan, persist, track lifecycles, alert, summarise.
+    ///
+    /// Never places an order. Refuses to start unless `mode = "dry-run"`.
+    Run {
+        /// Override scan.max_events for this run.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Stop after this many scan cycles (default: run until SIGINT/SIGTERM).
+        #[arg(long, value_name = "N")]
+        max_cycles: Option<u64>,
+    },
+    /// Generate the daily summary for a UTC date (default: today).
+    Report {
+        /// UTC date as YYYY-MM-DD.
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        date: Option<String>,
+        /// Write the report without emitting it through the alert path.
+        #[arg(long)]
+        no_send: bool,
+    },
 }
 
 #[tokio::main]
@@ -87,6 +110,22 @@ async fn main() -> Result<()> {
                 cfg.scan.max_events = n;
             }
             run_scan(&cfg, json).await
+        }
+        Command::Run { limit, max_cycles } => {
+            if let Some(n) = limit {
+                cfg.scan.max_events = n;
+            }
+            dryrun::run(cfg, max_cycles).await
+        }
+        Command::Report { date, no_send } => {
+            let day = match date {
+                Some(raw) => Some(
+                    chrono::NaiveDate::parse_from_str(&raw, "%Y-%m-%d")
+                        .with_context(|| format!("--date must be YYYY-MM-DD (got {raw:?})"))?,
+                ),
+                None => None,
+            };
+            dryrun::report(&cfg, day, !no_send).await
         }
     }
 }
@@ -348,7 +387,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_parses_both_subcommands() {
+    fn cli_parses_every_subcommand() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
 
@@ -363,6 +402,25 @@ mod tests {
                 ..
             }
         ));
+
+        let cli = Cli::try_parse_from(["polyarb", "run", "--max-cycles", "3"]).expect("run");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                max_cycles: Some(3),
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["polyarb", "report", "--date", "2026-07-26", "--no-send"])
+            .expect("report");
+        match cli.command {
+            Command::Report { date, no_send } => {
+                assert_eq!(date.as_deref(), Some("2026-07-26"));
+                assert!(no_send);
+            }
+            other => panic!("expected report, got {other:?}"),
+        }
     }
 
     #[test]

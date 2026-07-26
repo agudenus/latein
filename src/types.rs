@@ -488,6 +488,20 @@ mod tests {
         assert_eq!(m.no_token().as_str(), "a");
     }
 
+    /// The database and the dedupe key store `as_str()`; JSON stores the serde name.
+    /// If they ever diverge, historical rows stop matching new ones.
+    #[test]
+    fn opportunity_kind_names_match_their_serde_form() {
+        for kind in [
+            OpportunityKind::BinaryYesNo,
+            OpportunityKind::NegRiskYesSide,
+            OpportunityKind::NegRiskNoSide,
+        ] {
+            let json = serde_json::to_string(&kind).expect("serialise");
+            assert_eq!(json, format!("\"{}\"", kind.as_str()));
+        }
+    }
+
     #[test]
     fn decimal_deserializes_from_string_and_number() {
         #[derive(Deserialize)]

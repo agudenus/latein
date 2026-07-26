@@ -51,6 +51,18 @@ pub struct Config {
     pub scan: ScanConfig,
     #[serde(default)]
     pub risk: RiskConfig,
+    /// M3 dry-run daemon: loop cadences and the daily-summary clock.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
+    /// M3 opportunity lifecycle re-polling.
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
+    /// M3 alerting. Credentials are *never* here — only in the environment.
+    #[serde(default)]
+    pub alerts: AlertConfig,
+    /// M3 on-disk locations for the database, the JSONL event log and the reports.
+    #[serde(default)]
+    pub storage: StorageConfig,
     /// Category → taker fee rate. Verified against docs.polymarket.com 2026-07; kept in
     /// config because the protocol can change them.
     #[serde(default = "default_fee_rates")]
@@ -98,6 +110,60 @@ pub struct ScanConfig {
 pub struct RiskConfig {
     /// Hard per-opportunity capital cap in USDC. Applied inside the depth walker.
     pub per_trade_cap_usd: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// Seconds between book scans.
+    pub scan_interval_secs: u64,
+    /// Seconds between market-universe (Gamma) refreshes. Much slower than the book scan:
+    /// events appear and close on a human timescale, books move continuously.
+    pub universe_refresh_secs: u64,
+    /// UTC wall-clock time (`HH:MM`) at which the daily summary is generated and alerted.
+    pub daily_summary_utc: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleConfig {
+    /// Seconds between re-polls of a detected opportunity's legs.
+    pub repoll_interval_secs: u64,
+    /// How long to keep re-polling before closing the opportunity out.
+    pub repoll_window_secs: u64,
+    /// Cap on concurrently tracked opportunities; the excess is recorded `untracked`
+    /// rather than silently distorting the persistence statistics.
+    pub max_concurrent: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertConfig {
+    /// Master switch for outbound alerts. The JSONL event log is written either way.
+    pub enabled: bool,
+    /// Minimum net profit per share for an opportunity to be alerted (maker net is used
+    /// for maker-only constructions).
+    pub alert_min_net_per_share: Decimal,
+    /// Anti-spam spacing between routine (opportunity) alerts. Daily summaries ignore it.
+    pub min_seconds_between_alerts: u64,
+    /// Consecutive delivery failures before the circuit breaker opens.
+    pub failure_circuit_break: u32,
+    /// How long the breaker stays open before the next attempt is allowed through.
+    pub circuit_reprobe_secs: u64,
+    /// Bot API base. Overridable so tests never touch the real host.
+    pub telegram_api_base: String,
+    pub request_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// SQLite file. Parent directories are created on demand.
+    pub database_path: String,
+    /// Directory for `events.jsonl`.
+    pub log_dir: String,
+    /// Directory for the generated daily-summary markdown.
+    pub report_dir: String,
 }
 
 fn default_mode() -> String {
@@ -166,6 +232,50 @@ impl Default for RiskConfig {
     }
 }
 
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            scan_interval_secs: 5,
+            universe_refresh_secs: 600,
+            daily_summary_utc: "23:55".to_string(),
+        }
+    }
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            repoll_interval_secs: 2,
+            repoll_window_secs: 30,
+            max_concurrent: 32,
+        }
+    }
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            alert_min_net_per_share: Decimal::new(1, 2),
+            min_seconds_between_alerts: 30,
+            failure_circuit_break: 3,
+            circuit_reprobe_secs: 900,
+            telegram_api_base: "https://api.telegram.org".to_string(),
+            request_timeout_secs: 10,
+        }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            database_path: "data/polyarb.sqlite".to_string(),
+            log_dir: "logs".to_string(),
+            report_dir: "reports".to_string(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -173,6 +283,10 @@ impl Default for Config {
             api: ApiConfig::default(),
             scan: ScanConfig::default(),
             risk: RiskConfig::default(),
+            daemon: DaemonConfig::default(),
+            lifecycle: LifecycleConfig::default(),
+            alerts: AlertConfig::default(),
+            storage: StorageConfig::default(),
             fees: default_fee_rates(),
         }
     }
@@ -237,6 +351,21 @@ impl Config {
         if let Some(v) = env_str("POLYARB_MODE") {
             self.mode = v;
         }
+        if let Some(v) = env_str("POLYARB_DB_PATH") {
+            self.storage.database_path = v;
+        }
+        if let Some(v) = env_str("POLYARB_LOG_DIR") {
+            self.storage.log_dir = v;
+        }
+        if let Some(v) = env_str("POLYARB_REPORT_DIR") {
+            self.storage.report_dir = v;
+        }
+        if let Some(v) = env_u64("POLYARB_SCAN_INTERVAL_SECS")? {
+            self.daemon.scan_interval_secs = v;
+        }
+        if let Some(v) = env_decimal("POLYARB_ALERT_MIN_NET")? {
+            self.alerts.alert_min_net_per_share = v;
+        }
         Ok(())
     }
 
@@ -277,7 +406,73 @@ impl Config {
                 "fees must contain an \"other\" entry (used as the fallback rate)".into(),
             ));
         }
+
+        // ---- M3 daemon ---------------------------------------------------------------
+        if self.daemon.scan_interval_secs == 0 || self.daemon.universe_refresh_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "daemon.scan_interval_secs and daemon.universe_refresh_secs must be > 0".into(),
+            ));
+        }
+        self.daily_summary_time()?;
+        if self.lifecycle.repoll_interval_secs == 0 || self.lifecycle.repoll_window_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "lifecycle.repoll_interval_secs and lifecycle.repoll_window_secs must be > 0"
+                    .into(),
+            ));
+        }
+        if self.lifecycle.repoll_interval_secs > self.lifecycle.repoll_window_secs {
+            return Err(ConfigError::Invalid(
+                "lifecycle.repoll_interval_secs must not exceed lifecycle.repoll_window_secs \
+                 (otherwise no re-poll ever lands and nothing is ever confirmed)"
+                    .into(),
+            ));
+        }
+        if self.lifecycle.max_concurrent == 0 {
+            return Err(ConfigError::Invalid(
+                "lifecycle.max_concurrent must be > 0".into(),
+            ));
+        }
+        if self.alerts.alert_min_net_per_share < Decimal::ZERO {
+            return Err(ConfigError::Invalid(
+                "alerts.alert_min_net_per_share must be >= 0".into(),
+            ));
+        }
+        if self.alerts.failure_circuit_break == 0 {
+            return Err(ConfigError::Invalid(
+                "alerts.failure_circuit_break must be > 0".into(),
+            ));
+        }
+        if self.alerts.request_timeout_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "alerts.request_timeout_secs must be > 0".into(),
+            ));
+        }
+        if self.alerts.telegram_api_base.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "alerts.telegram_api_base must not be empty".into(),
+            ));
+        }
+        if self.storage.database_path.trim().is_empty()
+            || self.storage.log_dir.trim().is_empty()
+            || self.storage.report_dir.trim().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "storage.database_path, storage.log_dir and storage.report_dir must be set".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Parsed `daemon.daily_summary_utc`.
+    pub fn daily_summary_time(&self) -> Result<chrono::NaiveTime, ConfigError> {
+        chrono::NaiveTime::parse_from_str(self.daemon.daily_summary_utc.trim(), "%H:%M").map_err(
+            |_| {
+                ConfigError::Invalid(format!(
+                    "daemon.daily_summary_utc must be UTC \"HH:MM\" (got {:?})",
+                    self.daemon.daily_summary_utc
+                ))
+            },
+        )
     }
 
     /// Minimum acceptable net profit per share for a category.
@@ -305,6 +500,17 @@ fn env_str(var: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn env_u64(var: &'static str) -> Result<Option<u64>, ConfigError> {
+    match env_str(var) {
+        None => Ok(None),
+        Some(raw) => raw.parse::<u64>().map(Some).map_err(|_| ConfigError::Env {
+            var,
+            expected: "positive integer",
+            value: raw,
+        }),
+    }
 }
 
 fn env_decimal(var: &'static str) -> Result<Option<Decimal>, ConfigError> {
@@ -364,6 +570,103 @@ mod tests {
     fn unknown_config_keys_are_rejected_loudly() {
         let err = Config::from_toml_str("mode = \"dry-run\"\nnot_a_key = 1\n");
         assert!(err.is_err(), "typos in config must not be silently ignored");
+    }
+
+    #[test]
+    fn shipped_config_carries_the_m3_sections() {
+        let cfg = Config::from_toml_str(SHIPPED).expect("parse");
+        cfg.validate().expect("validate");
+        assert_eq!(cfg.daemon.scan_interval_secs, 5);
+        assert_eq!(cfg.daemon.universe_refresh_secs, 600);
+        assert_eq!(cfg.daemon.daily_summary_utc, "23:55");
+        assert_eq!(cfg.lifecycle.repoll_interval_secs, 2);
+        assert_eq!(cfg.lifecycle.repoll_window_secs, 30);
+        assert_eq!(cfg.lifecycle.max_concurrent, 32);
+        assert!(cfg.alerts.enabled);
+        assert_eq!(cfg.alerts.alert_min_net_per_share, dec!(0.01));
+        assert_eq!(cfg.alerts.telegram_api_base, "https://api.telegram.org");
+        assert_eq!(cfg.storage.database_path, "data/polyarb.sqlite");
+        assert_eq!(cfg.storage.log_dir, "logs");
+        assert_eq!(cfg.storage.report_dir, "reports");
+        assert_eq!(
+            cfg.daily_summary_time().expect("parses"),
+            chrono::NaiveTime::from_hms_opt(23, 55, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn shipped_config_contains_no_credentials() {
+        // Belt and braces for the CLAUDE.md rule: secrets live in the environment only.
+        // Comments may *name* the environment variables; no key may ever carry a value.
+        let settings: String = SHIPPED
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        for forbidden in ["token", "chat_id", "private_key", "secret", "api_key"] {
+            assert!(
+                !settings.contains(forbidden),
+                "config/default.toml must not define a {forbidden:?} setting"
+            );
+        }
+    }
+
+    #[test]
+    fn m3_sections_are_validated() {
+        let bad_interval = Config {
+            daemon: DaemonConfig {
+                scan_interval_secs: 0,
+                ..DaemonConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(bad_interval.validate().is_err());
+
+        let bad_clock = Config {
+            daemon: DaemonConfig {
+                daily_summary_utc: "midnight".into(),
+                ..DaemonConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(bad_clock.validate().is_err());
+
+        // A re-poll interval longer than the window would never confirm anything.
+        let bad_lifecycle = Config {
+            lifecycle: LifecycleConfig {
+                repoll_interval_secs: 60,
+                repoll_window_secs: 30,
+                max_concurrent: 4,
+            },
+            ..Config::default()
+        };
+        assert!(bad_lifecycle.validate().is_err());
+
+        let bad_threshold = Config {
+            alerts: AlertConfig {
+                alert_min_net_per_share: dec!(-0.01),
+                ..AlertConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(bad_threshold.validate().is_err());
+
+        let bad_storage = Config {
+            storage: StorageConfig {
+                database_path: "  ".into(),
+                ..StorageConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(bad_storage.validate().is_err());
+    }
+
+    #[test]
+    fn m3_sections_reject_unknown_keys() {
+        let err = Config::from_toml_str("[alerts]\nalert_min_net_per_shore = 0.01\n");
+        assert!(err.is_err(), "a typo in an M3 section must not be ignored");
     }
 
     #[test]
