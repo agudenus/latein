@@ -1,0 +1,82 @@
+# polyarb — dry-run soak deployment.
+#
+#   docker compose up -d --build     start (and build) in the background
+#   docker compose logs -f            watch it work
+#   docker compose down               stop
+#
+# Full walkthrough, including the one-time host directory permissions step that this file
+# depends on, is in docs/deploy.md.
+#
+# Safety: `mode` is locked to "dry-run" in config/default.toml and the daemon refuses to
+# start otherwise. Nothing here can place an order, and no wallet key exists to sign one.
+
+services:
+  polyarb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: polyarb:local
+    container_name: polyarb
+
+    # The soak is a week long and the point is unattended uptime: come back after a VPS
+    # reboot, an OOM kill or a panic. `unless-stopped` (rather than `always`) means a
+    # deliberate `docker compose stop` still stays stopped across a reboot.
+    restart: unless-stopped
+
+    # Optional Telegram credentials — and nothing else. When TELEGRAM_BOT_TOKEN or
+    # TELEGRAM_CHAT_ID is missing or blank, alerts degrade silently to logs/events.jsonl
+    # and the daemon carries on. `.env` must exist (copy .env.example); it is gitignored.
+    env_file:
+      - .env
+
+    # Bind mounts, not named volumes: during a soak you want to `cat reports/summary-*.md`
+    # and `tail -f logs/events.jsonl` from the host shell without exec'ing into anything,
+    # and you want the data to survive `docker compose down -v`.
+    #
+    # The container runs as uid 10001, so these three host directories must be owned by
+    # 10001 or the daemon dies on startup with "Permission denied". docs/deploy.md step 6.
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      # Uncomment to tune settings without rebuilding the image. The baked-in copy at
+      # /app/config/default.toml is used otherwise.
+      # - ./config/default.toml:/app/config/default.toml:ro
+
+    command: ["run"]
+
+    # This is a LIVENESS check, not a correctness check — be clear about what it proves.
+    #
+    # Every scan cycle upserts a `scan_stats` row, so the SQLite WAL is written every
+    # daemon.scan_interval_secs (5s by default). Crucially that happens even when the book
+    # fetch fails, because the failure path records the cycle too. So:
+    #   healthy   => the scan loop is turning
+    #   unhealthy => the loop is wedged, deadlocked or the process is gone
+    # It does NOT tell you the Polymarket APIs are answering, or that anything is being
+    # detected. For that, read the `errors` count in the daily report and grep the logs —
+    # docs/deploy.md, "Reviewing the soak".
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'newest=$$(ls -t /app/data/polyarb.sqlite* 2>/dev/null | head -1); [ -n "$$newest" ] && [ $$(( $$(date +%s) - $$(stat -c %Y "$$newest") )) -lt 180 ]'
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      # A cold start paginates the entire Gamma universe before the first cycle writes
+      # anything. Five minutes is slack, not an estimate — being marked unhealthy during
+      # startup would trigger a restart loop that never gets far enough to be healthy.
+      start_period: 300s
+
+    # SIGTERM is handled: the loop stops and the in-flight lifecycle re-polls are drained
+    # before exit. lifecycle.repoll_window_secs is 30, so give it more than that rather
+    # than SIGKILLing opportunities into the `unresolved` bucket on every restart.
+    stop_grace_period: 45s
+
+    # Without this, an info-level 5-second loop writes an unbounded json-file log and
+    # eventually fills a small VPS disk. 10 MB x 5 keeps roughly the last two weeks of
+    # scan-cycle lines, which comfortably covers a one-week soak review.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

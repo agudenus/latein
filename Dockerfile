@@ -69,9 +69,7 @@ RUN touch src/*.rs \
 FROM debian:bookworm-slim AS runtime
 
 LABEL org.opencontainers.image.title="polyarb" \
-      org.opencontainers.image.description="Polymarket arbitrage scanner — dry-run only, never places orders." \
-      org.opencontainers.image.source="https://github.com/gudenus/latein" \
-      org.opencontainers.image.licenses="UNLICENSED"
+      org.opencontainers.image.description="Polymarket arbitrage scanner — dry-run only, never places orders."
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
