@@ -17,15 +17,15 @@ Mechanism: detectors typically compute gaps on mid or last price, but execution 
 
 2026 Polymarket charges taker fees per share of `rate × p × (1 − p)` (Kalshi-style curve), which **peaks exactly at p = 0.50** — where arb gaps cluster, because that's where uncertainty and volatility are highest. Category rates as given by the guide:
 
-| Category | Taker fee rate |
-|---|---|
-| crypto | 0.072 |
-| economics, culture, weather, other | 0.05 |
-| finance, politics, tech | 0.04 |
-| sports | 0.03 |
-| geopolitics | 0.0 (free both sides) |
+| Category | Taker fee rate (guide) | **Verified rate (official docs, 2026-07)** |
+|---|---|---|
+| crypto | 0.072 | **0.07** |
+| economics, culture, weather, other | 0.05 | **0.05** ✓ |
+| finance, politics, tech (+ mentions) | 0.04 | **0.04** ✓ |
+| sports | 0.03 | **0.05** (guide was wrong) |
+| geopolitics | 0.0 | **0.0** ✓ (fee-free both sides) |
 
-> **⚠️ Verify before implementation:** these rates and the fee formula must be checked against the official Polymarket docs/fee schedule at build time — they change, and the academic papers in `research/` predate fees entirely.
+> **✅ Verified 2026-07-23** against [docs.polymarket.com/trading/fees](https://docs.polymarket.com/trading/fees) via adversarially-verified research (see `market-opportunity-and-strategy-report.md`): formula confirmed as `fee = C × feeRate × p × (1−p)`, makers confirmed fee-free, and makers additionally earn **rebates funded by taker fees** plus **daily liquidity rewards** (market-level qualification params `min_incentive_size` / `max_incentive_spread` queryable via the CLOB API). Use the verified column in code; re-check rates periodically as they are set by the protocol and can change.
 
 For a two-leg arb both legs share the same `p(1−p)`, so the pair pays **2×** the one-leg fee. Worked example: a crypto market at 50/50 → fee term = 2 × 0.072 × 0.25 = **3.6¢ per share pair** — a 2¢ "arb" is dead before the spread is even counted.
 
