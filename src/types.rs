@@ -304,6 +304,16 @@ impl OpportunityKind {
             Self::NegRiskNoSide => "negrisk NO-side",
         }
     }
+
+    /// Stable machine name — matches the serde representation, and is what the database
+    /// and the dedupe key store.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BinaryYesNo => "binary_yes_no",
+            Self::NegRiskYesSide => "neg_risk_yes_side",
+            Self::NegRiskNoSide => "neg_risk_no_side",
+        }
+    }
 }
 
 /// True arbitrage locks the payout at resolution regardless of outcome; relative value
