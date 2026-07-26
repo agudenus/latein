@@ -1,0 +1,14 @@
+# Rust
+/target/
+
+# Secrets — never commit credentials (see CLAUDE.md security rules)
+.env
+.env.*
+!.env.example
+
+# Runtime data
+*.sqlite
+*.sqlite3
+*.db
+/reports/
+/logs/
