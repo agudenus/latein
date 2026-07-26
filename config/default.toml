@@ -1,0 +1,118 @@
+# polyarb — Phase A (scanner) configuration.
+#
+# No secrets in this file. Credentials, when Phase B needs them, come from the
+# environment only (see CLAUDE.md, Wallet & Security Rules).
+#
+# Environment overrides:
+#   POLYARB_CONFIG              path to this file
+#   POLYARB_GAMMA_BASE_URL      api.gamma_base_url
+#   POLYARB_CLOB_BASE_URL       api.clob_base_url
+#   POLYARB_PER_TRADE_CAP_USD   risk.per_trade_cap_usd
+#   POLYARB_NET_FLOOR_DEFAULT   scan.net_floor.default
+#   POLYARB_MODE                mode
+#   POLYARB_DB_PATH             storage.database_path
+#   POLYARB_LOG_DIR             storage.log_dir
+#   POLYARB_REPORT_DIR          storage.report_dir
+#   POLYARB_SCAN_INTERVAL_SECS  daemon.scan_interval_secs
+#   POLYARB_ALERT_MIN_NET       alerts.alert_min_net_per_share
+#
+# Alert credentials are read from the environment only and never appear here:
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+# Only "dry-run" is implemented. Live execution is a later milestone behind an
+# explicit opt-in flag.
+mode = "dry-run"
+
+[api]
+gamma_base_url = "https://gamma-api.polymarket.com"
+clob_base_url = "https://clob.polymarket.com"
+request_timeout_secs = 20
+max_retries = 3
+# Client-side throttle between requests to the same host (rate-limit politeness).
+min_request_interval_ms = 120
+# Token ids per POST /books call.
+books_batch_size = 100
+user_agent = "polyarb/0.1.0"
+
+[scan]
+page_size = 100
+max_events = 500
+# NegRisk events with more outcomes than this are skipped: every extra outcome is
+# another leg of capital and another leg of fill risk.
+max_negrisk_outcomes = 30
+# Smallest share count worth reporting (Polymarket's own minimum order is ~5 shares).
+min_size_shares = 5
+# Binary-search resolution of the depth walker, in shares.
+size_search_tolerance = 0.01
+# Report gaps that die as a taker but survive as a maker (fee-free, rebate-subsidised,
+# but subject to legging risk).
+report_maker_only = true
+# Empty = scan every category.
+include_categories = []
+
+# Minimum net profit per share required to report / size an opportunity.
+# Geopolitics is the only fee-free category, so a thinner gap still survives there.
+[scan.net_floor]
+default = 0.005
+geopolitics = 0.003
+
+[risk]
+# Hard per-opportunity capital cap in USDC, applied inside the depth walker.
+per_trade_cap_usd = 50
+
+# ---------------------------------------------------------------------------------
+# M3 — `polyarb run` dry-run daemon
+# ---------------------------------------------------------------------------------
+
+[daemon]
+# Books are re-fetched and re-scanned this often.
+scan_interval_secs = 5
+# The market universe (Gamma /events) is refreshed on a much slower cadence.
+universe_refresh_secs = 600
+# UTC time-of-day at which the daily summary is generated, stored and alerted.
+daily_summary_utc = "23:55"
+
+[lifecycle]
+# After detection an opportunity's legs are re-polled on this cadence, for this long,
+# to measure how long it actually persisted and whether the walked fills survived.
+repoll_interval_secs = 2
+repoll_window_secs = 30
+# Cap on simultaneously tracked opportunities; the excess is recorded as "untracked"
+# rather than quietly biasing the persistence statistics.
+max_concurrent = 32
+
+[alerts]
+enabled = true
+# Minimum net profit per share before an opportunity is alerted (maker net is used for
+# maker-only constructions). Everything detected is still written to the event log.
+alert_min_net_per_share = 0.01
+# Anti-spam spacing between opportunity alerts; daily summaries ignore it.
+min_seconds_between_alerts = 30
+# Consecutive Telegram failures before the circuit breaker opens, and how long it stays
+# open before one alert is let through as a re-probe.
+failure_circuit_break = 3
+circuit_reprobe_secs = 900
+telegram_api_base = "https://api.telegram.org"
+request_timeout_secs = 10
+
+[storage]
+# All three are gitignored.
+database_path = "data/polyarb.sqlite"
+log_dir = "logs"
+report_dir = "reports"
+
+# Taker fee rates: fee = shares * rate * p * (1 - p). Makers pay zero.
+# Verified against https://docs.polymarket.com/trading/fees (2026-07). Re-check
+# periodically: these are protocol parameters and can change.
+[fees]
+geopolitics = 0.0
+politics = 0.04
+finance = 0.04
+tech = 0.04
+mentions = 0.04
+sports = 0.05
+economics = 0.05
+culture = 0.05
+weather = 0.05
+other = 0.05
+crypto = 0.07

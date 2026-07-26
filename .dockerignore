@@ -1,0 +1,33 @@
+# Build context exclusions.
+#
+# Without this file the context is ~1.6 GB (target/ alone), which on a 1 vCPU VPS turns
+# `docker compose build` into a multi-minute upload before the first instruction runs.
+
+# Local build artefacts. The image builds its own inside the builder stage; sending the
+# host's would also poison the cache with host-linked objects.
+/target/
+
+# Secrets. `.env` is never COPYed into any layer, but it must not even enter the build
+# context — anything in the context is readable by every build step and by BuildKit's
+# cache. Credentials reach the container at runtime via compose `env_file` only.
+.env
+.env.*
+!.env.example
+
+# Runtime state — the image ships empty data/logs/reports and compose bind-mounts over
+# them. Copying a host database in would silently mix two soaks' statistics.
+/data/
+/logs/
+/reports/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Not needed to compile or run the binary.
+/.git/
+/.github/
+/.claude/
+/research/
+/docs/
+*.md
+!README.md
