@@ -110,13 +110,57 @@ pub struct ScanConfig {
     pub min_size_shares: Decimal,
     /// Binary-search resolution for the depth walker, in shares.
     pub size_search_tolerance: Decimal,
-    /// Minimum net profit per share, by category, with a `default` key.
-    pub net_floor: BTreeMap<String, Decimal>,
+    /// Minimum net profit per share, by category, with a required `default` key.
+    ///
+    /// Each entry carries a taker floor and an optional maker floor, because the two sides
+    /// have different economics: a taker pays `rate · p · (1−p)` per leg, a maker pays
+    /// nothing (and is rebate-subsidised). In the 0.07 crypto tier the pair fee at
+    /// mid prices is ~0.035/share, so a thin taker gap there is noise while the same gap
+    /// captured as a maker is real — hence `crypto = { taker = 0.008, maker = 0.005 }`.
+    pub floors: BTreeMap<String, CategoryFloor>,
     /// Report gaps whose taker net dies to fees/slippage but whose maker net clears the
     /// floor. Maker capture is fee-free and rebate-subsidised, but carries legging risk.
     pub report_maker_only: bool,
     /// If non-empty, only scan these categories.
     pub include_categories: Vec<String>,
+}
+
+/// Net-per-share floors for one category.
+///
+/// `maker` is optional and defaults to `taker`, so a category that needs no side-specific
+/// treatment stays a one-liner: `geopolitics = { taker = 0.003 }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CategoryFloor {
+    /// Minimum net-per-share a depth-walked *taker* construction must clear.
+    pub taker: Decimal,
+    /// Minimum net-per-share a *maker-only* construction must clear. Absent = same as
+    /// `taker`. Lowering it below `taker` is the deliberate shape for high-fee categories:
+    /// makers pay no fee, so a gap that is noise as a taker can still be worth resting for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker: Option<Decimal>,
+}
+
+impl CategoryFloor {
+    /// One floor for both sides.
+    pub fn flat(floor: Decimal) -> Self {
+        Self {
+            taker: floor,
+            maker: None,
+        }
+    }
+
+    pub fn sided(taker: Decimal, maker: Decimal) -> Self {
+        Self {
+            taker,
+            maker: Some(maker),
+        }
+    }
+
+    /// The maker floor, resolving the "absent = same as taker" default.
+    pub fn maker_floor(&self) -> Decimal {
+        self.maker.unwrap_or(self.taker)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,8 +200,17 @@ pub struct AlertConfig {
     /// Master switch for outbound alerts. The JSONL event log is written either way.
     pub enabled: bool,
     /// Minimum net profit per share for an opportunity to be alerted (maker net is used
-    /// for maker-only constructions).
+    /// for maker-only constructions). The fallback for any category not listed in
+    /// `alert_min_net_by_category`.
     pub alert_min_net_per_share: Decimal,
+    /// Per-category alert thresholds, overriding `alert_min_net_per_share`.
+    ///
+    /// Crypto ships at 0.008 — the crypto taker floor — so a crypto gap that survived the
+    /// harshest fee tier is never silently swallowed by a threshold tuned for the far
+    /// busier politics flow. The volume stays bounded because that same higher floor is
+    /// what the detector already had to clear.
+    #[serde(default = "default_alert_min_net_by_category")]
+    pub alert_min_net_by_category: BTreeMap<String, Decimal>,
     /// Anti-spam spacing between routine (opportunity) alerts. Daily summaries ignore it.
     pub min_seconds_between_alerts: u64,
     /// Consecutive delivery failures before the circuit breaker opens.
@@ -182,6 +235,21 @@ pub struct StorageConfig {
 
 fn default_mode() -> String {
     "dry-run".to_string()
+}
+
+/// Categories that always get a line in the daily summary, even at zero, and the order
+/// they appear in. The MVP focus set (CLAUDE.md): politics/NegRisk is primary, sports
+/// secondary, geopolitics the fee-free opportunistic tier, crypto the staged second focus.
+/// "crypto: 0 opportunities" is information — it is the soak's evidence that the current
+/// refresh cadence is not finding any.
+pub const REPORTED_CATEGORIES: [&str; 4] = ["politics", "sports", "geopolitics", "crypto"];
+
+fn default_alert_min_net_by_category() -> BTreeMap<String, Decimal> {
+    // Matches the crypto taker floor (0.008): anything the detector let through in the
+    // 0.07 fee tier is rare enough to be worth seeing.
+    [("crypto".to_string(), Decimal::new(8, 3))]
+        .into_iter()
+        .collect()
 }
 
 fn default_fee_rates() -> BTreeMap<String, Decimal> {
@@ -227,9 +295,20 @@ impl Default for ScanConfig {
             report_partial_negrisk: false,
             min_size_shares: Decimal::new(5, 0),
             size_search_tolerance: Decimal::new(1, 2),
-            net_floor: [
-                ("default".to_string(), Decimal::new(5, 3)),
-                ("geopolitics".to_string(), Decimal::new(3, 3)),
+            floors: [
+                ("default".to_string(), CategoryFloor::flat(Decimal::new(5, 3))),
+                (
+                    "geopolitics".to_string(),
+                    // Fee-free, so a thinner gap still survives.
+                    CategoryFloor::flat(Decimal::new(3, 3)),
+                ),
+                (
+                    "crypto".to_string(),
+                    // 0.07 tier: the pair fee at mid prices is ~0.035/share, so a taker
+                    // gap under ~0.008 is noise. Maker capture is the realistic path
+                    // there, and it pays no fee — so its floor stays at the default.
+                    CategoryFloor::sided(Decimal::new(8, 3), Decimal::new(5, 3)),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -272,6 +351,7 @@ impl Default for AlertConfig {
         Self {
             enabled: true,
             alert_min_net_per_share: Decimal::new(1, 2),
+            alert_min_net_by_category: default_alert_min_net_by_category(),
             min_seconds_between_alerts: 30,
             failure_circuit_break: 3,
             circuit_reprobe_secs: 900,
@@ -361,7 +441,13 @@ impl Config {
             self.risk.per_trade_cap_usd = v;
         }
         if let Some(v) = env_decimal("POLYARB_NET_FLOOR_DEFAULT")? {
-            self.scan.net_floor.insert("default".to_string(), v);
+            // Only the taker floor moves; a configured maker floor is left alone (and an
+            // absent one keeps following the taker floor, as before).
+            self.scan
+                .floors
+                .entry("default".to_string())
+                .and_modify(|f| f.taker = v)
+                .or_insert_with(|| CategoryFloor::flat(v));
         }
         if let Some(v) = env_str("POLYARB_MODE") {
             self.mode = v;
@@ -411,10 +497,18 @@ impl Config {
                 "scan.page_size and api.books_batch_size must be > 0".into(),
             ));
         }
-        if !self.scan.net_floor.contains_key("default") {
+        if !self.scan.floors.contains_key("default") {
             return Err(ConfigError::Invalid(
-                "scan.net_floor must contain a \"default\" entry".into(),
+                "scan.floors must contain a \"default\" entry".into(),
             ));
+        }
+        for (name, floor) in &self.scan.floors {
+            // A negative floor would accept a construction that loses money at every size.
+            if floor.taker < Decimal::ZERO || floor.maker_floor() < Decimal::ZERO {
+                return Err(ConfigError::Invalid(format!(
+                    "scan.floors.{name}: taker and maker floors must be >= 0"
+                )));
+            }
         }
         if !self.fees.contains_key(Category::OTHER) {
             return Err(ConfigError::Invalid(
@@ -451,6 +545,13 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "alerts.alert_min_net_per_share must be >= 0".into(),
             ));
+        }
+        for (name, threshold) in &self.alerts.alert_min_net_by_category {
+            if *threshold < Decimal::ZERO {
+                return Err(ConfigError::Invalid(format!(
+                    "alerts.alert_min_net_by_category.{name} must be >= 0"
+                )));
+            }
         }
         if self.alerts.failure_circuit_break == 0 {
             return Err(ConfigError::Invalid(
@@ -490,14 +591,24 @@ impl Config {
         )
     }
 
-    /// Minimum acceptable net profit per share for a category.
-    pub fn net_floor_for(&self, category: &Category) -> Decimal {
+    /// Both net-per-share floors for a category, falling back to the `default` entry.
+    pub fn floor_for(&self, category: &Category) -> CategoryFloor {
         self.scan
-            .net_floor
+            .floors
             .get(category.as_str())
-            .or_else(|| self.scan.net_floor.get("default"))
+            .or_else(|| self.scan.floors.get("default"))
             .copied()
-            .unwrap_or(Decimal::ZERO)
+            .unwrap_or_else(|| CategoryFloor::flat(Decimal::ZERO))
+    }
+
+    /// Minimum acceptable net profit per share for a depth-walked taker construction.
+    pub fn net_floor_taker(&self, category: &Category) -> Decimal {
+        self.floor_for(category).taker
+    }
+
+    /// Minimum acceptable net profit per share for a maker-only construction.
+    pub fn net_floor_maker(&self, category: &Category) -> Decimal {
+        self.floor_for(category).maker_floor()
     }
 
     pub fn category_included(&self, category: &Category) -> bool {
@@ -507,6 +618,16 @@ impl Config {
                 .include_categories
                 .iter()
                 .any(|c| c.eq_ignore_ascii_case(category.as_str()))
+    }
+}
+
+impl AlertConfig {
+    /// Alert threshold for a category: its own entry, else `alert_min_net_per_share`.
+    pub fn min_net_for(&self, category: &Category) -> Decimal {
+        self.alert_min_net_by_category
+            .get(category.as_str())
+            .copied()
+            .unwrap_or(self.alert_min_net_per_share)
     }
 }
 
@@ -565,11 +686,82 @@ mod tests {
     fn net_floor_falls_back_to_default() {
         let cfg = Config::default();
         assert_eq!(
-            cfg.net_floor_for(&Category::new("geopolitics")),
+            cfg.net_floor_taker(&Category::new("geopolitics")),
             dec!(0.003)
         );
-        assert_eq!(cfg.net_floor_for(&Category::new("politics")), dec!(0.005));
-        assert_eq!(cfg.net_floor_for(&Category::new("nonsense")), dec!(0.005));
+        assert_eq!(cfg.net_floor_taker(&Category::new("politics")), dec!(0.005));
+        assert_eq!(cfg.net_floor_taker(&Category::new("nonsense")), dec!(0.005));
+    }
+
+    /// The crypto override is the point of the per-side floor table: a higher taker floor
+    /// (the 0.07 tier eats ~0.035/share at mid prices) with the maker floor left at the
+    /// default, because a maker pays no fee at all.
+    #[test]
+    fn crypto_floor_is_sided_and_other_categories_follow_the_default() {
+        let cfg = Config::default();
+        let crypto = Category::new("crypto");
+        assert_eq!(cfg.net_floor_taker(&crypto), dec!(0.008));
+        assert_eq!(cfg.net_floor_maker(&crypto), dec!(0.005));
+
+        // A category with no maker override uses its own taker floor on both sides.
+        for name in ["politics", "geopolitics", "sports", "not-a-category"] {
+            let c = Category::new(name);
+            assert_eq!(
+                cfg.net_floor_maker(&c),
+                cfg.net_floor_taker(&c),
+                "{name} must have a single effective floor"
+            );
+        }
+        assert_eq!(cfg.net_floor_maker(&Category::new("geopolitics")), dec!(0.003));
+        // Unknown categories fall through to `default`, on both sides.
+        assert_eq!(cfg.net_floor_maker(&Category::new("nonsense")), dec!(0.005));
+    }
+
+    #[test]
+    fn per_category_floors_parse_from_toml_and_reject_typos_and_negatives() {
+        let cfg = Config::from_toml_str(
+            "[scan.floors]\n\
+             default = { taker = 0.004 }\n\
+             crypto = { taker = 0.01, maker = 0.002 }\n",
+        )
+        .expect("sided floors must parse");
+        assert_eq!(cfg.net_floor_taker(&Category::new("crypto")), dec!(0.01));
+        assert_eq!(cfg.net_floor_maker(&Category::new("crypto")), dec!(0.002));
+        assert_eq!(cfg.net_floor_taker(&Category::new("politics")), dec!(0.004));
+
+        assert!(
+            Config::from_toml_str("[scan.floors]\ndefault = { takr = 0.004 }\n").is_err(),
+            "a typo inside a floor entry must not be silently ignored"
+        );
+
+        let mut negative = Config::default();
+        negative
+            .scan
+            .floors
+            .insert("crypto".into(), CategoryFloor::sided(dec!(0.008), dec!(-0.001)));
+        assert!(negative.validate().is_err(), "a negative floor accepts losses");
+
+        let mut no_default = Config::default();
+        no_default.scan.floors.remove("default");
+        assert!(no_default.validate().is_err());
+    }
+
+    #[test]
+    fn alert_threshold_is_per_category_with_a_crypto_default() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.alerts.min_net_for(&Category::new("crypto")),
+            dec!(0.008),
+            "crypto alerts at its own taker floor, not the general 0.01"
+        );
+        assert_eq!(cfg.alerts.min_net_for(&Category::new("politics")), dec!(0.01));
+        assert_eq!(cfg.alerts.min_net_for(&Category::new("nonsense")), dec!(0.01));
+
+        let mut bad = Config::default();
+        bad.alerts
+            .alert_min_net_by_category
+            .insert("crypto".into(), dec!(-0.01));
+        assert!(bad.validate().is_err());
     }
 
     #[test]
