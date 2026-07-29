@@ -206,15 +206,17 @@ async fn run_markets(cfg: &Config, show: usize) -> Result<()> {
     );
     // Partial coverage is why a "3.2¢ two-outcome election arb" is not one; say so up
     // front rather than leaving it to be discovered in the opportunity flags.
-    let partial = universe
+    let partial: Vec<&crate::types::TrackedEvent> = universe
         .events
         .iter()
         .filter(|e| e.neg_risk && !e.coverage_complete())
-        .count();
-    if partial > 0 {
+        .collect();
+    if !partial.is_empty() {
+        let missing: usize = partial.iter().map(|e| e.missing_outcomes()).sum();
         println!(
-            "  negrisk events with INCOMPLETE outcome coverage: {partial} \
-             (sweeps suppressed unless scan.report_partial_negrisk = true)"
+            "  negrisk events with INCOMPLETE outcome coverage: {} ({missing} outcome(s) \
+             untracked; sweeps suppressed unless scan.report_partial_negrisk = true)",
+            partial.len()
         );
     }
     if stats.truncated {
