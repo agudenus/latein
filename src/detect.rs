@@ -28,8 +28,10 @@
 //!   the **YES-side** may be surfaced as `relative-value` carrying a `partial_coverage`
 //!   flag, never as arbitrage.
 //! * `tracked < total` on the **NO-side** is always suppressed: its `$(N−1)` payout is
-//!   derived from the full outcome count, and with a partial sweep the number of NOs that
-//!   pay is not `tracked − 1` at all. There is no honest way to report it.
+//!   derived from the event's full outcome count, which is only the payout we actually
+//!   receive when we hold a NO on every outcome. Over a partial set that number overstates
+//!   the lock, and the capital-efficient exit (the NegRisk adapter conversion) assumes the
+//!   complete set too — so the construction is not reported at all, not even downgraded.
 
 use rust_decimal::{Decimal, RoundingStrategy};
 
@@ -894,16 +896,35 @@ mod tests {
     fn senate_like_books() -> Vec<OrderBook> {
         vec![
             // YES A: ask 0.026 / bid 0.024      NO A: ask 0.980 → binary 1.006, no gap.
-            book("0-yes", &[(dec!(0.024), dec!(1000))], &[(dec!(0.026), dec!(1000))]),
-            book("0-no", &[(dec!(0.970), dec!(1000))], &[(dec!(0.980), dec!(1000))]),
+            book(
+                "0-yes",
+                &[(dec!(0.024), dec!(1000))],
+                &[(dec!(0.026), dec!(1000))],
+            ),
+            book(
+                "0-no",
+                &[(dec!(0.970), dec!(1000))],
+                &[(dec!(0.980), dec!(1000))],
+            ),
             // YES B: ask 0.942 / bid 0.940      NO B: ask 0.062 → binary 1.004, no gap.
-            book("1-yes", &[(dec!(0.940), dec!(1000))], &[(dec!(0.942), dec!(1000))]),
-            book("1-no", &[(dec!(0.055), dec!(1000))], &[(dec!(0.062), dec!(1000))]),
+            book(
+                "1-yes",
+                &[(dec!(0.940), dec!(1000))],
+                &[(dec!(0.942), dec!(1000))],
+            ),
+            book(
+                "1-no",
+                &[(dec!(0.055), dec!(1000))],
+                &[(dec!(0.062), dec!(1000))],
+            ),
         ]
     }
 
     fn senate_like_markets() -> Vec<TrackedMarket> {
-        vec![market(0, "Will the Democrat win?"), market(1, "Will the Republican win?")]
+        vec![
+            market(0, "Will the Democrat win?"),
+            market(1, "Will the Republican win?"),
+        ]
     }
 
     #[test]
@@ -974,7 +995,10 @@ mod tests {
         // And the alert rendering must repeat it — the label alone is easy to skim past.
         let text = crate::alert::format_opportunity(op);
         assert!(text.contains("relative-value"), "got: {text}");
-        assert!(text.contains("NOT risk-free: 2 of 3 outcomes covered"), "got: {text}");
+        assert!(
+            text.contains("NOT risk-free: 2 of 3 outcomes covered"),
+            "got: {text}"
+        );
     }
 
     #[test]
@@ -1003,10 +1027,26 @@ mod tests {
     ///   Σ NO asks = 0.90 → against a $1 payout that is a 10¢ gap.
     fn no_side_books() -> Vec<OrderBook> {
         vec![
-            book("0-yes", &[(dec!(0.60), dec!(1000))], &[(dec!(0.62), dec!(1000))]),
-            book("0-no", &[(dec!(0.38), dec!(1000))], &[(dec!(0.40), dec!(1000))]),
-            book("1-yes", &[(dec!(0.53), dec!(1000))], &[(dec!(0.55), dec!(1000))]),
-            book("1-no", &[(dec!(0.48), dec!(1000))], &[(dec!(0.50), dec!(1000))]),
+            book(
+                "0-yes",
+                &[(dec!(0.60), dec!(1000))],
+                &[(dec!(0.62), dec!(1000))],
+            ),
+            book(
+                "0-no",
+                &[(dec!(0.38), dec!(1000))],
+                &[(dec!(0.40), dec!(1000))],
+            ),
+            book(
+                "1-yes",
+                &[(dec!(0.53), dec!(1000))],
+                &[(dec!(0.55), dec!(1000))],
+            ),
+            book(
+                "1-no",
+                &[(dec!(0.48), dec!(1000))],
+                &[(dec!(0.50), dec!(1000))],
+            ),
         ]
     }
 
@@ -1022,8 +1062,7 @@ mod tests {
             no_side_books(),
         );
         assert!(
-            !ops.iter()
-                .any(|o| o.kind == OpportunityKind::NegRiskNoSide),
+            !ops.iter().any(|o| o.kind == OpportunityKind::NegRiskNoSide),
             "a partial NO-side sweep must never be reported; got {:?}",
             ops.iter().map(|o| o.kind).collect::<Vec<_>>()
         );

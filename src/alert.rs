@@ -459,6 +459,29 @@ mod tests {
         assert!(!text.contains("MAKER-ONLY"));
     }
 
+    /// A partial NegRisk sweep sums under $1 and looks exactly like a lock in the alert
+    /// body. The message must say, in words, that it is not one.
+    #[test]
+    fn partial_coverage_is_spelled_out_in_the_alert_body() {
+        let mut op = sample_opportunity();
+        op.kind = crate::types::OpportunityKind::NegRiskYesSide;
+        op.label = crate::types::Label::RelativeValue;
+        op.partial_coverage = Some((2, 3));
+        let text = format_opportunity(&op);
+        assert!(text.contains("relative-value"), "got: {text}");
+        assert!(
+            text.contains("NOT risk-free: 2 of 3 outcomes covered"),
+            "got: {text}"
+        );
+        assert!(text.contains("1 outcome(s)"), "got: {text}");
+
+        // A fully covered sweep must not carry the caveat — crying wolf costs the same as
+        // staying silent.
+        let mut complete = sample_opportunity();
+        complete.partial_coverage = None;
+        assert!(!format_opportunity(&complete).contains("NOT risk-free"));
+    }
+
     #[test]
     fn maker_only_and_conversion_caveats_are_stated() {
         let mut op = sample_opportunity();

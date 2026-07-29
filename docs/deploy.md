@@ -262,17 +262,29 @@ You are looking for, in order:
 
 ```
 starting polyarb dry-run daemon (no orders are ever placed)   mode=dry-run ...
-market universe refreshed   events=... markets=... negrisk_events=... dropped_markets=...
+market discovery drop breakdown   events_seen=... markets_seen=... markets_dropped=... drop_reasons="closed_or_inactive=... no_token_ids=..."
+market universe refreshed   events=... markets=... negrisk_events=... partial_negrisk_events=... markets_seen=... dropped_markets=... drop_reasons=... truncated=false
 scan cycle complete   books=... markets=... opportunities=... new=... duration_ms=...
 ```
 
-Three things matter in those lines:
+Five things matter in those lines:
 
 - `mode=dry-run` — confirms the safety lock.
 - `negrisk_events` is **greater than zero**. NegRisk multi-outcome events are the primary
   strategy; if this is `0`, discovery is broken (see troubleshooting).
+- `truncated=false`. `true` (and an accompanying `WARN universe truncated at max_events`)
+  means pagination stopped at the `scan.max_events` backstop instead of at the end of the
+  event list, so the universe is incomplete — raise `scan.max_events`.
+- `drop_reasons` accounts for every dropped market by bucket. `markets_kept + dropped =
+  markets_seen` always balances, so a surprising bucket is the thing to chase.
 - `books` on the scan line is close to `markets`. A large shortfall means order books are
   not being fetched.
+
+`partial_negrisk_events` counts NegRisk events whose tracked outcomes are a strict subset
+of what Gamma listed. Their sweeps are **suppressed** (they are not risk-free — a dropped
+outcome can win and pay every leg nothing), so a large number here means real opportunity
+is being skipped and the drop reasons are worth fixing. See
+`scan.report_partial_negrisk` in `config/default.toml`.
 
 `opportunities=0` on most cycles is **normal and expected** — genuine arbitrage is rare.
 That is precisely what the soak is measuring.
@@ -501,16 +513,22 @@ Interpreting them:
       `src/clob.rs` expect. This must be fixed before any number in the report is
       trustworthy.
 - [ ] **Check 3 shows `negrisk_events` > 0.** Zero → the `negRisk` field name or casing on
-      `/events` is wrong (`src/gamma.rs:44`). Since NegRisk rebalancing is ~72% of realised
+      `/events` is wrong (`RawEvent::neg_risk` in `src/gamma.rs`). Since NegRisk rebalancing is ~72% of realised
       arbitrage platform-wide, a zero here invalidates the *entire* soak, not part of it.
-- [ ] **Check 3 shows `dropped_markets` small relative to `markets`.** A large share
-      dropped points at the `clobTokenIds` double-encoding assumption
-      (`src/gamma.rs:74`) or the `enableOrderBook` filter (`src/gamma.rs:88`) discarding
-      tradeable markets.
+- [ ] **Check 3 shows `dropped_markets` small relative to `markets_seen`, and the
+      `drop_reasons` breakdown is plausible.** The buckets say exactly where markets went:
+      `no_token_ids` points at the `clobTokenIds` double-encoding assumption,
+      `no_order_book` at the `enableOrderBook` filter, `not_binary` at a multi-token
+      market shape we do not model, `event_dropped` at whole events failing the
+      active/closed re-check. A large `no_token_ids` or `no_order_book` share is a wire-shape
+      bug, not a fact about the market.
+- [ ] **Check 3 shows `truncated=false`.** `true` means `scan.max_events` — not the API —
+      ended discovery, so the universe is a prefix of reality and NegRisk events may be
+      split across the boundary. Raise `scan.max_events` and re-soak.
 - [ ] **Check 4 shows `books` ≈ `markets`.** A big shortfall points at the batch book
       endpoint's `asset_id` key assumption (`src/clob.rs:30`).
 - [ ] **Categories in the report's opportunity table are not overwhelmingly `other`.** The
-      category→fee-tier alias table (`src/types.rs:52`) is inferred from Polymarket's
+      category→fee-tier alias table (`Category::from_text` in `src/types.rs`) is inferred from Polymarket's
       public taxonomy. If everything lands in `other`, opportunities are being costed at
       the 0.05 fallback rate — which would understate fee-free geopolitics and understate
       crypto's 0.07, distorting every net figure.

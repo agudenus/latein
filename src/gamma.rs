@@ -484,7 +484,10 @@ mod tests {
         assert_eq!(stats.drops.no_order_book, 0);
         assert_eq!(stats.drops.other, 0);
         // The books must balance: nothing may vanish unexplained.
-        assert_eq!(stats.markets_kept + stats.markets_dropped(), stats.markets_seen);
+        assert_eq!(
+            stats.markets_kept + stats.markets_dropped(),
+            stats.markets_seen
+        );
 
         assert_eq!(universe.events.len(), 2);
         assert_eq!(universe.neg_risk_event_count(), 1);
@@ -597,7 +600,10 @@ mod tests {
             "no_condition_id=1",
             "event_dropped=2",
         ] {
-            assert!(line.contains(expected), "{expected:?} missing from {line:?}");
+            assert!(
+                line.contains(expected),
+                "{expected:?} missing from {line:?}"
+            );
         }
         // Zero buckets are omitted so the log line stays short.
         assert!(!line.contains("other="), "got: {line}");
@@ -607,7 +613,9 @@ mod tests {
 
     /// Serve `total` synthetic events, honouring `limit`/`offset`, and return the base URL
     /// plus a counter of how many pages were requested.
-    async fn paging_gamma(total: usize) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    async fn paging_gamma(
+        total: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
