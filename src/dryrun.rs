@@ -34,6 +34,15 @@
 //!
 //! With `stream.enabled = false` — or after the stream has been abandoned as unreachable —
 //! the daemon is exactly the M3 polling loop.
+//!
+//! ## Who decides the stream is dead (M6.1)
+//!
+//! The socket tasks retry forever; only this loop may hand over to REST-only polling, and
+//! only when it has seen REST work while the socket kept failing (see
+//! [`crate::ws::StreamHealth::evaluate_fallback`]). That is the difference between "the
+//! endpoint is wrong" and "the machine was offline for a minute", and a live run showed the
+//! second one costing a whole night of streaming. After a hand-over the loop re-probes the
+//! endpoint every `stream.reprobe_interval_secs` and restores streaming if it answers.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -47,7 +56,7 @@ use serde_json::json;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::alert::{format_opportunity, AlertStats, Alerter, EventLog, Priority};
+use crate::alert::{format_opportunity, AlertStats, Alerter, Delivery, EventLog, Priority};
 use crate::clob::ClobClient;
 use crate::config::{Config, REPORTED_CATEGORIES};
 use crate::detect;
@@ -57,7 +66,7 @@ use crate::store::{
     CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, ScanTotals, Store,
 };
 use crate::types::{BookMap, Opportunity, Side, TokenId, Universe};
-use crate::ws::{DirtyBatch, StreamManager, DIVERGENCE_SAMPLE};
+use crate::ws::{self, DirtyBatch, StreamManager, DIVERGENCE_SAMPLE};
 
 /// Phase A is dry-run only. Live execution does not exist yet — not behind a flag, not
 /// behind a feature: there is no order-placing code in this binary.
@@ -213,7 +222,13 @@ impl Daemon {
         let refresh_after = Duration::from_secs(self.cfg.daemon.universe_refresh_secs);
         let resync_after = Duration::from_secs(self.cfg.stream.resync_interval_secs);
         let stale_after = Duration::from_secs(self.cfg.stream.stale_after_secs);
+        let reprobe_after = Duration::from_secs(self.cfg.stream.reprobe_interval_secs.max(1));
+        let probe_timeout = Duration::from_secs(self.cfg.api.request_timeout_secs.max(1));
         let mut last_sweep = Instant::now();
+        // `Some(when)` = streaming has handed over to REST and is due for a re-probe
+        // `reprobe_after` later. `None` = nothing to restore.
+        let mut fallback_since: Option<Instant> = None;
+        let mut last_pulse: Option<StreamPulse> = None;
         let mut cycles = 0u64;
         let mut stream_passes = 0u64;
 
@@ -225,8 +240,14 @@ impl Daemon {
                 _ = ticker.tick() => None,
                 batch = recv_batch(stream.as_mut()) => match batch {
                     Some(batch) => Some(batch),
-                    // The pool is gone (fallback or shutdown): stop selecting on it.
-                    None => { stream = None; continue; }
+                    // The pool is gone: stop selecting on it, and treat it as a fallback
+                    // so the slow re-probe can bring streaming back.
+                    None => {
+                        tracing::warn!("the market stream pool stopped — polling REST until a re-probe succeeds");
+                        stream = None;
+                        fallback_since = Some(Instant::now());
+                        continue;
+                    }
                 },
             };
             if *self.shutdown.borrow() {
@@ -259,33 +280,78 @@ impl Daemon {
                 universe_fetched = Instant::now();
             }
 
-            // The stream can be given up on mid-run; from then on this is the M3 daemon.
-            if stream
-                .as_ref()
-                .is_some_and(|manager| manager.health().fallen_back())
-            {
-                tracing::error!(
-                    "falling back to REST polling for the rest of this process — detection \
-                     latency returns to the {} s scan interval",
-                    self.cfg.daemon.scan_interval_secs
-                );
-                if let Some(manager) = stream.take() {
-                    manager.stop().await;
-                }
-            }
-
+            let mut hand_over = false;
             match stream.as_ref() {
                 Some(manager) => {
-                    // Cheap every tick: anything the stream has not refreshed recently.
+                    // Cheap every tick: anything explicitly stale or behind a shard gap.
                     self.resync_stale(manager, &universe, stale_after).await;
                     // Slow and thorough: the whole universe over REST, a divergence
                     // cross-check, and a full detection pass as the integrity net.
                     if last_sweep.elapsed() >= resync_after {
                         last_sweep = Instant::now();
-                        self.full_sweep(manager, &universe).await;
+                        self.full_sweep(manager, &universe, &mut last_pulse).await;
+                    }
+                    // Now — and only now, with this tick's REST evidence in hand — decide
+                    // whether the socket is specifically broken.
+                    if manager.health().evaluate_fallback() {
+                        let health = manager.health();
+                        tracing::error!(
+                            consecutive_ws_failures = health.consecutive_failures(),
+                            rest_failures_seen = health.rest_failures(),
+                            scan_interval_secs = self.cfg.daemon.scan_interval_secs,
+                            reprobe_interval_secs = self.cfg.stream.reprobe_interval_secs,
+                            "the market stream keeps failing while REST works — handing \
+                             detection back to REST polling; latency returns to the scan \
+                             interval. Check stream.url. Streaming will be re-probed on \
+                             the interval above and restored if it answers."
+                        );
+                        hand_over = true;
                     }
                 }
                 None => self.scan_cycle(&universe).await,
+            }
+            if hand_over {
+                if let Some(manager) = stream.take() {
+                    manager.stop().await;
+                }
+                last_pulse = None;
+                fallback_since = Some(Instant::now());
+                // Take over immediately rather than leaving one scan interval unscanned:
+                // from here on REST *is* the detector.
+                self.scan_cycle(&universe).await;
+            }
+
+            // "Permanent" fallback means "until the endpoint proves itself again".
+            if stream.is_none() && self.cfg.stream.enabled {
+                if let Some(since) = fallback_since {
+                    if since.elapsed() >= reprobe_after {
+                        fallback_since = Some(Instant::now());
+                        match ws::probe(&self.cfg.stream.url, probe_timeout).await {
+                            Ok(()) => {
+                                tracing::warn!(
+                                    url = %self.cfg.stream.url,
+                                    "the market stream answered a re-probe — restoring \
+                                     streaming after the REST-only fallback"
+                                );
+                                let manager = StreamManager::start(
+                                    &self.cfg,
+                                    &universe.token_ids(),
+                                    self.shutdown.clone(),
+                                );
+                                self.seed_stream_books(&manager, &universe).await;
+                                stream = Some(manager);
+                                fallback_since = None;
+                                last_sweep = Instant::now();
+                            }
+                            Err(err) => tracing::info!(
+                                %err,
+                                url = %self.cfg.stream.url,
+                                reprobe_interval_secs = self.cfg.stream.reprobe_interval_secs,
+                                "the market stream is still unreachable — staying on REST polling"
+                            ),
+                        }
+                    }
+                }
             }
             self.maybe_daily_summary(summary_time).await;
 
@@ -299,6 +365,7 @@ impl Daemon {
         if let Some(manager) = stream.take() {
             let stats = manager.books().stats.snapshot();
             tracing::info!(
+                messages = stats.messages,
                 snapshots = stats.snapshots,
                 deltas = stats.deltas,
                 unknown_frames = stats.unknown_frames,
@@ -323,6 +390,7 @@ impl Daemon {
             alerts_sent = stats.sent,
             alerts_failed = stats.failed,
             alerts_suppressed = stats.suppressed,
+            alerts_cooldown_suppressed = stats.cooldown_suppressed,
             "polyarb daemon stopped"
         );
         Ok(())
@@ -475,12 +543,18 @@ impl Daemon {
                     books = books.len(),
                     "seeded the stream book state over REST"
                 );
+                // Also the first evidence that this machine has a network: a socket that
+                // never connects while *this* worked is a socket problem.
+                manager.health().record_rest_success();
                 manager.books().apply_rest(&tokens, &books, Instant::now());
             }
-            Err(err) => tracing::warn!(
-                %err,
-                "could not seed book state over REST — detection waits for stream snapshots"
-            ),
+            Err(err) => {
+                manager.health().record_rest_failure();
+                tracing::warn!(
+                    %err,
+                    "could not seed book state over REST — detection waits for stream snapshots"
+                );
+            }
         }
     }
 
@@ -538,8 +612,10 @@ impl Daemon {
         });
     }
 
-    /// Targeted REST re-fetch of books the stream has not refreshed (or has flagged
-    /// unverified). Usually a no-op, and then it costs nothing at all.
+    /// Targeted REST re-fetch of the books the stream cannot vouch for: never seen,
+    /// explicitly invalidated, or sitting behind a shard disconnect. A *quiet* book is not
+    /// in that set (M6.1), which is what makes this path cheap again — usually it is a
+    /// no-op and costs nothing at all.
     async fn resync_stale(
         &mut self,
         manager: &StreamManager,
@@ -564,6 +640,7 @@ impl Daemon {
                     stale_after_secs = stale_after.as_secs(),
                     "resynced stale books over REST"
                 );
+                manager.health().record_rest_success();
                 manager
                     .books()
                     .stats
@@ -571,7 +648,10 @@ impl Daemon {
                     .fetch_add(books.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 manager.books().apply_rest(&stale, &books, Instant::now());
             }
-            Err(err) => tracing::warn!(%err, stale = stale.len(), "stale-book resync failed"),
+            Err(err) => {
+                manager.health().record_rest_failure();
+                tracing::warn!(%err, stale = stale.len(), "stale-book resync failed");
+            }
         }
     }
 
@@ -583,15 +663,40 @@ impl Daemon {
     /// verifiable checksum (they may not — see `ws.rs`), this sweep is the *only* thing
     /// that can tell us our books are wrong, so its divergence count is the number to
     /// watch during the soak.
-    async fn full_sweep(&mut self, manager: &StreamManager, universe: &Universe) {
+    async fn full_sweep(
+        &mut self,
+        manager: &StreamManager,
+        universe: &Universe,
+        last_pulse: &mut Option<StreamPulse>,
+    ) {
         let started = Instant::now();
         let tokens = universe.token_ids();
-        let books = match ClobClient::new(&self.http, &self.cfg)
-            .fetch_books(&tokens)
-            .await
-        {
+
+        // The divergence budget is spread over the sweep's batches rather than taken at the
+        // end: the live universe needs 30–70 s to fetch, and a comparison made a minute
+        // after the answer arrived measures nothing but elapsed time.
+        let batches = tokens
+            .len()
+            .div_ceil(self.cfg.api.books_batch_size.max(1))
+            .max(1);
+        let per_batch = DIVERGENCE_SAMPLE.div_ceil(batches).max(1);
+        let mut diverged = 0usize;
+        let mut sampled = 0usize;
+
+        let fetched = ClobClient::new(&self.http, &self.cfg)
+            .fetch_books_batched(&tokens, |batch| {
+                let (d, s) =
+                    manager
+                        .books()
+                        .count_divergence(batch.books, per_batch, batch.requested_at);
+                diverged += d;
+                sampled += s;
+            })
+            .await;
+        let books = match fetched {
             Ok(books) => books,
             Err(err) => {
+                manager.health().record_rest_failure();
                 tracing::warn!(%err, "full REST resync sweep failed");
                 self.record_cycle(CycleStats {
                     events: universe.events.len() as i64,
@@ -603,16 +708,17 @@ impl Daemon {
                 return;
             }
         };
+        manager.health().record_rest_success();
 
-        let diverged = manager.books().count_divergence(&books, DIVERGENCE_SAMPLE);
         if diverged > 0 {
             tracing::warn!(
                 diverged,
-                sampled = books.len().min(DIVERGENCE_SAMPLE),
+                sampled,
                 "locally streamed books disagreed with REST at the top of book — the REST \
                  view wins; investigate before trusting stream-only detection"
             );
         }
+        self.log_stream_pulse(manager, last_pulse);
         manager.books().apply_rest(&tokens, &books, Instant::now());
 
         let opportunities = detect::scan(&self.cfg, universe, &books);
@@ -642,6 +748,44 @@ impl Daemon {
         });
     }
 
+    /// Per-sweep data-plane health: is traffic actually arriving?
+    ///
+    /// A subscribed-but-silent shard and a genuinely quiet market look identical from the
+    /// book state alone, which is exactly the ambiguity the soak needs resolved. Counting
+    /// payloads, applied deltas and the rate between sweeps separates them.
+    fn log_stream_pulse(&self, manager: &StreamManager, last: &mut Option<StreamPulse>) {
+        let stats = manager.books().stats.snapshot();
+        let now = Instant::now();
+        let pulse = StreamPulse {
+            at: now,
+            messages: stats.messages,
+            deltas: stats.deltas,
+            snapshots: stats.snapshots,
+        };
+        match last.replace(pulse) {
+            Some(previous) => {
+                let elapsed = now.saturating_duration_since(previous.at);
+                let messages = stats.messages.saturating_sub(previous.messages);
+                tracing::info!(
+                    frames = messages,
+                    price_changes_applied = stats.deltas.saturating_sub(previous.deltas),
+                    snapshots_applied = stats.snapshots.saturating_sub(previous.snapshots),
+                    events_per_sec = %ws::events_per_sec(messages, elapsed),
+                    since_secs = elapsed.as_secs(),
+                    connections = manager.health().live_connections(),
+                    "stream data-plane health"
+                );
+            }
+            // First sweep: totals only, because there is no interval to divide by yet.
+            None => tracing::info!(
+                frames_total = stats.messages,
+                price_changes_applied_total = stats.deltas,
+                connections = manager.health().live_connections(),
+                "stream data-plane health (first sweep — no rate yet)"
+            ),
+        }
+    }
+
     fn record_cycle(&self, stats: CycleStats) {
         if let Err(err) = self.store.record_cycle(&stats, Utc::now()) {
             tracing::warn!(%err, "could not record scan-cycle stats");
@@ -657,20 +801,33 @@ impl Daemon {
             "opportunity": op,
         });
 
-        if self.alerter.passes_threshold(op) {
-            self.alerter
-                .notify(
-                    "opportunity",
-                    &format_opportunity(op),
-                    Priority::Routine,
-                    payload,
-                )
-                .await;
+        // Two gates, in order: is it big enough to be worth a message at all, and is it
+        // *news* — or the same slow-moving construction we already reported? A suppressed
+        // alert is still a full JSONL record, so the soak loses nothing either way.
+        let held_back = if !self.alerter.passes_threshold(op) {
+            Some(Delivery::BelowThreshold)
+        } else if !self.alerter.allow_alert_at(op, Instant::now()) {
+            Some(Delivery::Cooldown)
         } else {
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("delivery".into(), json!("below_threshold"));
+            None
+        };
+        match held_back {
+            Some(reason) => {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("delivery".into(), json!(reason.as_str()));
+                }
+                self.alerter.events().append("opportunity", payload);
             }
-            self.alerter.events().append("opportunity", payload);
+            None => {
+                self.alerter
+                    .notify(
+                        "opportunity",
+                        &format_opportunity(op),
+                        Priority::Routine,
+                        payload,
+                    )
+                    .await;
+            }
         }
 
         match Arc::clone(&self.slots).try_acquire_owned() {
@@ -749,6 +906,15 @@ impl Daemon {
             tracing::warn!(%err, "could not generate the daily summary");
         }
     }
+}
+
+/// Stream counters at one moment, so the next sweep can report a rate rather than a total.
+#[derive(Debug, Clone, Copy)]
+struct StreamPulse {
+    at: Instant,
+    messages: u64,
+    deltas: u64,
+    snapshots: u64,
 }
 
 fn elapsed_ms(since: Instant) -> i64 {
@@ -1268,9 +1434,19 @@ impl DailySummary {
 
         if let Some(alerts) = self.alerts {
             out.push_str(&format!(
-                "\n## Alerts\n\n- sent: {} · failed: {} · suppressed: {} · circuit open: {}\n",
-                alerts.sent, alerts.failed, alerts.suppressed, alerts.circuit_open
+                "\n## Alerts\n\n- sent: {} · failed: {} · suppressed: {} · \
+                 held back by the per-event cooldown: {} · circuit open: {}\n",
+                alerts.sent,
+                alerts.failed,
+                alerts.suppressed,
+                alerts.cooldown_suppressed,
+                alerts.circuit_open
             ));
+            out.push_str(
+                "\nA cooldown-suppressed alert is a re-detection of a construction already \
+                 reported, no better than last time; its measurement row and JSONL record \
+                 exist either way.\n",
+            );
         }
         out
     }
@@ -1966,14 +2142,21 @@ mod tests {
     /// subscribe frame shows up as "nothing was ever detected" rather than passing
     /// silently. Returns its `ws://` URL.
     async fn mock_market_channel(gap: Duration) -> String {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message;
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
+        tokio::spawn(serve_market_channel(listener, gap));
+        format!("ws://{addr}/ws/market")
+    }
+
+    /// The accept loop of [`mock_market_channel`], separated so a test can start serving on
+    /// an address that was deliberately left dead for a while.
+    async fn serve_market_channel(listener: tokio::net::TcpListener, gap: Duration) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        {
             while let Ok((socket, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
@@ -2025,8 +2208,7 @@ mod tests {
                     while let Some(Ok(_)) = ws.next().await {}
                 });
             }
-        });
-        format!("ws://{addr}/ws/market")
+        }
     }
 
     fn stream_test_config(rest: String, ws_url: String, tmp: &Path) -> Config {
@@ -2045,11 +2227,13 @@ mod tests {
         cfg.stream.enabled = true;
         cfg.stream.url = ws_url;
         cfg.stream.debounce_ms = 50;
-        cfg.stream.stale_after_secs = 60;
+        cfg.stream.stale_after_secs = 900;
         // Long enough that no full REST sweep runs inside the test window: what is
         // detected here was detected from the stream, and nothing else.
         cfg.stream.resync_interval_secs = 3_600;
         cfg.stream.fallback_after_failures = 5;
+        // Likewise: no re-probe unless a test asks for one.
+        cfg.stream.reprobe_interval_secs = 3_600;
         cfg
     }
 
@@ -2173,6 +2357,203 @@ mod tests {
             totals.cycles
         );
         assert_eq!(totals.errors, 0);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// M6.1 issue 1, end to end: a fallback is not a life sentence. The endpoint is dead
+    /// when the daemon starts (so REST carries detection), then comes back — and the slow
+    /// re-probe has to notice and restore streaming. The proof is a row carrying a detection
+    /// latency, which only the stream path can produce.
+    #[tokio::test]
+    async fn a_fallen_back_stream_is_restored_when_the_endpoint_answers_a_reprobe() {
+        let rest = mock_api_with(STREAM_EVENTS, STREAM_BOOKS).await;
+        // Reserve an address and let it go: connections are refused until we bind again.
+        let addr = {
+            let reserved = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            reserved.local_addr().expect("addr")
+        };
+        let tmp = std::env::temp_dir().join(format!("polyarb-reprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mut cfg = stream_test_config(rest, format!("ws://{addr}/ws/market"), &tmp);
+        cfg.stream.fallback_after_failures = 2;
+        cfg.stream.reprobe_interval_secs = 1;
+        cfg.validate().expect("config must validate");
+
+        // The channel appears well after the hand-over to REST.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            let listener = tokio::net::TcpListener::bind(addr).await.expect("re-bind");
+            serve_market_channel(listener, Duration::from_millis(100)).await;
+        });
+
+        run(cfg.clone(), Some(8)).await.expect("daemon run");
+
+        let store = Store::open(Path::new(&cfg.storage.database_path)).expect("reopen db");
+        let rows = store
+            .opportunities_for_day(Utc::now().date_naive())
+            .expect("rows");
+        // REST polling found event B's standing gap while the socket was dead…
+        assert!(
+            rows.iter().any(|r| r.event_slug == "mock-event-b"),
+            "REST polling must have carried detection during the fallback; got {:?}",
+            rows.iter()
+                .map(|r| r.event_slug.clone())
+                .collect::<Vec<_>>()
+        );
+        // …and the restored stream then found event A's pushed one.
+        let streamed: Vec<&OpportunityRow> = rows
+            .iter()
+            .filter(|r| r.detection_latency_ms.is_some())
+            .collect();
+        assert_eq!(
+            streamed.len(),
+            1,
+            "the re-probe must restore streaming and detect event A from a pushed delta; \
+             rows were {:?}",
+            rows.iter()
+                .map(|r| (r.event_slug.clone(), r.detection_latency_ms))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(streamed[0].event_slug, "mock-event-a");
+        assert!(
+            streamed[0].detection_latency_ms.unwrap_or(i64::MAX) < 5_000,
+            "a restored stream must still beat the polling floor"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- M6.1: the alert cooldown, through the real daemon ----------------------------
+
+    /// Books whose YES ask ticks one notch better on the second call: different economics,
+    /// so correctly a second measurement row — but only a 0.001/share improvement, which is
+    /// under the 0.01 re-alert bar.
+    const DRIFTED_BOOKS: &str = r#"[
+        {"asset_id":"1001","bids":[{"price":"0.389","size":"500"}],"asks":[{"price":"0.399","size":"500"}]},
+        {"asset_id":"1002","bids":[{"price":"0.54","size":"500"}],"asks":[{"price":"0.55","size":"500"}]}
+    ]"#;
+
+    /// Like [`mock_api_with`], but the first `/books` call gets `first` and every later one
+    /// gets `rest` — enough to make the daemon see the same event at two different prices.
+    async fn mock_api_drifting(
+        events: &'static str,
+        first: &'static str,
+        rest: &'static str,
+    ) -> String {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let served_first = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let served_first = served_first.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body = if head.starts_with("GET /events") {
+                        events
+                    } else if served_first.swap(true, Ordering::SeqCst) {
+                        rest
+                    } else {
+                        first
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// M6.1 issue 4, end to end. The row-level dedupe is unchanged — a one-tick ask move is
+    /// different economics and gets its own row — but the *message* is held back, and the
+    /// JSONL record says so rather than going missing.
+    #[tokio::test]
+    async fn a_re_detection_that_is_no_better_is_logged_as_cooldown_not_alerted_again() {
+        let base = mock_api_drifting(MOCK_EVENTS, MOCK_BOOKS, DRIFTED_BOOKS).await;
+        let tmp = std::env::temp_dir().join(format!("polyarb-cooldown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mut cfg = Config::default();
+        cfg.api.gamma_base_url = base.clone();
+        cfg.api.clob_base_url = base;
+        cfg.api.min_request_interval_ms = 0;
+        cfg.api.max_retries = 0;
+        cfg.daemon.scan_interval_secs = 1;
+        cfg.lifecycle.repoll_interval_secs = 1;
+        cfg.lifecycle.repoll_window_secs = 1;
+        cfg.alerts.telegram_api_base = "http://127.0.0.1:1".into();
+        cfg.storage.database_path = tmp.join("polyarb.sqlite").display().to_string();
+        cfg.storage.log_dir = tmp.join("logs").display().to_string();
+        cfg.storage.report_dir = tmp.join("reports").display().to_string();
+        cfg.stream.enabled = false;
+        cfg.validate().expect("config must validate");
+
+        run(cfg.clone(), Some(2)).await.expect("daemon run");
+
+        // Two distinct rows: the economics really did change.
+        let store = Store::open(Path::new(&cfg.storage.database_path)).expect("reopen db");
+        let rows = store
+            .opportunities_for_day(Utc::now().date_naive())
+            .expect("rows");
+        assert_eq!(
+            rows.len(),
+            2,
+            "different quotes are different economics and must still each get a row"
+        );
+        // asks 0.40 + 0.55 → net 0.0305 ; asks 0.399 + 0.55 → net 0.03150804
+        // improvement 0.00100804 per share, far under the 0.01 re-alert bar
+        let mut nets: Vec<Decimal> = rows.iter().map(|r| r.net_taker).collect();
+        nets.sort();
+        assert_eq!(nets, vec![dec!(0.0305), dec!(0.03150804)]);
+
+        // But only the first one was a notification; the second is on record as suppressed.
+        let log = std::fs::read_to_string(tmp.join("logs").join("events.jsonl")).expect("log");
+        let deliveries: Vec<String> = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event"] == "opportunity")
+            .map(|v| v["delivery"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            deliveries,
+            vec!["no_credentials".to_string(), "cooldown".to_string()],
+            "the second sighting must be logged, and logged as held back"
+        );
+
+        let summary = emit_daily_summary(
+            &cfg,
+            &store,
+            &Alerter::new(
+                &cfg.alerts,
+                Arc::new(EventLog::open(Path::new(&cfg.storage.log_dir)).expect("log")),
+            ),
+            Utc::now().date_naive(),
+            false,
+        )
+        .await
+        .expect("summary");
+        assert!(summary
+            .to_markdown()
+            .contains("held back by the per-event cooldown"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

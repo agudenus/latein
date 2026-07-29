@@ -802,12 +802,15 @@ mod tests {
         );
     }
 
-    /// The shipped default must be high enough that the live universe (~500+ events and
-    /// growing) is not silently clipped.
+    /// The shipped default must be high enough that the live universe is not silently
+    /// clipped. 500 was the original guess, 2 000 was raised to after that clipped, and a
+    /// live overnight run then filled all 20 pages of *that* — 8.3k markets / 16.6k tokens —
+    /// so the real event count is above 2 000 too.
     #[test]
-    fn shipped_max_events_default_is_not_the_old_500_cap() {
-        assert!(
-            Config::default().scan.max_events >= 2_000,
+    fn shipped_max_events_default_covers_the_observed_live_universe() {
+        assert_eq!(
+            Config::default().scan.max_events,
+            6_000,
             "scan.max_events must be a rate-limit backstop, not the usual stopping point"
         );
     }

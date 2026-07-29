@@ -6,6 +6,8 @@
 //! levels dropped) before anything downstream touches them — the API's ordering is not a
 //! contract and the whole cost model depends on "best" meaning best.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -94,6 +96,25 @@ impl<'a> ClobClient<'a> {
     /// Fetch books for every token, in batches. Tokens the API omits (no book yet) are
     /// simply absent from the result; detectors treat a missing leg as "not priceable".
     pub async fn fetch_books(&self, tokens: &[TokenId]) -> Result<BookMap, ApiError> {
+        self.fetch_books_batched(tokens, |_| {}).await
+    }
+
+    /// [`fetch_books`](Self::fetch_books), with each batch handed to `on_batch` the moment
+    /// it lands.
+    ///
+    /// A full sweep of the live universe is 160+ batches over 30–70 s, so "the state when
+    /// the sweep finished" and "the state when this batch was answered" are very different
+    /// things. The stream's divergence cross-check needs the second one, plus the instant
+    /// the request went out, to tell a stale local book from a book that simply moved while
+    /// the request was in flight.
+    pub async fn fetch_books_batched<F>(
+        &self,
+        tokens: &[TokenId],
+        mut on_batch: F,
+    ) -> Result<BookMap, ApiError>
+    where
+        F: FnMut(BookBatch),
+    {
         let url = format!("{}/books", self.base_url);
         let mut out = BookMap::with_capacity(tokens.len());
 
@@ -104,6 +125,7 @@ impl<'a> ClobClient<'a> {
                     token_id: t.as_str(),
                 })
                 .collect();
+            let requested_at = Instant::now();
             let body = self.http.post_json(&url, &payload).await?;
             let books = parse_books(&url, &body)?;
             tracing::debug!(
@@ -111,6 +133,10 @@ impl<'a> ClobClient<'a> {
                 returned = books.len(),
                 "fetched clob book batch"
             );
+            on_batch(BookBatch {
+                books: &books,
+                requested_at,
+            });
             for book in books {
                 out.insert(book.asset_id.clone(), book);
             }
@@ -118,6 +144,16 @@ impl<'a> ClobClient<'a> {
 
         Ok(out)
     }
+}
+
+/// One `/books` batch, handed to the callback the moment it lands (so "now" inside the
+/// callback *is* the batch's return time — there is no need to carry it).
+#[derive(Debug, Clone, Copy)]
+pub struct BookBatch<'a> {
+    pub books: &'a [OrderBook],
+    /// When the request went out. Local state touched after this is newer than the answer,
+    /// which is what lets the stream tell drift from in-flight market movement.
+    pub requested_at: Instant,
 }
 
 #[cfg(test)]

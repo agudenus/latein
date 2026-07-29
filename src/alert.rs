@@ -15,6 +15,7 @@
 //! [`redact`] scrubs it from anything we emit, and transport errors are stripped of their
 //! URL (which embeds the token) before they are formatted.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -107,6 +108,11 @@ pub enum Delivery {
     Disabled,
     RateLimited,
     CircuitOpen,
+    /// Suppressed by the per-`(event, kind, side)` re-alert cooldown: the same
+    /// construction, no materially better, inside `alerts.per_event_cooldown_secs`.
+    Cooldown,
+    /// The opportunity did not clear its category's alert threshold.
+    BelowThreshold,
     Failed(String),
 }
 
@@ -118,6 +124,8 @@ impl Delivery {
             Self::Disabled => "disabled",
             Self::RateLimited => "rate_limited",
             Self::CircuitOpen => "circuit_open",
+            Self::Cooldown => "cooldown",
+            Self::BelowThreshold => "below_threshold",
             Self::Failed(reason) => reason,
         }
     }
@@ -146,14 +154,54 @@ pub struct AlertStats {
     pub sent: u64,
     pub failed: u64,
     pub suppressed: u64,
+    /// Re-alerts of an already-reported construction held back by the per-event cooldown.
+    /// Counted separately from `suppressed` (transport-level spacing) because they mean
+    /// something different: nothing was lost, the news was simply already delivered.
+    pub cooldown_suppressed: u64,
     pub circuit_open: bool,
 }
+
+/// What we last told the owner about one `(event, kind, side)` construction.
+#[derive(Debug, Clone, Copy)]
+struct AlertRecord {
+    last_alert: Instant,
+    /// The figures as *alerted*, never as merely detected: the bar for the next message is
+    /// what the owner has already seen, so a slow cumulative drift eventually clears it
+    /// while tick-by-tick noise never does.
+    alerted_taker: Decimal,
+    alerted_maker: Option<Decimal>,
+}
+
+/// Per-construction alert history plus its suppression counter.
+#[derive(Debug, Default)]
+struct AlertHistory {
+    seen: HashMap<String, AlertRecord>,
+    suppressed: u64,
+}
+
+/// Above this many tracked constructions the history is pruned of entries whose cooldown
+/// has long expired. Bounded by the event count in practice; this is the backstop.
+const MAX_ALERT_HISTORY: usize = 4_096;
 
 pub struct Alerter {
     cfg: AlertConfig,
     events: std::sync::Arc<EventLog>,
     telegram: Option<Telegram>,
     circuit: Mutex<Circuit>,
+    history: Mutex<AlertHistory>,
+}
+
+/// Cooldown identity of an opportunity: the same event, the same construction, the same
+/// side of the book. Deliberately coarser than [`crate::store::dedupe_key`], which includes
+/// the quotes — that is the right key for a *measurement row* and the wrong one for a
+/// *notification*, because a one-tick quote move is new data but not new news.
+pub fn alert_cooldown_key(op: &Opportunity) -> String {
+    format!(
+        "{}|{}|{}",
+        op.event_slug,
+        op.kind.as_str(),
+        if op.maker_only { "maker" } else { "taker" }
+    )
 }
 
 impl Alerter {
@@ -192,6 +240,7 @@ impl Alerter {
             events,
             telegram,
             circuit: Mutex::new(Circuit::default()),
+            history: Mutex::new(AlertHistory::default()),
         }
     }
 
@@ -200,11 +249,13 @@ impl Alerter {
     }
 
     pub fn stats(&self) -> AlertStats {
+        let cooldown_suppressed = self.history_lock().suppressed;
         let c = self.lock();
         AlertStats {
             sent: c.sent,
             failed: c.failed,
             suppressed: c.suppressed,
+            cooldown_suppressed,
             circuit_open: c.open_until.is_some_and(|until| Instant::now() < until),
         }
     }
@@ -213,6 +264,65 @@ impl Alerter {
         self.circuit
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn history_lock(&self) -> std::sync::MutexGuard<'_, AlertHistory> {
+        self.history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The re-alert gate (M6.1). `true` = send it; `false` = the owner has already been
+    /// told about this construction and it has not got materially better.
+    ///
+    /// Row-level dedupe stays as it was: a different set of quotes is different economics
+    /// and deserves its own measurement row. What this suppresses is only the *message*.
+    /// A live run alerted the same slow-moving event once per 5-minute sweep because its
+    /// ask drifted a tick each time; each drift produced a new dedupe key, a new row, and
+    /// a new notification.
+    ///
+    /// Calling this **records** the alert when it returns `true`, so call it once, at the
+    /// point of sending.
+    pub fn allow_alert_at(&self, op: &Opportunity, now: Instant) -> bool {
+        let cooldown = Duration::from_secs(self.cfg.per_event_cooldown_secs);
+        if cooldown.is_zero() {
+            return true;
+        }
+        let key = alert_cooldown_key(op);
+        let mut history = self.history_lock();
+
+        if let Some(previous) = history.seen.get(&key).copied() {
+            if now.saturating_duration_since(previous.last_alert) < cooldown {
+                let bar = self.cfg.realert_improvement;
+                let taker_better = op.net_taker >= previous.alerted_taker + bar;
+                let maker_better = match (op.net_maker, previous.alerted_maker) {
+                    (Some(current), Some(alerted)) => current >= alerted + bar,
+                    // A construction that has acquired a maker side it did not have before
+                    // is new information regardless of the numbers.
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if !(taker_better || maker_better) {
+                    history.suppressed += 1;
+                    return false;
+                }
+            }
+        }
+
+        if history.seen.len() >= MAX_ALERT_HISTORY {
+            history
+                .seen
+                .retain(|_, record| now.saturating_duration_since(record.last_alert) < cooldown);
+        }
+        history.seen.insert(
+            key,
+            AlertRecord {
+                last_alert: now,
+                alerted_taker: op.net_taker,
+                alerted_maker: op.net_maker,
+            },
+        );
+        true
     }
 
     /// Send `text`, then record the attempt (content included) in the JSONL log.
@@ -578,6 +688,104 @@ mod tests {
         );
     }
 
+    fn alerter_with(cfg: AlertConfig, dir: &str) -> Alerter {
+        let events = std::sync::Arc::new(
+            EventLog::open(&std::env::temp_dir().join(dir)).expect("event log"),
+        );
+        Alerter {
+            cfg,
+            events,
+            telegram: None,
+            circuit: Mutex::new(Circuit::default()),
+            history: Mutex::new(AlertHistory::default()),
+        }
+    }
+
+    /// Issue 4 of M6.1. "Eurozone Annual Inflation 2026" NO-side re-alerted on every 5-minute
+    /// sweep all night because its ask drifted a tick each time (6.32 → 6.33 → 6.34): new
+    /// economics, so correctly a new measurement row, but the same news. The row-level
+    /// dedupe stays; the *message* is what gets held back.
+    #[test]
+    fn the_cooldown_holds_back_a_drifting_re_detection_but_not_a_real_improvement() {
+        let mut cfg = cfg();
+        cfg.per_event_cooldown_secs = 1_800;
+        cfg.realert_improvement = dec!(0.01);
+        let alerter = alerter_with(cfg, "polyarb-test-cooldown");
+
+        let at = |secs: u64| Instant::now() + Duration::from_secs(secs);
+        let drifted = |net: Decimal| {
+            let mut op = sample_opportunity();
+            op.net_taker = net;
+            op.net_maker = Some(net + dec!(0.02));
+            op
+        };
+
+        // First sighting: 0.0305 net taker. Delivered.
+        assert!(alerter.allow_alert_at(&drifted(dec!(0.0305)), at(0)));
+        // Three sweeps later the ask has ticked twice: +0.0002 and +0.0004 on a 0.01 bar.
+        assert!(!alerter.allow_alert_at(&drifted(dec!(0.0307)), at(300)));
+        assert!(!alerter.allow_alert_at(&drifted(dec!(0.0309)), at(600)));
+        // And a *worse* re-detection is certainly not news.
+        assert!(!alerter.allow_alert_at(&drifted(dec!(0.0290)), at(900)));
+        assert_eq!(alerter.stats().cooldown_suppressed, 3);
+
+        // The bar is measured against what was last *alerted* (0.0305), not against the
+        // last thing seen, so a slow cumulative drift does eventually reach the phone:
+        // 0.0405 - 0.0305 = 0.0100, exactly the improvement threshold.
+        assert!(alerter.allow_alert_at(&drifted(dec!(0.0405)), at(1_200)));
+        // …and that re-alert becomes the new bar: 0.0500 - 0.0405 = 0.0095 < 0.01.
+        assert!(!alerter.allow_alert_at(&drifted(dec!(0.0500)), at(1_500)));
+        assert!(alerter.allow_alert_at(&drifted(dec!(0.0505)), at(1_600)));
+        assert_eq!(alerter.stats().cooldown_suppressed, 4);
+    }
+
+    #[test]
+    fn the_cooldown_expires_and_keys_on_event_kind_and_side() {
+        let mut cfg = cfg();
+        cfg.per_event_cooldown_secs = 1_800;
+        cfg.realert_improvement = dec!(0.01);
+        let alerter = alerter_with(cfg, "polyarb-test-cooldown-keys");
+
+        let start = Instant::now();
+        let op = sample_opportunity();
+        assert!(alerter.allow_alert_at(&op, start));
+        assert!(!alerter.allow_alert_at(&op, start + Duration::from_secs(1_799)));
+        // 30 minutes on, the same unchanged opportunity is worth saying again.
+        assert!(alerter.allow_alert_at(&op, start + Duration::from_secs(1_800)));
+
+        // A different event, a different construction on the same event, and the maker-side
+        // view of it are all separate conversations.
+        let mut other_event = op.clone();
+        other_event.event_slug = "another-event".into();
+        assert!(alerter.allow_alert_at(&other_event, start + Duration::from_secs(1_800)));
+
+        let mut other_kind = op.clone();
+        other_kind.kind = crate::types::OpportunityKind::NegRiskNoSide;
+        assert!(alerter.allow_alert_at(&other_kind, start + Duration::from_secs(1_800)));
+
+        let mut maker = op.clone();
+        maker.maker_only = true;
+        assert!(alerter.allow_alert_at(&maker, start + Duration::from_secs(1_800)));
+
+        assert_eq!(alert_cooldown_key(&op), "an-event|binary_yes_no|taker");
+        assert_eq!(alert_cooldown_key(&maker), "an-event|binary_yes_no|maker");
+        assert_ne!(alert_cooldown_key(&op), alert_cooldown_key(&other_kind));
+        assert_eq!(alerter.stats().cooldown_suppressed, 1);
+    }
+
+    #[test]
+    fn a_zero_cooldown_disables_the_gate_entirely() {
+        let mut cfg = cfg();
+        cfg.per_event_cooldown_secs = 0;
+        let alerter = alerter_with(cfg, "polyarb-test-cooldown-off");
+        let op = sample_opportunity();
+        let now = Instant::now();
+        for _ in 0..5 {
+            assert!(alerter.allow_alert_at(&op, now));
+        }
+        assert_eq!(alerter.stats().cooldown_suppressed, 0);
+    }
+
     #[tokio::test]
     async fn without_credentials_alerts_fall_back_to_the_jsonl_log() {
         let dir = std::env::temp_dir().join(format!("polyarb-test-jsonl-{}", std::process::id()));
@@ -590,6 +798,7 @@ mod tests {
             events: events.clone(),
             telegram: None, // as if the env vars were unset
             circuit: Mutex::new(Circuit::default()),
+            history: Mutex::new(AlertHistory::default()),
         };
 
         let delivery = alerter
@@ -637,6 +846,7 @@ mod tests {
             cfg,
             events: events.clone(),
             circuit: Mutex::new(Circuit::default()),
+            history: Mutex::new(AlertHistory::default()),
         };
 
         for _ in 0..2 {
@@ -716,6 +926,7 @@ mod tests {
             cfg: cfg(),
             events: events.clone(),
             circuit: Mutex::new(Circuit::default()),
+            history: Mutex::new(AlertHistory::default()),
         };
 
         let delivery = alerter
@@ -754,6 +965,7 @@ mod tests {
             cfg,
             events,
             circuit: Mutex::new(Circuit::default()),
+            history: Mutex::new(AlertHistory::default()),
         };
         // Pretend a message just went out.
         alerter.lock().last_sent = Some(Instant::now());

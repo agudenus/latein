@@ -348,7 +348,17 @@ not it cleared the alert threshold:
 ```bash
 tail -f logs/events.jsonl
 wc -l logs/events.jsonl
+
+# Why each one did or did not reach the phone (M6.1 adds "cooldown"):
+grep '"event":"opportunity"' logs/events.jsonl \
+  | python3 -c 'import json,sys,collections;print(collections.Counter(json.loads(l)["delivery"] for l in sys.stdin))'
 ```
+
+`delivery = "cooldown"` means the same `(event, kind, side)` construction was already
+alerted inside `alerts.per_event_cooldown_secs` and had not improved by
+`alerts.realert_improvement` per share. The row and this log line exist either way — only
+the message was held back. A large cooldown count is the intended state for a slow-moving
+market, not a fault.
 
 **A one-off scan**, printed to the terminal with the full cost breakdown, without
 disturbing the running daemon:
@@ -549,21 +559,31 @@ which is exactly the M3 daemon. Check it explicitly:
 # 6. Did it ever connect? One line per shard per connection.
 docker compose logs --no-color | grep -c "market stream connected"
 
-# 7. Did it give up? This is the loud, permanent fallback to polling.
-docker compose logs --no-color | grep "falling back to REST polling"
+# 7. Did it hand detection back to REST? (Only happens when REST works and WS does not.)
+docker compose logs --no-color | grep "handing \\|answered a re-probe"
 
 # 8. Frame health at shutdown (snapshots/deltas/unknown/malformed/out_of_order/divergences).
 docker compose logs --no-color | grep "market stream stopping"
 
 # 9. Did our locally maintained books disagree with REST?
 docker compose logs --no-color | grep "disagreed with REST at the top of book"
+
+# 10. Is traffic actually arriving? One line per full REST sweep (M6.1).
+docker compose logs --no-color | grep "stream data-plane health"
+
+# 11. How much REST load did the targeted resync path cause? (M6.1: should be small.)
+docker compose logs --no-color | grep "resynced stale books over REST" | tail -20
 ```
 
 - [ ] **Check 6 is non-zero.** Zero → `stream.url` is wrong, or the handshake is rejected.
       Nothing is lost (the daemon polls), but the whole latency benefit is.
-- [ ] **Check 7 is empty.** A hit means the endpoint was unreachable
-      `stream.fallback_after_failures` times in a row and streaming is off for that
-      process. Every latency number in the report after that point is absent, not zero.
+- [ ] **Check 7 is empty.** A `handing detection back` line means the endpoint failed
+      `stream.fallback_after_failures` times in a row *while REST kept working* — i.e. the
+      socket specifically is broken. Latency numbers are absent, not zero, from that point
+      until an `answered a re-probe` line shows streaming restored (M6.1: the hand-over
+      lasts only until the endpoint proves itself again, re-probed every
+      `stream.reprobe_interval_secs`). Repeated pairs of both lines mean a flapping
+      endpoint. A *total* network outage produces neither line — both transports retry.
 - [ ] **Check 8 shows `snapshots` > 0 and `deltas` > 0.** `snapshots: 0` with a successful
       connection means the subscribe frame shape (`assets_ids`, `type: "market"` in
       `subscribe_message`, `src/ws.rs`) is wrong — we connected and were ignored.
@@ -582,6 +602,16 @@ docker compose logs --no-color | grep "disagreed with REST at the top of book"
       divergence count means detection has been running on a book that does not match the
       venue — treat every stream-detected opportunity as unproven until it is explained,
       and re-soak with `stream.enabled = false` to get a clean REST baseline.
+- [ ] **Check 10 shows a non-zero `events_per_sec` on every sweep.** This is the M6.1
+      addition that makes "subscribed but silent" distinguishable from "the market is
+      quiet" — from the book state alone they look identical. `frames = 0` across sweeps
+      while `connections` is non-zero means we connected and are being ignored (see the
+      subscribe-frame note under check 8).
+- [ ] **Check 11 shows `requested` in the hundreds at most, and usually nothing at all.**
+      Before M6.1 this line read `requested=16500+` every ~90 s — every *quiet* book in the
+      universe, on a loop, because silence was being treated as staleness. It should now
+      only fire after a reconnect or a universe re-plan. A sustained large `requested` means
+      shards are flapping; correlate with `reconnects` in check 8.
 - [ ] **`## Detection latency (stream)` p50 is in the tens of milliseconds.** Hundreds of
       ms or more points at `stream.debounce_ms`, a saturated shard, or a `timestamp` unit
       we guessed wrong (the fallback measurement — time since we read the frame — cannot

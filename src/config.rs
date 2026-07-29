@@ -222,15 +222,36 @@ pub struct StreamConfig {
     /// Small enough to stay in the tens of milliseconds, large enough that a burst across
     /// an event's legs is one detection pass rather than one per leg.
     pub debounce_ms: u64,
-    /// A book not updated for this long is re-fetched over REST. This is the bound on how
-    /// wrong a silently-dead subscription can make us.
+    /// Rate limit / batching cap on the targeted stale-book resync: one token is
+    /// re-requested over REST at most once per this window.
+    ///
+    /// It is **not** an idle timeout (M6.1). Silence on a healthy shard means the market
+    /// is quiet, which is the normal state of most books; treating it as staleness made
+    /// this path re-fetch ~16 500 books every 90 s, heavier than the polling loop it
+    /// replaced. Only an explicitly invalidated book, or one whose shard dropped after its
+    /// last update, is resynced — and this window caps how often.
+    ///
+    /// It governs the two cases that need rate-limiting (a token the API has no book for,
+    /// and a book suspect only because of a shard gap). A book we hold and have explicitly
+    /// invalidated is repaired on a much shorter fixed floor — see
+    /// [`crate::ws::BookStore::missing_or_stale`].
     pub stale_after_secs: u64,
     /// Cadence of the full REST sweep: re-fetch every book, cross-check a random sample
-    /// against the local state, and run detection over the whole universe.
+    /// against the local state, and run detection over the whole universe. This, not
+    /// `stale_after_secs`, is the global integrity net.
     pub resync_interval_secs: u64,
-    /// Consecutive failed connection attempts before streaming is abandoned for the life
-    /// of the process (logged at ERROR) and the daemon reverts to REST polling.
+    /// Consecutive failed connection attempts before streaming hands over to REST polling
+    /// (logged at ERROR).
+    ///
+    /// The streak is necessary but not sufficient: the daemon only trips the switch when
+    /// REST demonstrably worked *during* the same streak. Both transports failing together
+    /// is a network outage, not a broken socket, and is retried indefinitely.
     pub fallback_after_failures: u32,
+    /// After a fallback, how often to open one throwaway connection to see whether the
+    /// endpoint answers again. On success the pool is restarted and streaming resumes
+    /// (logged loudly), so "permanent" really means "until proven working again".
+    #[serde(default = "default_reprobe_interval_secs")]
+    pub reprobe_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +273,21 @@ pub struct AlertConfig {
     pub alert_min_net_by_category: BTreeMap<String, Decimal>,
     /// Anti-spam spacing between routine (opportunity) alerts. Daily summaries ignore it.
     pub min_seconds_between_alerts: u64,
+    /// Re-alert cooldown per `(event, kind, side)` (M6.1).
+    ///
+    /// A slow-moving opportunity is re-detected on every sweep, and a one-tick ask move
+    /// (6.32 → 6.33) is different economics, so it is correctly a *new* row — but it is not
+    /// news. Inside this window the same construction is not alerted again unless it got
+    /// materially better (`realert_improvement`). Suppressed alerts are still written to
+    /// the JSONL log with `delivery = "cooldown"`, so nothing is lost from the record.
+    /// `0` disables the cooldown.
+    #[serde(default = "default_per_event_cooldown_secs")]
+    pub per_event_cooldown_secs: u64,
+    /// How much better, in net per share, a re-detection must be to break the cooldown.
+    /// Compared against the last *alerted* figure on both the taker and the maker side, so
+    /// a slow cumulative drift eventually re-alerts while tick noise never does.
+    #[serde(default = "default_realert_improvement")]
+    pub realert_improvement: Decimal,
     /// Consecutive delivery failures before the circuit breaker opens.
     pub failure_circuit_break: u32,
     /// How long the breaker stays open before the next attempt is allowed through.
@@ -289,6 +325,22 @@ fn default_alert_min_net_by_category() -> BTreeMap<String, Decimal> {
     [("crypto".to_string(), Decimal::new(8, 3))]
         .into_iter()
         .collect()
+}
+
+/// One hour. Long enough that a genuinely dead endpoint is not hammered, short enough that
+/// a night-long outage does not cost a night of streaming.
+fn default_reprobe_interval_secs() -> u64 {
+    3_600
+}
+
+/// 30 minutes: the same slow-moving opportunity is worth one message per half hour.
+fn default_per_event_cooldown_secs() -> u64 {
+    1_800
+}
+
+/// A cent per share. Below that a re-alert is a rounding artefact of the book ticking.
+fn default_realert_improvement() -> Decimal {
+    Decimal::new(1, 2)
 }
 
 fn default_fee_rates() -> BTreeMap<String, Decimal> {
@@ -329,7 +381,9 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             page_size: 100,
-            max_events: 2_000,
+            // Raised from 2 000 after a live run filled all 20 pages: the active-event
+            // count is past that, and a truncated universe can split a NegRisk event.
+            max_events: 6_000,
             max_negrisk_outcomes: 30,
             report_partial_negrisk: false,
             min_size_shares: Decimal::new(5, 0),
@@ -395,9 +449,10 @@ impl Default for StreamConfig {
             url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string(),
             max_subs_per_connection: 500,
             debounce_ms: 50,
-            stale_after_secs: 60,
+            stale_after_secs: 900,
             resync_interval_secs: 300,
             fallback_after_failures: 5,
+            reprobe_interval_secs: default_reprobe_interval_secs(),
         }
     }
 }
@@ -409,6 +464,8 @@ impl Default for AlertConfig {
             alert_min_net_per_share: Decimal::new(1, 2),
             alert_min_net_by_category: default_alert_min_net_by_category(),
             min_seconds_between_alerts: 30,
+            per_event_cooldown_secs: default_per_event_cooldown_secs(),
+            realert_improvement: default_realert_improvement(),
             failure_circuit_break: 3,
             circuit_reprobe_secs: 900,
             telegram_api_base: "https://api.telegram.org".to_string(),
@@ -623,6 +680,13 @@ impl Config {
                     "stream.stale_after_secs and stream.resync_interval_secs must be > 0".into(),
                 ));
             }
+            if self.stream.reprobe_interval_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "stream.reprobe_interval_secs must be > 0 (0 would re-probe the endpoint \
+                     on every tick after a fallback)"
+                        .into(),
+                ));
+            }
             if self.stream.fallback_after_failures == 0 {
                 return Err(ConfigError::Invalid(
                     "stream.fallback_after_failures must be > 0 (0 would fall back before the \
@@ -652,6 +716,13 @@ impl Config {
                     "alerts.alert_min_net_by_category.{name} must be >= 0"
                 )));
             }
+        }
+        if self.alerts.realert_improvement < Decimal::ZERO {
+            return Err(ConfigError::Invalid(
+                "alerts.realert_improvement must be >= 0 (a negative bar would re-alert on \
+                 every worsening re-detection)"
+                    .into(),
+            ));
         }
         if self.alerts.failure_circuit_break == 0 {
             return Err(ConfigError::Invalid(
@@ -952,9 +1023,10 @@ mod tests {
         );
         assert_eq!(cfg.stream.max_subs_per_connection, 500);
         assert_eq!(cfg.stream.debounce_ms, 50);
-        assert_eq!(cfg.stream.stale_after_secs, 60);
+        assert_eq!(cfg.stream.stale_after_secs, 900);
         assert_eq!(cfg.stream.resync_interval_secs, 300);
         assert_eq!(cfg.stream.fallback_after_failures, 5);
+        assert_eq!(cfg.stream.reprobe_interval_secs, 3_600);
         // The shipped section must agree with the compiled defaults.
         assert_eq!(cfg.stream, StreamConfig::default());
         // And the file must say out loud that the wire shapes are unverified.
@@ -962,6 +1034,66 @@ mod tests {
             SHIPPED.contains("TODO(verify-live)"),
             "the stream section must keep its unverified-API warning"
         );
+    }
+
+    /// The four M6.1 knobs, each one the fix for something a live overnight run did wrong.
+    #[test]
+    fn shipped_config_carries_the_m6_1_soak_fixes() {
+        let cfg = Config::from_toml_str(SHIPPED).expect("parse");
+        cfg.validate().expect("validate");
+
+        // Issue 3: 2 000 was not enough — all 20 pages came back full.
+        assert_eq!(cfg.scan.max_events, 6_000);
+        // Issue 2: silence is not staleness; this is now only the re-request rate limit.
+        assert_eq!(cfg.stream.stale_after_secs, 900);
+        // Issue 1: a fallback lasts until the endpoint proves itself again.
+        assert_eq!(cfg.stream.reprobe_interval_secs, 3_600);
+        // Issue 4: the same slow-moving construction is one message per half hour.
+        assert_eq!(cfg.alerts.per_event_cooldown_secs, 1_800);
+        assert_eq!(cfg.alerts.realert_improvement, dec!(0.01));
+
+        // The shipped file and the compiled defaults must not drift apart.
+        assert_eq!(cfg.stream, StreamConfig::default());
+        assert_eq!(cfg.alerts, AlertConfig::default());
+        assert_eq!(cfg.scan.max_events, ScanConfig::default().max_events);
+    }
+
+    /// The new keys are optional so an operator's older `config/default.toml` copy keeps
+    /// starting up — it simply gets the defaults rather than a parse error.
+    #[test]
+    fn the_m6_1_keys_are_optional_and_validated() {
+        let older = SHIPPED
+            .lines()
+            .filter(|l| {
+                !l.starts_with("reprobe_interval_secs")
+                    && !l.starts_with("per_event_cooldown_secs")
+                    && !l.starts_with("realert_improvement")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = Config::from_toml_str(&older).expect("a config without the new keys must load");
+        cfg.validate().expect("validate");
+        assert_eq!(cfg.stream.reprobe_interval_secs, 3_600);
+        assert_eq!(cfg.alerts.per_event_cooldown_secs, 1_800);
+        assert_eq!(cfg.alerts.realert_improvement, dec!(0.01));
+
+        // A zero re-probe interval would probe on every tick.
+        let mut bad = Config::default();
+        bad.stream.reprobe_interval_secs = 0;
+        assert!(bad.validate().is_err());
+        bad.stream.enabled = false;
+        assert!(bad.validate().is_ok(), "not checked when streaming is off");
+
+        // A negative bar would re-alert on every *worse* re-detection.
+        let mut negative = Config::default();
+        negative.alerts.realert_improvement = dec!(-0.01);
+        assert!(negative.validate().is_err());
+
+        // Zero is legal on both: no cooldown, and re-alert on any improvement at all.
+        let mut eager = Config::default();
+        eager.alerts.per_event_cooldown_secs = 0;
+        eager.alerts.realert_improvement = Decimal::ZERO;
+        assert!(eager.validate().is_ok());
     }
 
     #[test]
@@ -991,6 +1123,10 @@ mod tests {
             StreamConfig {
                 // 0 would fall back before the first attempt.
                 fallback_after_failures: 0,
+                ..StreamConfig::default()
+            },
+            StreamConfig {
+                reprobe_interval_secs: 0,
                 ..StreamConfig::default()
             },
             StreamConfig {

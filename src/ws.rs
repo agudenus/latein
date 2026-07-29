@@ -34,6 +34,31 @@
 //! * A `book` snapshot whose `hash` repeats but whose content differs is counted and the
 //!   book is marked stale — we cannot verify the hash, but a contradiction in it is still
 //!   evidence that our view and the server's have diverged.
+//! * **Quiet is not stale** (M6.1). Silence on a healthy, connected shard is the *normal*
+//!   state of a 16 000-book universe: nothing traded, so nothing was pushed. Treating
+//!   silence as staleness turned the cheap targeted resync into a heavier poller than the
+//!   loop it replaced (a live run re-requested 16 500 books every ~90 s). A book is
+//!   therefore only stale when it is explicitly marked, or when **its shard disconnected
+//!   after the book's last update** — i.e. when there really is a window we could have
+//!   missed. `stream.stale_after_secs` survives as the cap on how often one token may be
+//!   re-requested by that path, and the slow full REST sweep remains the global net.
+//!
+//! ## Fallback: "the socket is broken" vs "the machine is offline" (M6.1)
+//!
+//! A live overnight run lost its network entirely for ~60 s: every shard took a TLS EOF at
+//! once, reconnects failed with DNS errors, and the REST `/books` call failed in the same
+//! moment. The old one-way switch read that as "streaming is broken" and disabled it for
+//! the life of the process, even though everything recovered a minute later.
+//!
+//! So the switch now needs *two* facts, and [`StreamHealth::evaluate_fallback`] is only
+//! allowed to trip when both hold: a streak of `fallback_after_failures` WS connect
+//! failures with no live connection left, **and** at least one REST request that succeeded
+//! during that same streak (proof the box has a network and it is the socket that is at
+//! fault). When both transports are failing, both keep retrying on capped backoff forever
+//! — a total outage is survivable and must not degrade the process permanently.
+//!
+//! Even a tripped fallback is no longer forever: the daemon re-probes the endpoint every
+//! `stream.reprobe_interval_secs` with [`probe`] and restores streaming if it answers.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -65,6 +90,11 @@ const MAX_PLAUSIBLE_LATENCY_MS: i64 = 60_000;
 /// How many books one cross-check sweep compares against REST. Comparing every book on
 /// every sweep is pointless work: drift is systematic, so a sample finds it.
 pub const DIVERGENCE_SAMPLE: usize = 64;
+/// Cooldown on re-requesting a book we *hold* but have explicitly invalidated (reconnect,
+/// out-of-order delta, contradictory hash). Deliberately short and not configurable: this
+/// is the repair path, it fires rarely, and `stream.stale_after_secs` — which is minutes —
+/// exists to rate-limit the *other* two cases (see [`BookStore::missing_or_stale`]).
+const TARGETED_RESYNC_COOLDOWN_SECS: u64 = 15;
 const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 30_000;
 /// Keepalive cadence. TODO(verify-live): the public docs mention a client keepalive on the
@@ -351,6 +381,13 @@ struct LiveBook {
     /// True when this copy is not trustworthy: never snapshotted, or invalidated by a
     /// reconnect / out-of-order frame / hash contradiction.
     stale: bool,
+    /// Which connection is (or was last) responsible for this token. Silence only makes a
+    /// book suspect if *this* shard has had a gap since the book's last update.
+    shard: Option<usize>,
+    /// Whether we have ever actually held a book for this token, from REST or from a
+    /// snapshot frame. `false` means "asked about, never answered" — the tokens with no
+    /// order book at all, which must be re-requested slowly or not at all.
+    ever_had_a_book: bool,
 }
 
 impl LiveBook {
@@ -363,6 +400,8 @@ impl LiveBook {
             last_hash: None,
             last_rest_attempt: None,
             stale: true,
+            shard: None,
+            ever_had_a_book: false,
         }
     }
 
@@ -379,6 +418,10 @@ impl LiveBook {
 /// gates a trade.
 #[derive(Debug, Default)]
 pub struct StreamStats {
+    /// Payloads read off a socket, whatever they turned out to contain. This is the one
+    /// counter that separates "the market is quiet" from "the subscription is dead": a
+    /// silent shard and a quiet book are otherwise indistinguishable.
+    pub messages: AtomicU64,
     pub snapshots: AtomicU64,
     pub deltas: AtomicU64,
     pub unknown_frames: AtomicU64,
@@ -402,6 +445,7 @@ impl StreamStats {
 
     pub fn snapshot(&self) -> StreamStatsSnapshot {
         StreamStatsSnapshot {
+            messages: self.messages.load(Ordering::Relaxed),
             snapshots: self.snapshots.load(Ordering::Relaxed),
             deltas: self.deltas.load(Ordering::Relaxed),
             unknown_frames: self.unknown_frames.load(Ordering::Relaxed),
@@ -420,6 +464,7 @@ impl StreamStats {
 /// A plain-old-data copy of [`StreamStats`], for logging.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamStatsSnapshot {
+    pub messages: u64,
     pub snapshots: u64,
     pub deltas: u64,
     pub unknown_frames: u64,
@@ -438,6 +483,9 @@ pub struct StreamStatsSnapshot {
 #[derive(Debug, Default)]
 pub struct BookStore {
     books: Mutex<HashMap<TokenId, LiveBook>>,
+    /// shard index → when that connection last dropped. The only thing that can turn a
+    /// *quiet* book into a suspect one.
+    shard_disconnects: Mutex<HashMap<usize, Instant>>,
     pub stats: StreamStats,
 }
 
@@ -452,6 +500,40 @@ impl BookStore {
         self.books
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Copy of the per-shard disconnect times. Always taken *before* the book lock, so the
+    /// two mutexes have one global order and cannot deadlock.
+    fn disconnects(&self) -> HashMap<usize, Instant> {
+        self.shard_disconnects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Note which connection owns these tokens. Called on every (re)connect, because a
+    /// universe re-plan can move a token to a different shard.
+    pub fn assign_shard(&self, shard: usize, tokens: &[TokenId], now: Instant) {
+        let mut live = self.lock();
+        for token in tokens {
+            live.entry(token.clone())
+                .or_insert_with(|| LiveBook::placeholder(token.clone(), now))
+                .shard = Some(shard);
+        }
+    }
+
+    /// Record that a connection dropped. Every book on that shard whose last update
+    /// predates this moment now has an unexplained gap and is due for a REST resync.
+    pub fn record_shard_disconnect(&self, shard: usize, at: Instant) {
+        self.shard_disconnects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(shard, at);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn shard_disconnected_at(&self, shard: usize) -> Option<Instant> {
+        self.disconnects().get(&shard).copied()
     }
 
     /// Apply one frame. Returns the token whose book changed, if any — that is the signal
@@ -486,6 +568,7 @@ impl BookStore {
                 entry.book = fresh;
                 entry.last_hash = meta.hash.clone();
                 entry.stale = false;
+                entry.ever_had_a_book = true;
                 entry.bump(received, meta.server_ts);
                 StreamStats::bump(&self.stats.snapshots);
                 Some(asset_id.clone())
@@ -557,6 +640,7 @@ impl BookStore {
                 .or_insert_with(|| LiveBook::placeholder(token.clone(), now));
             entry.book = book.clone();
             entry.stale = false;
+            entry.ever_had_a_book = true;
             entry.last_hash = None;
             entry.last_rest_attempt = Some(now);
             entry.bump(now, None);
@@ -606,30 +690,61 @@ impl BookStore {
         }
     }
 
-    /// Tokens that need a targeted REST re-fetch: never seen, explicitly stale, or not
-    /// updated inside `stale_after` — and not already asked about inside the same window.
+    /// Tokens that need a targeted REST re-fetch.
     ///
-    /// That last clause is the rate limit on this path. Some tokens simply have no book,
-    /// and a book that never arrives would otherwise be requested on every tick for as
-    /// long as the daemon runs.
+    /// A token qualifies when it is
+    ///
+    /// * **never seen** — we have no book at all; or
+    /// * **explicitly stale** — invalidated by a reconnect, an out-of-order delta or a
+    ///   self-contradicting hash; or
+    /// * **behind a shard gap** — its connection dropped after the book's last update, so
+    ///   there is a window of pushes we may have missed.
+    ///
+    /// Silence is deliberately *not* on that list (M6.1). Most of a 16 000-book universe
+    /// never trades in a given minute; re-fetching every quiet book made the "cheap"
+    /// targeted path heavier than the polling loop it was supposed to replace.
+    ///
+    /// How often one token may be re-requested depends on *why* it is due, because the
+    /// three reasons want very different rates:
+    ///
+    /// * **explicitly invalidated, and we do hold a book** — [`TARGETED_RESYNC_COOLDOWN_SECS`].
+    ///   Rare, and repairing it promptly is the entire point: a reconnect must not have to
+    ///   wait out a 15-minute window, not least because that REST call is also the evidence
+    ///   the fallback decision needs.
+    /// * **asked about but never answered** — `stale_after`. Some tokens have no order book
+    ///   at all and never will; this is pure rate limit, and without it they would be
+    ///   requested on every tick for as long as the daemon runs.
+    /// * **only its shard had a gap** — `stale_after`, the batching cap, with the full REST
+    ///   sweep as the real integrity net.
     pub fn missing_or_stale(
         &self,
         tokens: &[TokenId],
         now: Instant,
         stale_after: Duration,
     ) -> Vec<TokenId> {
+        let prompt = Duration::from_secs(TARGETED_RESYNC_COOLDOWN_SECS).min(stale_after);
+        let disconnects = self.disconnects();
         let live = self.lock();
         tokens
             .iter()
             .filter(|t| match live.get(*t) {
                 None => true,
                 Some(entry) => {
-                    let due = entry.stale
-                        || now.saturating_duration_since(entry.last_update) >= stale_after;
-                    let cooled = entry.last_rest_attempt.is_none_or(|attempted| {
-                        now.saturating_duration_since(attempted) >= stale_after
-                    });
-                    due && cooled
+                    let shard_gap = entry
+                        .shard
+                        .and_then(|shard| disconnects.get(&shard).copied())
+                        .is_some_and(|down| down >= entry.last_update);
+                    if !(entry.stale || shard_gap) {
+                        return false;
+                    }
+                    let cooldown = if entry.stale && entry.ever_had_a_book {
+                        prompt
+                    } else {
+                        stale_after
+                    };
+                    entry.last_rest_attempt.is_none_or(|attempted| {
+                        now.saturating_duration_since(attempted) >= cooldown
+                    })
                 }
             })
             .cloned()
@@ -642,29 +757,51 @@ impl BookStore {
         self.lock().retain(|token, _| keep.contains(token));
     }
 
-    /// How many of a random sample of `rest`'s books disagree with our local copy at the
-    /// top of book — the number that matters, since that is what the detectors price.
+    /// How many of a random sample of `rest` disagree with our local copy at the top of
+    /// book — the number that matters, since that is what the detectors price.
+    ///
+    /// Returns `(diverged, compared)`.
+    ///
+    /// Call this per REST *batch*, as the batch lands, and pass that batch's request start
+    /// as `fetch_started`. A full sweep of the live universe takes 30–70 s, and both parts
+    /// of that matter (M6.1):
+    ///
+    /// * comparing at the end of the sweep would judge our local book against a REST body
+    ///   that is up to a minute old, and
+    /// * a book we updated *while the request was in flight* legitimately disagrees with
+    ///   the answer — the market moved, our copy is the newer one. Such a book is skipped
+    ///   rather than counted, so the WARN means "our state has rotted", not "the market is
+    ///   active".
     ///
     /// Call this *before* [`apply_rest`], which overwrites the evidence.
-    pub fn count_divergence(&self, rest: &BookMap, sample: usize) -> usize {
-        let mut tokens: Vec<&TokenId> = rest.keys().collect();
-        if tokens.len() > sample {
-            tokens.shuffle(&mut rand::thread_rng());
-            tokens.truncate(sample);
+    pub fn count_divergence(
+        &self,
+        rest: &[OrderBook],
+        sample: usize,
+        fetch_started: Instant,
+    ) -> (usize, usize) {
+        let mut picked: Vec<&OrderBook> = rest.iter().collect();
+        if picked.len() > sample {
+            picked.shuffle(&mut rand::thread_rng());
+            picked.truncate(sample);
         }
         let live = self.lock();
         let mut diverged = 0usize;
-        for token in tokens {
-            let Some(entry) = live.get(token) else {
+        let mut compared = 0usize;
+        for theirs in picked {
+            let Some(entry) = live.get(&theirs.asset_id) else {
                 continue;
             };
             // A book we already know is stale is not evidence of drift.
             if entry.stale {
                 continue;
             }
-            let Some(theirs) = rest.get(token) else {
+            // Our copy changed after the request went out: any disagreement is in-flight
+            // market movement, which says nothing about whether our state is correct.
+            if entry.last_update >= fetch_started {
                 continue;
-            };
+            }
+            compared += 1;
             let top = |b: &OrderBook| (b.bids.first().cloned(), b.asks.first().cloned());
             if top(&entry.book) != top(theirs) {
                 diverged += 1;
@@ -675,8 +812,18 @@ impl BookStore {
                 .divergences
                 .fetch_add(diverged as u64, Ordering::Relaxed);
         }
-        diverged
+        (diverged, compared)
     }
+}
+
+/// Message rate since the previous sample, as a `Decimal` (no `f64` anywhere, per the
+/// project convention). Zero elapsed time yields zero rather than a division by zero.
+pub fn events_per_sec(count: u64, elapsed: Duration) -> Decimal {
+    let millis = Decimal::from(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+    if millis.is_zero() {
+        return Decimal::ZERO;
+    }
+    (Decimal::from(count) * Decimal::ONE_THOUSAND / millis).round_dp(2)
 }
 
 // ---------------------------------------------------------------------------------
@@ -866,13 +1013,22 @@ pub fn replan(existing: &[Vec<TokenId>], desired: &[TokenId], cap: usize) -> Sha
 // Health
 // ---------------------------------------------------------------------------------
 
-/// Connection health, and the one-way switch to REST-only polling.
+/// Connection health, and the switch to REST-only polling.
+///
+/// The switch is deliberately *not* driven by WebSocket failures alone. See the module
+/// docs: a total network outage fails the socket and REST at the same moment, and reading
+/// that as "streaming is broken" cost a live run its stream for the rest of the night.
 #[derive(Debug)]
 pub struct StreamHealth {
     consecutive_failures: AtomicU32,
     fallback_after: u32,
     fallen_back: AtomicBool,
     connected: AtomicU32,
+    /// At least one REST request has succeeded since this failure streak began. This is
+    /// the evidence that the machine has a working network and the socket does not.
+    rest_ok_during_streak: AtomicBool,
+    /// Telemetry only: REST failures observed by the daemon while streaming was up.
+    rest_failures: AtomicU64,
 }
 
 impl StreamHealth {
@@ -882,11 +1038,13 @@ impl StreamHealth {
             fallback_after: fallback_after.max(1),
             fallen_back: AtomicBool::new(false),
             connected: AtomicU32::new(0),
+            rest_ok_during_streak: AtomicBool::new(false),
+            rest_failures: AtomicU64::new(0),
         }
     }
 
     fn record_connected(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.begin_streak();
         self.connected.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -897,24 +1055,83 @@ impl StreamHealth {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
+        // A drop starts a fresh streak, with fresh REST evidence: whatever REST managed
+        // *before* the socket died says nothing about the network right now.
+        self.begin_streak();
     }
 
-    /// Returns true when this failure tripped the permanent fallback.
-    fn record_connect_failure(&self) -> bool {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if failures >= self.fallback_after && !self.fallen_back.swap(true, Ordering::SeqCst) {
-            return true;
+    /// Reset the streak and the REST evidence that goes with it.
+    fn begin_streak(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.rest_ok_during_streak.store(false, Ordering::SeqCst);
+    }
+
+    /// Returns the length of the current failure streak.
+    fn record_connect_failure(&self) -> u32 {
+        self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The daemon reporting that a REST call went through. Only meaningful *during* a WS
+    /// failure streak, which is exactly when it is consulted.
+    pub fn record_rest_success(&self) {
+        self.rest_ok_during_streak.store(true, Ordering::SeqCst);
+    }
+
+    /// The daemon reporting that a REST call failed. Counted for the log line; it never
+    /// clears the flag, because one failed request does not unprove a working network.
+    pub fn record_rest_failure(&self) {
+        self.rest_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decide whether streaming should hand over to REST polling, and trip the switch if
+    /// so. Returns true only on the transition.
+    ///
+    /// Called from the daemon loop rather than from a socket task on purpose: the decision
+    /// needs the REST evidence, which only the daemon has, and it needs it *after* this
+    /// tick's REST work. All three conditions must hold:
+    ///
+    /// 1. the WS failure streak has reached `fallback_after_failures`;
+    /// 2. no connection is currently live (one bad shard must not sink 33 good ones);
+    /// 3. REST succeeded at least once during that same streak.
+    ///
+    /// Fail (3) — the both-down case — and we keep retrying both, indefinitely.
+    pub fn evaluate_fallback(&self) -> bool {
+        if self.fallen_back() {
+            return false;
         }
-        false
+        if self.consecutive_failures.load(Ordering::Relaxed) < self.fallback_after {
+            return false;
+        }
+        if self.live_connections() > 0 {
+            return false;
+        }
+        if !self.rest_ok_during_streak.load(Ordering::SeqCst) {
+            return false;
+        }
+        !self.fallen_back.swap(true, Ordering::SeqCst)
     }
 
-    /// True once the stream has been given up on for the life of the process.
+    /// True once the stream has been given up on — until a re-probe proves it works again,
+    /// at which point the daemon starts a fresh pool with a fresh [`StreamHealth`].
     pub fn fallen_back(&self) -> bool {
         self.fallen_back.load(Ordering::SeqCst)
     }
 
     pub fn live_connections(&self) -> u32 {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn rest_ok_during_streak(&self) -> bool {
+        self.rest_ok_during_streak.load(Ordering::SeqCst)
+    }
+
+    pub fn rest_failures(&self) -> u64 {
+        self.rest_failures.load(Ordering::Relaxed)
     }
 }
 
@@ -966,8 +1183,10 @@ pub struct StreamManager {
 
 impl StreamManager {
     /// Start the pool for `tokens`. Connections are established in the background: a start
-    /// never blocks the daemon, and an endpoint that is simply down turns into the
-    /// permanent REST fallback after `stream.fallback_after_failures` attempts.
+    /// never blocks the daemon. An endpoint that is down is retried forever on capped
+    /// backoff; whether that ever becomes a REST-only fallback is the daemon's call, via
+    /// [`StreamHealth::evaluate_fallback`], because only the daemon knows whether REST is
+    /// working at the same time.
     pub fn start(cfg: &Config, tokens: &[TokenId], shutdown: watch::Receiver<bool>) -> Self {
         let stream = &cfg.stream;
         let books = Arc::new(BookStore::new());
@@ -1109,6 +1328,7 @@ async fn shard_task(
             Ok((socket, _response)) => {
                 health.record_connected();
                 attempt = 0;
+                books.assign_shard(id, &tokens, Instant::now());
                 tracing::info!(shard = id, tokens = tokens.len(), "market stream connected");
                 run_connection(
                     id,
@@ -1122,7 +1342,9 @@ async fn shard_task(
                 .await;
                 health.record_disconnected();
                 // Whatever we missed while the socket was down is unknowable, so every
-                // book on this shard is unverified until a fresh snapshot lands.
+                // book on this shard is unverified until a fresh snapshot lands, and any
+                // book that stays quiet from here on is suspect too.
+                books.record_shard_disconnect(id, Instant::now());
                 books.mark_stale(&tokens);
                 StreamStats::bump(&books.stats.reconnects);
                 if *shutdown.borrow() {
@@ -1131,19 +1353,18 @@ async fn shard_task(
             }
             Err(err) => {
                 StreamStats::bump(&books.stats.connect_failures);
-                let tripped = health.record_connect_failure();
-                if tripped {
-                    tracing::error!(
-                        shard = id,
-                        %url,
-                        %err,
-                        "market stream unreachable — giving up on streaming for the life of \
-                         this process and falling back to REST polling. Detection latency \
-                         returns to the scan interval; check stream.url and connectivity."
-                    );
-                    return;
-                }
-                tracing::warn!(shard = id, %url, %err, attempt, "market stream connect failed");
+                let streak = health.record_connect_failure();
+                // Never a permanent decision from here: this task cannot tell a broken
+                // socket from a broken network. The daemon owns that call (it has the REST
+                // evidence) — see `StreamHealth::evaluate_fallback`.
+                tracing::warn!(
+                    shard = id,
+                    %url,
+                    %err,
+                    attempt,
+                    streak,
+                    "market stream connect failed — retrying with backoff"
+                );
                 attempt = attempt.saturating_add(1);
             }
         }
@@ -1226,6 +1447,22 @@ async fn run_connection<S>(
     }
 }
 
+/// One-off reachability probe, used to decide whether a fallen-back stream can be restored.
+///
+/// Deliberately *not* part of the pool: it opens a connection, subscribes to nothing, and
+/// closes again, so a probe against a live endpoint costs one handshake and cannot disturb
+/// the REST path that is currently carrying detection.
+pub async fn probe(url: &str, timeout: Duration) -> Result<(), String> {
+    match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(url)).await {
+        Ok(Ok((mut socket, _response))) => {
+            let _ = socket.close(None).await;
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!("no answer within {} s", timeout.as_secs())),
+    }
+}
+
 /// Parse and apply one payload. Returns false when the consumer is gone.
 async fn handle_payload(
     id: usize,
@@ -1234,6 +1471,7 @@ async fn handle_payload(
     touches: &mpsc::Sender<TokenTouch>,
     received: Instant,
 ) -> bool {
+    StreamStats::bump(&books.stats.messages);
     let frames = match parse_frames(text) {
         Ok(frames) => frames,
         Err(err) => {
@@ -1570,49 +1808,236 @@ mod tests {
     }
 
     #[test]
-    fn staleness_covers_never_seen_and_too_old_books() {
+    fn staleness_covers_never_seen_books() {
         let store = BookStore::new();
         let t0 = Instant::now();
         for frame in frames_of(SNAPSHOT) {
             store.apply_frame(&frame, t0);
         }
         let watched = vec![tok_id("1001"), tok_id("2002")];
-        // 2002 was never seen at all.
+        // 2002 was never seen at all; 1001 was just snapshotted.
         assert_eq!(
-            store.missing_or_stale(&watched, t0, Duration::from_secs(60)),
+            store.missing_or_stale(&watched, t0, Duration::from_secs(900)),
             vec![tok_id("2002")]
         );
-        // 61 s later 1001 is stale too.
-        let later = t0 + Duration::from_secs(61);
+    }
+
+    /// The M6.1 regression this milestone exists for. With staleness driven by silence, a
+    /// live run re-requested 16 500 books over REST every ~90 s — every quiet book in the
+    /// universe, on a loop, because nothing had traded in them. Silence on a healthy shard
+    /// must cost nothing; only a shard that actually dropped makes its quiet books suspect.
+    #[test]
+    fn a_quiet_book_is_only_resynced_when_its_shard_had_a_gap() {
+        let store = BookStore::new();
+        let t0 = Instant::now();
+        let quiet = tok_id("1001");
+        let watched = vec![quiet.clone()];
+        let window = Duration::from_secs(900);
+
+        store.assign_shard(0, &watched, t0);
+        for frame in frames_of(SNAPSHOT) {
+            store.apply_frame(&frame, t0);
+        }
+        assert_eq!(store.is_stale(&quiet), Some(false));
+
+        // An hour of total silence on a connected shard: nothing traded, nothing to do.
+        for age_secs in [61, 901, 3_600] {
+            assert!(
+                store
+                    .missing_or_stale(&watched, t0 + Duration::from_secs(age_secs), window)
+                    .is_empty(),
+                "a quiet book on a healthy shard must not be resynced after {age_secs} s"
+            );
+        }
+
+        // Its shard drops: now there is a window of pushes we cannot account for.
+        let down = t0 + Duration::from_secs(1_000);
+        store.record_shard_disconnect(0, down);
+        assert_eq!(store.shard_disconnected_at(0), Some(down));
         assert_eq!(
-            store.missing_or_stale(&watched, later, Duration::from_secs(60)),
+            store.missing_or_stale(&watched, down + Duration::from_secs(1), window),
+            watched,
+            "a book whose shard dropped after its last update must be resynced"
+        );
+
+        // A fresh update after the drop closes the gap again.
+        for frame in frames_of(SNAPSHOT) {
+            store.apply_frame(&frame, down + Duration::from_secs(2));
+        }
+        assert!(
+            store
+                .missing_or_stale(&watched, down + Duration::from_secs(3), window)
+                .is_empty(),
+            "an update newer than the disconnect is evidence the shard recovered"
+        );
+
+        // A book on a *different*, healthy shard is untouched by shard 0's trouble.
+        let other = tok_id("7777");
+        store.assign_shard(1, std::slice::from_ref(&other), t0);
+        store.apply_rest(
+            std::slice::from_ref(&other),
+            &[(other.clone(), OrderBook::new(other.clone(), vec![], vec![]))]
+                .into_iter()
+                .collect(),
+            t0,
+        );
+        assert!(store
+            .missing_or_stale(&[other], down + Duration::from_secs(3), window)
+            .is_empty());
+    }
+
+    /// The three reasons a book can be due are rate-limited differently on purpose: a
+    /// reconnect must be repaired in seconds (that REST call is also the evidence the
+    /// fallback decision needs), while a token the API has no book for must be left alone.
+    #[test]
+    fn an_invalidated_book_is_repaired_promptly_and_a_bookless_token_is_not() {
+        let store = BookStore::new();
+        let t0 = Instant::now();
+        let real = tok_id("1001");
+        let ghost = tok_id("ghost");
+        let watched = vec![real.clone(), ghost.clone()];
+        let window = Duration::from_secs(900);
+
+        // We asked about both; only `real` came back.
+        store.apply_rest(
+            &watched,
+            &[(
+                real.clone(),
+                OrderBook::new(
+                    real.clone(),
+                    vec![],
+                    vec![PriceLevel::new(dec!(0.4), dec!(1))],
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            t0,
+        );
+
+        // A reconnect invalidates the book we hold. It is re-fetched after the short
+        // repair cooldown, not after the 15-minute batching window.
+        store.mark_stale(std::slice::from_ref(&real));
+        assert!(
+            store
+                .missing_or_stale(&watched, t0 + Duration::from_secs(5), window)
+                .is_empty(),
+            "not instantly — a burst of frames must not turn into a burst of requests"
+        );
+        assert_eq!(
+            store.missing_or_stale(
+                &watched,
+                t0 + Duration::from_secs(TARGETED_RESYNC_COOLDOWN_SECS + 1),
+                window
+            ),
+            vec![real.clone()],
+            "an invalidated book is repaired promptly; the bookless token waits"
+        );
+
+        // The ghost only comes back round on the long window.
+        assert_eq!(
+            store.missing_or_stale(&watched, t0 + Duration::from_secs(901), window),
             watched
         );
+
+        // And a `stale_after` shorter than the repair cooldown wins — the configured value
+        // is never exceeded.
+        assert!(store
+            .missing_or_stale(
+                &watched,
+                t0 + Duration::from_secs(5),
+                Duration::from_secs(2)
+            )
+            .contains(&real));
     }
 
     #[test]
     fn rest_is_authoritative_and_divergence_is_counted_before_it_lands() {
         let store = BookStore::new();
-        let now = Instant::now();
+        let applied = Instant::now();
         for frame in frames_of(SNAPSHOT) {
-            store.apply_frame(&frame, now);
+            store.apply_frame(&frame, applied);
         }
-        let mut rest = BookMap::new();
-        rest.insert(
+        // The request went out after our copy was last touched, so a disagreement is ours.
+        let requested_at = applied + Duration::from_millis(1);
+        let rest = vec![OrderBook::new(
             tok_id("1001"),
-            OrderBook::new(
-                tok_id("1001"),
-                vec![PriceLevel::new(dec!(0.39), dec!(500))],
-                vec![PriceLevel::new(dec!(0.42), dec!(300))], // we think 0.41
-            )
-            .normalized(),
+            vec![PriceLevel::new(dec!(0.39), dec!(500))],
+            vec![PriceLevel::new(dec!(0.42), dec!(300))], // we think 0.41
+        )
+        .normalized()];
+
+        assert_eq!(
+            store.count_divergence(&rest, DIVERGENCE_SAMPLE, requested_at),
+            (1, 1)
         );
-        assert_eq!(store.count_divergence(&rest, DIVERGENCE_SAMPLE), 1);
-        store.apply_rest(&[tok_id("1001")], &rest, now);
+        let returned_at = requested_at + Duration::from_millis(1);
+        store.apply_rest(
+            &[tok_id("1001")],
+            &rest
+                .iter()
+                .map(|b| (b.asset_id.clone(), b.clone()))
+                .collect(),
+            returned_at,
+        );
         let book = &store.snapshot_of(&[tok_id("1001")])[&tok_id("1001")];
         assert_eq!(book.best_ask(), Some(dec!(0.42)));
-        assert_eq!(store.count_divergence(&rest, DIVERGENCE_SAMPLE), 0);
+        // Adopting the REST view also means our copy is now newer than that request, so the
+        // same comparison is no longer even attempted.
+        assert_eq!(
+            store.count_divergence(&rest, DIVERGENCE_SAMPLE, requested_at),
+            (0, 0)
+        );
         assert_eq!(store.stats.snapshot().divergences, 1);
+    }
+
+    /// The live WARN fired every sweep with 5–15 of 64 sampled "diverged", and part of that
+    /// was simply the market moving during a 30–70 s sweep. A book we updated *after* the
+    /// request went out is newer than the answer: it is not evidence our state has rotted,
+    /// so it must not be counted (nor sampled).
+    #[test]
+    fn divergence_excludes_books_updated_after_the_fetch_started() {
+        let store = BookStore::new();
+        let t0 = Instant::now();
+        let requested_at = t0 + Duration::from_secs(1);
+
+        // `settled` was last touched before the request; `moving` while it was in flight.
+        for (id, at) in [
+            ("1001", t0),
+            ("2002", requested_at + Duration::from_millis(5)),
+        ] {
+            let snapshot =
+                SNAPSHOT.replace("\"asset_id\": \"1001\"", &format!("\"asset_id\": \"{id}\""));
+            for frame in frames_of(&snapshot) {
+                store.apply_frame(&frame, at);
+            }
+        }
+
+        // REST disagrees about both (0.42 where we hold 0.41).
+        let rest: Vec<OrderBook> = ["1001", "2002"]
+            .into_iter()
+            .map(|id| {
+                OrderBook::new(
+                    tok_id(id),
+                    vec![PriceLevel::new(dec!(0.39), dec!(500))],
+                    vec![PriceLevel::new(dec!(0.42), dec!(300))],
+                )
+                .normalized()
+            })
+            .collect();
+
+        assert_eq!(
+            store.count_divergence(&rest, DIVERGENCE_SAMPLE, requested_at),
+            (1, 1),
+            "only the book that was already settled when the request went out counts"
+        );
+        assert_eq!(store.stats.snapshot().divergences, 1);
+
+        // With the request start moved past both updates, both are fair game again.
+        let later = requested_at + Duration::from_secs(1);
+        assert_eq!(
+            store.count_divergence(&rest, DIVERGENCE_SAMPLE, later),
+            (2, 2)
+        );
     }
 
     /// A token the API has no book for must not become a request on every tick: after we
@@ -1645,14 +2070,15 @@ mod tests {
                 .is_empty(),
             "neither may be re-requested five seconds later"
         );
-        // Once the window has passed, the ghost is retried — we do not give up on it.
+        // Once the window has passed the ghost is retried — we do not give up on it — but
+        // the book we successfully fetched stays quiet and stays alone.
         assert_eq!(
             store.missing_or_stale(&watched, t0 + Duration::from_secs(61), window),
-            watched
+            vec![tok_id("ghost")]
         );
 
-        // A reconnect still forces a prompt resync of a book we do have, because the last
-        // REST attempt for it is old by then.
+        // A reconnect still forces a resync of a book we do have, because the last REST
+        // attempt for it is outside the window by then.
         store.mark_stale(&[tok_id("1001")]);
         assert_eq!(
             store.missing_or_stale(&watched, t0 + Duration::from_secs(61), window),
@@ -1841,25 +2267,104 @@ mod tests {
     #[test]
     fn health_falls_back_once_and_only_once() {
         let health = StreamHealth::new(3);
-        assert!(!health.record_connect_failure());
-        assert!(!health.record_connect_failure());
+        health.record_rest_success(); // REST works; the socket is the suspect
+        assert_eq!(health.record_connect_failure(), 1);
+        assert!(!health.evaluate_fallback());
+        assert_eq!(health.record_connect_failure(), 2);
+        assert!(!health.evaluate_fallback());
         assert!(!health.fallen_back());
-        assert!(
-            health.record_connect_failure(),
-            "the third failure trips it"
-        );
+        assert_eq!(health.record_connect_failure(), 3);
+        assert!(health.evaluate_fallback(), "the third failure trips it");
         assert!(health.fallen_back());
         assert!(
-            !health.record_connect_failure(),
+            !health.evaluate_fallback(),
             "the switch only reports tripping once"
         );
 
-        // A success resets the streak, and the fallback is permanent.
+        // A success resets the streak.
         let health = StreamHealth::new(2);
-        assert!(!health.record_connect_failure());
+        health.record_rest_success();
+        health.record_connect_failure();
         health.record_connected();
-        assert!(!health.record_connect_failure());
-        assert!(!health.fallen_back(), "the streak was broken by a success");
+        health.record_rest_success();
+        health.record_connect_failure();
+        assert!(
+            !health.evaluate_fallback(),
+            "the streak was broken by a success"
+        );
+        assert!(!health.fallen_back());
+    }
+
+    /// Issue 1 of M6.1, in isolation. At 21:26 on the live box the network vanished: every
+    /// shard took a TLS EOF, reconnects failed with DNS errors, *and* the REST `/books`
+    /// call failed in the same moment. The old switch read that as "streaming is broken"
+    /// and disabled it for the rest of the process, though the network was back in ~60 s.
+    #[test]
+    fn a_total_outage_never_trips_the_fallback_but_a_dead_socket_does() {
+        let health = StreamHealth::new(3);
+
+        // Normal operation: connected, and REST is fine.
+        health.record_connected();
+        health.record_rest_success();
+        assert_eq!(health.live_connections(), 1);
+
+        // 21:26 — the socket drops and every retry fails, with REST failing too.
+        health.record_disconnected();
+        assert!(
+            !health.rest_ok_during_streak(),
+            "REST evidence from before the drop says nothing about the network now"
+        );
+        for _ in 0..20 {
+            health.record_connect_failure();
+            health.record_rest_failure();
+            assert!(
+                !health.evaluate_fallback(),
+                "both transports down is an outage: keep retrying, never degrade"
+            );
+        }
+        assert!(!health.fallen_back());
+        assert_eq!(health.rest_failures(), 20);
+
+        // ~60 s later the network is back. REST proves it; the socket reconnects too.
+        health.record_rest_success();
+        health.record_connected();
+        assert!(!health.evaluate_fallback());
+        assert!(!health.fallen_back(), "the process must still be streaming");
+
+        // Now the *socket specifically* breaks: it drops and will not come back, while
+        // REST keeps answering. That is the case the fallback exists for.
+        health.record_disconnected();
+        for _ in 0..3 {
+            health.record_connect_failure();
+        }
+        health.record_rest_success();
+        assert!(health.evaluate_fallback());
+        assert!(health.fallen_back());
+    }
+
+    /// One broken shard must not take the other 33 down with it.
+    #[test]
+    fn a_live_connection_anywhere_blocks_the_fallback() {
+        let health = StreamHealth::new(2);
+        health.record_connected(); // shard 0 is happily connected
+        health.record_rest_success();
+        for _ in 0..10 {
+            health.record_connect_failure();
+        }
+        assert!(
+            !health.evaluate_fallback(),
+            "some shard is receiving data — streaming is not what is broken"
+        );
+        assert_eq!(health.live_connections(), 1);
+    }
+
+    #[test]
+    fn events_per_sec_is_a_decimal_rate_and_survives_a_zero_interval() {
+        assert_eq!(events_per_sec(500, Duration::from_secs(10)), dec!(50));
+        assert_eq!(events_per_sec(3, Duration::from_secs(2)), dec!(1.5));
+        assert_eq!(events_per_sec(1, Duration::from_millis(300)), dec!(3.33));
+        assert_eq!(events_per_sec(0, Duration::from_secs(300)), Decimal::ZERO);
+        assert_eq!(events_per_sec(9, Duration::ZERO), Decimal::ZERO);
     }
 
     // -- the pool, over real sockets --------------------------------------------------
@@ -1872,34 +2377,37 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
-                        return;
-                    };
-                    let Some(Ok(message)) = ws.next().await else {
-                        return;
-                    };
-                    let ids: Vec<String> =
-                        serde_json::from_str::<Value>(message.to_text().unwrap_or_default())
-                            .ok()
-                            .and_then(|v| v["assets_ids"].as_array().cloned())
-                            .map(|ids| {
-                                ids.iter()
-                                    .filter_map(|i| i.as_str().map(str::to_string))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                    if tx.send(ids).await.is_err() {
-                        return;
-                    }
-                    while let Some(Ok(_)) = ws.next().await {}
-                });
-            }
-        });
+        tokio::spawn(serve_subscriptions(listener, tx));
         (format!("ws://{addr}/ws/market"), rx)
+    }
+
+    /// Accept forever, reporting the token list of every subscribe frame received.
+    async fn serve_subscriptions(listener: tokio::net::TcpListener, tx: mpsc::Sender<Vec<String>>) {
+        while let Ok((socket, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                    return;
+                };
+                let Some(Ok(message)) = ws.next().await else {
+                    return;
+                };
+                let ids: Vec<String> =
+                    serde_json::from_str::<Value>(message.to_text().unwrap_or_default())
+                        .ok()
+                        .and_then(|v| v["assets_ids"].as_array().cloned())
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(|i| i.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                if tx.send(ids).await.is_err() {
+                    return;
+                }
+                while let Some(Ok(_)) = ws.next().await {}
+            });
+        }
     }
 
     async fn next_subscription(rx: &mut mpsc::Receiver<Vec<String>>) -> Vec<String> {
@@ -1954,8 +2462,21 @@ mod tests {
         manager.stop().await;
     }
 
+    /// Wait until `health` has seen `want` consecutive connect failures, or give up.
+    async fn wait_for_failures(health: &StreamHealth, want: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while health.consecutive_failures() < want && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            health.consecutive_failures() >= want,
+            "expected at least {want} connect failures, got {}",
+            health.consecutive_failures()
+        );
+    }
+
     #[tokio::test]
-    async fn an_unreachable_endpoint_trips_the_fallback_and_stops_the_pool() {
+    async fn an_unreachable_endpoint_falls_back_only_once_rest_is_shown_to_work() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut cfg = Config::default();
         // Port 1 refuses connections immediately.
@@ -1964,17 +2485,81 @@ mod tests {
 
         let manager = StreamManager::start(&cfg, &[tok(1)], shutdown_rx);
         let health = manager.health().clone();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !health.fallen_back() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_failures(&health, 2).await;
+
+        // No REST evidence yet: the socket may be down because the whole box is.
         assert!(
-            health.fallen_back(),
-            "two refused connections must trip the permanent fallback"
+            !health.evaluate_fallback(),
+            "a failing socket alone must not disable streaming"
         );
+        assert!(!health.fallen_back());
+
+        // The daemon reports a REST call that went through — the network is fine and the
+        // endpoint is not.
+        health.record_rest_success();
+        assert!(health.evaluate_fallback());
+        assert!(health.fallen_back());
         assert!(manager.books().stats.snapshot().connect_failures >= 2);
         assert_eq!(health.live_connections(), 0);
         manager.stop().await;
+    }
+
+    /// The other half of issue 1: a socket that comes back must be used again. The pool
+    /// keeps retrying through the outage, so no restart (and no re-probe) is needed for the
+    /// window where the daemon has not handed over yet.
+    #[tokio::test]
+    async fn the_pool_reconnects_by_itself_when_the_endpoint_returns() {
+        // Reserve a port, then release it: connections are refused until we bind again.
+        let addr = {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            probe.local_addr().expect("addr")
+        };
+        let url = format!("ws://{addr}/ws/market");
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut cfg = Config::default();
+        cfg.stream.url = url.clone();
+        cfg.stream.max_subs_per_connection = 1;
+        cfg.stream.fallback_after_failures = 2;
+
+        let manager = StreamManager::start(&cfg, &[tok(1)], shutdown_rx);
+        let health = manager.health().clone();
+        wait_for_failures(&health, 2).await;
+        assert!(
+            !health.fallen_back(),
+            "nothing may disable streaming without the daemon's REST evidence"
+        );
+
+        // The "network" comes back on the same address.
+        let listener = tokio::net::TcpListener::bind(addr).await.expect("re-bind");
+        let (tx, mut subscriptions) = mpsc::channel(8);
+        tokio::spawn(serve_subscriptions(listener, tx));
+
+        assert_eq!(
+            next_subscription(&mut subscriptions).await,
+            vec!["t1".to_string()],
+            "the pool must resubscribe by itself once the endpoint answers"
+        );
+        assert!(health.live_connections() >= 1);
+        assert!(!health.fallen_back());
+        manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_probe_reports_reachability_both_ways() {
+        // Nothing listening: an error, and never a panic or a hang.
+        let err = probe("ws://127.0.0.1:1/ws/market", Duration::from_secs(5))
+            .await
+            .expect_err("a refused port must not look reachable");
+        assert!(!err.is_empty());
+
+        // A live channel answers, and the probe leaves no pool behind.
+        let (url, _subscriptions) = mock_channel().await;
+        probe(&url, Duration::from_secs(5))
+            .await
+            .expect("a live endpoint must probe clean");
     }
 
     #[test]

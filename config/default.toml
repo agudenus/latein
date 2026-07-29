@@ -41,9 +41,12 @@ page_size = 100
 # Hard stop on Gamma /events pagination — a rate-limit backstop, NOT the normal
 # stopping point (discovery ends when the API returns a short page). If this cap is
 # what stops us the universe is incomplete and a NegRisk event can be split across the
-# boundary, so the scanner logs "WARN universe truncated at max_events". Keep it well
-# above the live event count (~500 and growing); raise it if that warning appears.
-max_events = 2000
+# boundary, so the scanner logs "WARN universe truncated at max_events".
+#
+# Raised from 2000 after a live run filled all 20 pages and still hit the cap: the real
+# active-event count is above 2000 (that run saw 8.3k markets / 16.6k tokens). Watch the
+# WARN — if it comes back, this number is again below the live event count.
+max_events = 6000
 # NegRisk events with more outcomes than this are skipped: every extra outcome is
 # another leg of capital and another leg of fill risk.
 max_negrisk_outcomes = 30
@@ -147,16 +150,37 @@ max_subs_per_connection = 500
 # legs is one detection pass and not one per leg. Must be well under
 # daemon.scan_interval_secs, or streaming detects no faster than polling.
 debounce_ms = 50
-# A book not updated for this long is re-fetched over REST. This is the bound on how wrong
-# a silently-dead subscription can make us.
-stale_after_secs = 60
+# Rate limit on the targeted stale-book resync: one token is re-requested at most once per
+# this window.
+#
+# NOT an idle timeout. Silence on a healthy, connected shard means the market is quiet —
+# the normal state of most of 16 000 books — and treating that as staleness made this path
+# re-fetch 16 500 books every ~90 s, i.e. heavier than the 5 s polling loop it replaced.
+# Only a book that is explicitly invalidated (reconnect, out-of-order delta, contradictory
+# hash) or whose shard dropped after its last update is resynced here. The full REST sweep
+# below, not this, is the global integrity net.
+#
+# This window applies to the two cases that must be rate-limited: a token the API has no
+# order book for (it will never arrive), and a book that is only suspect because its shard
+# had a gap. A book we hold and have explicitly invalidated is repaired far sooner — on a
+# fixed 15 s floor in src/ws.rs, because a reconnect must not wait out 15 minutes.
+stale_after_secs = 900
 # Cadence of the full REST sweep: re-fetch every book, cross-check a random sample against
 # the locally streamed state (the divergence count is logged — watch it during the soak),
 # adopt the REST view, and run detection over the whole universe.
 resync_interval_secs = 300
-# Consecutive failed connection attempts before streaming is abandoned for the life of the
-# process (logged at ERROR) and the daemon reverts to REST polling.
+# Consecutive failed connection attempts before streaming hands detection back to REST
+# polling (logged at ERROR).
+#
+# The streak alone is not enough: the daemon only hands over when REST demonstrably worked
+# *during* that same streak. Both transports failing at once is a network outage, not a
+# broken socket — a live run lost its network for ~60 s and the old one-way switch disabled
+# streaming for the rest of the night. That case now retries both, indefinitely.
 fallback_after_failures = 5
+# After a hand-over, how often to open one throwaway connection to see whether the endpoint
+# answers again. On success the pool restarts and streaming resumes (logged loudly), so the
+# fallback is "until proven working again" rather than permanent.
+reprobe_interval_secs = 3600
 
 [alerts]
 enabled = true
@@ -166,6 +190,18 @@ enabled = true
 alert_min_net_per_share = 0.01
 # Anti-spam spacing between opportunity alerts; daily summaries ignore it.
 min_seconds_between_alerts = 30
+# Re-alert cooldown per (event, kind, side).
+#
+# A slow-moving opportunity is re-detected on every sweep, and a one-tick ask move
+# (6.32 -> 6.33 -> 6.34) really is different economics, so it correctly gets its own
+# measurement row — but it is not news, and a live run sent the same event once per sweep
+# all night. Inside this window the same construction is not alerted again unless it
+# improved by at least realert_improvement per share on the taker or the maker side,
+# measured against the figure last *alerted* (so a slow cumulative drift does eventually
+# reach the phone). Suppressed alerts are still written to events.jsonl with
+# delivery = "cooldown"; set 0 to disable the cooldown entirely.
+per_event_cooldown_secs = 1800
+realert_improvement = 0.01
 # Consecutive Telegram failures before the circuit breaker opens, and how long it stays
 # open before one alert is let through as a re-probe.
 failure_circuit_break = 3

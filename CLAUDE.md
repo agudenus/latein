@@ -55,9 +55,9 @@ Rust binary crate `polyarb` (Phase A: scanner + dry-run only; no wallet/key code
 - `src/detect.rs` — binary, NegRisk YES-side, NegRisk NO-side detectors; depth-walked joint sizing.
 - `src/risk.rs` — per-trade cap (Phase A scope).
 - `src/store.rs` — SQLite persistence; money stored as TEXT Decimal strings, never REAL.
-- `src/ws.rs` — M6 streaming market data: CLOB WebSocket market channel, sharded connection pool, defensively parsed frames, locally maintained books with staleness/resync, debounced dirty-event detection. Every wire shape is `TODO(verify-live)` (the container cannot reach the endpoint); unreachable ⇒ loud permanent fallback to REST polling.
+- `src/ws.rs` — M6 streaming market data: CLOB WebSocket market channel, sharded connection pool, defensively parsed frames, locally maintained books with staleness/resync, debounced dirty-event detection. Every wire shape is `TODO(verify-live)` (the container cannot reach the endpoint). M6.1: staleness comes from explicit invalidation or a *shard disconnect*, never from silence (quiet ≠ stale); the REST-only fallback requires WS failing **while REST demonstrably works** (both down = network outage = retry both forever) and is re-probed every `stream.reprobe_interval_secs` so it lasts only until the socket proves itself again.
 - `src/dryrun.rs` — daemon loop (REST-timer *and* stream-triggered detection through one shared `process_opportunities` path), opportunity lifecycle (filled_simulated vs vanished decided by first re-poll, never revised), daily summaries incl. detection-latency p50/p95.
-- `src/alert.rs` — Telegram send-only alerts with JSONL fallback + circuit breaker; token never logged.
+- `src/alert.rs` — Telegram send-only alerts with JSONL fallback + circuit breaker; token never logged. M6.1 adds an alert-level cooldown per `(event, kind, side)` (row-level dedupe unchanged — different economics is still its own measurement row; only the *message* is held back, and it is still logged with `delivery = "cooldown"`).
 - `config/default.toml` — all knobs, including `[stream]` (enabled by default); secrets only via env (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
 - `tests/fixtures/` — recorded API-shape fixtures (live Polymarket APIs unreachable from dev container; `TODO(verify-live)` markers track unverified API shape assumptions).
 
