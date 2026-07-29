@@ -15,6 +15,8 @@
 #   POLYARB_REPORT_DIR          storage.report_dir
 #   POLYARB_SCAN_INTERVAL_SECS  daemon.scan_interval_secs
 #   POLYARB_ALERT_MIN_NET       alerts.alert_min_net_per_share
+#   POLYARB_STREAM_ENABLED      stream.enabled  (true/false)
+#   POLYARB_STREAM_URL          stream.url
 #
 # Alert credentials are read from the environment only and never appear here:
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -116,6 +118,45 @@ repoll_window_secs = 30
 # Cap on simultaneously tracked opportunities; the excess is recorded as "untracked"
 # rather than quietly biasing the persistence statistics.
 max_concurrent = 32
+
+# ---------------------------------------------------------------------------------
+# M6 — streaming market data (CLOB WebSocket market channel)
+# ---------------------------------------------------------------------------------
+#
+# With the stream on, detection is event-driven: books are maintained locally from pushed
+# frames and only the events whose books moved are re-evaluated, which takes detection
+# latency from the scan interval (seconds) down to tens of milliseconds.
+#
+# REST does not go away. It seeds the books at startup, re-fetches anything stale, sweeps
+# the whole universe on `resync_interval_secs` as the integrity net (and runs a full
+# detection pass while it is there), and takes over completely if the socket cannot be
+# reached. Set `enabled = false` for the pure-REST M3 daemon.
+#
+# TODO(verify-live): every wire detail of this channel is unverified from the build
+# container — the URL below, the subscribe frame shape, the `book`/`price_change` event
+# names and their fields, and whether a connection has a subscription limit at all. See
+# the TODO(verify-live) markers in src/ws.rs before the first live run.
+[stream]
+enabled = true
+url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# Token subscriptions per connection; the universe is sharded across as many connections
+# as this implies. A conservative guess — the real limit is unverified.
+max_subs_per_connection = 500
+# Quiet period after the last book update before the dirty events are re-evaluated. Small
+# enough to stay in the tens of milliseconds, large enough that a burst across an event's
+# legs is one detection pass and not one per leg. Must be well under
+# daemon.scan_interval_secs, or streaming detects no faster than polling.
+debounce_ms = 50
+# A book not updated for this long is re-fetched over REST. This is the bound on how wrong
+# a silently-dead subscription can make us.
+stale_after_secs = 60
+# Cadence of the full REST sweep: re-fetch every book, cross-check a random sample against
+# the locally streamed state (the divergence count is logged — watch it during the soak),
+# adopt the REST view, and run detection over the whole universe.
+resync_interval_secs = 300
+# Consecutive failed connection attempts before streaming is abandoned for the life of the
+# process (logged at ERROR) and the daemon reverts to REST polling.
+fallback_after_failures = 5
 
 [alerts]
 enabled = true

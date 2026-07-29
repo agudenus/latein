@@ -62,8 +62,9 @@ const BATCH_CAPACITY: usize = 64;
 /// A server timestamp further than this from our clock is not usable as a latency
 /// reference (clock skew, or a unit we guessed wrong); we fall back to frame receipt.
 const MAX_PLAUSIBLE_LATENCY_MS: i64 = 60_000;
-/// Books compared against REST on one cross-check sweep.
-const DIVERGENCE_SAMPLE: usize = 64;
+/// How many books one cross-check sweep compares against REST. Comparing every book on
+/// every sweep is pointless work: drift is systematic, so a sample finds it.
+pub const DIVERGENCE_SAMPLE: usize = 64;
 const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 30_000;
 /// Keepalive cadence. TODO(verify-live): the public docs mention a client keepalive on the
@@ -128,15 +129,6 @@ pub enum MarketFrame {
         event_type: String,
         reason: &'static str,
     },
-}
-
-impl MarketFrame {
-    pub fn asset_id(&self) -> Option<&TokenId> {
-        match self {
-            Self::Book { asset_id, .. } | Self::PriceChange { asset_id, .. } => Some(asset_id),
-            _ => None,
-        }
-    }
 }
 
 /// Wire form. Every field is optional: the parser decides what a frame is, not serde.
@@ -228,7 +220,9 @@ fn as_decimal(raw: &Value) -> Option<Decimal> {
 /// A non-JSON keepalive (`PING`/`PONG`) is not an error and yields no frames.
 pub fn parse_frames(text: &str) -> Result<Vec<MarketFrame>, FrameError> {
     let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("ping") || trimmed.eq_ignore_ascii_case("pong")
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("ping")
+        || trimmed.eq_ignore_ascii_case("pong")
     {
         return Ok(Vec::new());
     }
@@ -351,6 +345,9 @@ struct LiveBook {
     last_update: Instant,
     last_server_ts: Option<DateTime<Utc>>,
     last_hash: Option<String>,
+    /// When we last *asked* REST about this token, whether or not it answered. A token the
+    /// API has no book for must not turn into a request on every single tick.
+    last_rest_attempt: Option<Instant>,
     /// True when this copy is not trustworthy: never snapshotted, or invalidated by a
     /// reconnect / out-of-order frame / hash contradiction.
     stale: bool,
@@ -364,6 +361,7 @@ impl LiveBook {
             last_update: now,
             last_server_ts: None,
             last_hash: None,
+            last_rest_attempt: None,
             stale: true,
         }
     }
@@ -519,7 +517,9 @@ impl BookStore {
                     }
                 }
                 for change in changes {
-                    entry.book.apply_level(change.side, change.price, change.size);
+                    entry
+                        .book
+                        .apply_level(change.side, change.price, change.size);
                 }
                 entry.last_hash = meta.hash.clone();
                 entry.bump(received, meta.server_ts);
@@ -537,9 +537,20 @@ impl BookStore {
         }
     }
 
-    /// Overwrite from a REST fetch. REST is authoritative: this clears staleness.
-    pub fn apply_rest(&self, books: &BookMap, now: Instant) {
+    /// Adopt a REST fetch. REST is authoritative: a returned book replaces ours and clears
+    /// its staleness.
+    ///
+    /// `requested` is everything we asked about, so a token the API did **not** return is
+    /// remembered as *asked about* rather than *never seen*. Without that, a token with no
+    /// order book at all would qualify as "missing" on every tick and be re-requested
+    /// forever — turning the cheap targeted resync back into a full polling loop.
+    pub fn apply_rest(&self, requested: &[TokenId], books: &BookMap, now: Instant) {
         let mut live = self.lock();
+        for token in requested {
+            live.entry(token.clone())
+                .or_insert_with(|| LiveBook::placeholder(token.clone(), now))
+                .last_rest_attempt = Some(now);
+        }
         for (token, book) in books {
             let entry = live
                 .entry(token.clone())
@@ -547,6 +558,7 @@ impl BookStore {
             entry.book = book.clone();
             entry.stale = false;
             entry.last_hash = None;
+            entry.last_rest_attempt = Some(now);
             entry.bump(now, None);
         }
     }
@@ -595,7 +607,11 @@ impl BookStore {
     }
 
     /// Tokens that need a targeted REST re-fetch: never seen, explicitly stale, or not
-    /// updated inside `stale_after`.
+    /// updated inside `stale_after` — and not already asked about inside the same window.
+    ///
+    /// That last clause is the rate limit on this path. Some tokens simply have no book,
+    /// and a book that never arrives would otherwise be requested on every tick for as
+    /// long as the daemon runs.
     pub fn missing_or_stale(
         &self,
         tokens: &[TokenId],
@@ -608,7 +624,12 @@ impl BookStore {
             .filter(|t| match live.get(*t) {
                 None => true,
                 Some(entry) => {
-                    entry.stale || now.saturating_duration_since(entry.last_update) >= stale_after
+                    let due = entry.stale
+                        || now.saturating_duration_since(entry.last_update) >= stale_after;
+                    let cooled = entry.last_rest_attempt.is_none_or(|attempted| {
+                        now.saturating_duration_since(attempted) >= stale_after
+                    });
+                    due && cooled
                 }
             })
             .cloned()
@@ -644,12 +665,7 @@ impl BookStore {
             let Some(theirs) = rest.get(token) else {
                 continue;
             };
-            let top = |b: &OrderBook| {
-                (
-                    b.bids.first().cloned(),
-                    b.asks.first().cloned(),
-                )
-            };
+            let top = |b: &OrderBook| (b.bids.first().cloned(), b.asks.first().cloned());
             if top(&entry.book) != top(theirs) {
                 diverged += 1;
             }
@@ -718,10 +734,9 @@ impl DirtyBatch {
             let Some(touch) = self.triggers.get(token) else {
                 continue;
             };
-            let from_receipt = i64::try_from(
-                now.saturating_duration_since(touch.received).as_millis(),
-            )
-            .unwrap_or(i64::MAX);
+            let from_receipt =
+                i64::try_from(now.saturating_duration_since(touch.received).as_millis())
+                    .unwrap_or(i64::MAX);
             let ms = match touch.server_ts {
                 Some(ts) => {
                     let delta = (wall_now - ts).num_milliseconds();
@@ -1154,10 +1169,7 @@ async fn run_connection<S>(
         + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
         + Unpin,
 {
-    if let Err(err) = socket
-        .send(Message::Text(subscribe_message(tokens)))
-        .await
-    {
+    if let Err(err) = socket.send(Message::Text(subscribe_message(tokens))).await {
         tracing::warn!(shard = id, %err, "could not send the market subscribe frame");
         return;
     }
@@ -1235,10 +1247,17 @@ async fn handle_payload(
             tracing::debug!(shard = id, event_type, "unknown market frame type ignored");
         }
         if let MarketFrame::Malformed { event_type, reason } = frame {
-            tracing::debug!(shard = id, event_type, reason, "malformed market frame ignored");
+            tracing::debug!(
+                shard = id,
+                event_type,
+                reason,
+                "malformed market frame ignored"
+            );
         }
         let server_ts = match frame {
-            MarketFrame::Book { meta, .. } | MarketFrame::PriceChange { meta, .. } => meta.server_ts,
+            MarketFrame::Book { meta, .. } | MarketFrame::PriceChange { meta, .. } => {
+                meta.server_ts
+            }
             _ => None,
         };
         if let Some(token) = books.apply_frame(frame, received) {
@@ -1340,7 +1359,8 @@ mod tests {
         }
 
         // The single-level form, with the fields at the top level.
-        let single = r#"{"event_type":"price_change","asset_id":"7","price":0.5,"size":"12","side":"buy"}"#;
+        let single =
+            r#"{"event_type":"price_change","asset_id":"7","price":0.5,"size":"12","side":"buy"}"#;
         match &parse_frames(single).expect("single form")[0] {
             MarketFrame::PriceChange { changes, .. } => {
                 assert_eq!(changes.len(), 1);
@@ -1379,7 +1399,10 @@ mod tests {
                 "no level",
             ),
             // Right type, wrong JSON type for a field we need.
-            (r#"{"event_type":"book","asset_id":"1","bids":"nope"}"#, "types"),
+            (
+                r#"{"event_type":"book","asset_id":"1","bids":"nope"}"#,
+                "types",
+            ),
         ] {
             let frames = parse_frames(body).unwrap_or_else(|e| panic!("{why}: {e}"));
             assert!(
@@ -1427,7 +1450,10 @@ mod tests {
         let store = BookStore::new();
         let now = Instant::now();
         for frame in frames_of(SNAPSHOT) {
-            assert_eq!(store.apply_frame(&frame, now).as_ref(), Some(&tok_id("1001")));
+            assert_eq!(
+                store.apply_frame(&frame, now).as_ref(),
+                Some(&tok_id("1001"))
+            );
         }
         let book = &store.snapshot_of(&[tok_id("1001")])[&tok_id("1001")];
         assert_eq!(book.best_bid(), Some(dec!(0.39)));
@@ -1487,7 +1513,11 @@ mod tests {
             assert_eq!(store.apply_frame(&frame, now), None);
         }
         let book = &store.snapshot_of(&[tok_id("1001")])[&tok_id("1001")];
-        assert_eq!(book.bids[0].size, dec!(500), "the old level was not applied");
+        assert_eq!(
+            book.bids[0].size,
+            dec!(500),
+            "the old level was not applied"
+        );
         assert_eq!(store.stats.snapshot().out_of_order, 1);
         assert_eq!(store.is_stale(&tok_id("1001")), Some(true));
     }
@@ -1578,17 +1608,63 @@ mod tests {
             .normalized(),
         );
         assert_eq!(store.count_divergence(&rest, DIVERGENCE_SAMPLE), 1);
-        store.apply_rest(&rest, now);
+        store.apply_rest(&[tok_id("1001")], &rest, now);
         let book = &store.snapshot_of(&[tok_id("1001")])[&tok_id("1001")];
         assert_eq!(book.best_ask(), Some(dec!(0.42)));
         assert_eq!(store.count_divergence(&rest, DIVERGENCE_SAMPLE), 0);
         assert_eq!(store.stats.snapshot().divergences, 1);
     }
 
+    /// A token the API has no book for must not become a request on every tick: after we
+    /// have asked once, it waits out the stale window like everything else.
+    #[test]
+    fn a_token_the_api_never_returns_is_not_re_requested_every_tick() {
+        let store = BookStore::new();
+        let t0 = Instant::now();
+        let watched = vec![tok_id("1001"), tok_id("ghost")];
+        let window = Duration::from_secs(60);
+
+        // Nothing known yet: both are due.
+        assert_eq!(store.missing_or_stale(&watched, t0, window), watched);
+
+        // We asked about both; only 1001 came back.
+        let mut returned = BookMap::new();
+        returned.insert(
+            tok_id("1001"),
+            OrderBook::new(
+                tok_id("1001"),
+                vec![PriceLevel::new(dec!(0.39), dec!(500))],
+                vec![],
+            ),
+        );
+        store.apply_rest(&watched, &returned, t0);
+
+        assert!(
+            store
+                .missing_or_stale(&watched, t0 + Duration::from_secs(5), window)
+                .is_empty(),
+            "neither may be re-requested five seconds later"
+        );
+        // Once the window has passed, the ghost is retried — we do not give up on it.
+        assert_eq!(
+            store.missing_or_stale(&watched, t0 + Duration::from_secs(61), window),
+            watched
+        );
+
+        // A reconnect still forces a prompt resync of a book we do have, because the last
+        // REST attempt for it is old by then.
+        store.mark_stale(&[tok_id("1001")]);
+        assert_eq!(
+            store.missing_or_stale(&watched, t0 + Duration::from_secs(61), window),
+            watched
+        );
+    }
+
     #[test]
     fn retain_drops_books_that_left_the_universe() {
         let store = BookStore::new();
         store.apply_rest(
+            &[tok_id("a"), tok_id("b")],
             &[
                 (tok_id("a"), OrderBook::new(tok_id("a"), vec![], vec![])),
                 (tok_id("b"), OrderBook::new(tok_id("b"), vec![], vec![])),
@@ -1601,6 +1677,8 @@ mod tests {
         store.retain(&[tok_id("a")]);
         assert_eq!(store.len(), 1);
         assert!(store.snapshot_of(&[tok_id("b")]).is_empty());
+        store.retain(&[]);
+        assert!(store.is_empty());
     }
 
     // -- sharding ---------------------------------------------------------------------
@@ -1748,10 +1826,7 @@ mod tests {
         assert_eq!(batch.latency_ms([&tok(2)], now, wall), Some(0));
         assert_eq!(batch.latency_ms([&tok(3)], now, wall), Some(0));
         // The worst (oldest) leg is the one reported.
-        assert_eq!(
-            batch.latency_ms([&tok(1), &tok(3)], now, wall),
-            Some(120)
-        );
+        assert_eq!(batch.latency_ms([&tok(1), &tok(3)], now, wall), Some(120));
         // A token nobody touched is not this batch's business.
         assert_eq!(batch.latency_ms([&tok(42)], now, wall), None);
     }
@@ -1769,7 +1844,10 @@ mod tests {
         assert!(!health.record_connect_failure());
         assert!(!health.record_connect_failure());
         assert!(!health.fallen_back());
-        assert!(health.record_connect_failure(), "the third failure trips it");
+        assert!(
+            health.record_connect_failure(),
+            "the third failure trips it"
+        );
         assert!(health.fallen_back());
         assert!(
             !health.record_connect_failure(),
@@ -1784,14 +1862,126 @@ mod tests {
         assert!(!health.fallen_back(), "the streak was broken by a success");
     }
 
+    // -- the pool, over real sockets --------------------------------------------------
+
+    /// A stub market channel that reports every subscribe frame it receives and then holds
+    /// the connection open. Returns `(url, subscriptions)`.
+    async fn mock_channel() -> (String, mpsc::Receiver<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                        return;
+                    };
+                    let Some(Ok(message)) = ws.next().await else {
+                        return;
+                    };
+                    let ids: Vec<String> =
+                        serde_json::from_str::<Value>(message.to_text().unwrap_or_default())
+                            .ok()
+                            .and_then(|v| v["assets_ids"].as_array().cloned())
+                            .map(|ids| {
+                                ids.iter()
+                                    .filter_map(|i| i.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    if tx.send(ids).await.is_err() {
+                        return;
+                    }
+                    while let Some(Ok(_)) = ws.next().await {}
+                });
+            }
+        });
+        (format!("ws://{addr}/ws/market"), rx)
+    }
+
+    async fn next_subscription(rx: &mut mpsc::Receiver<Vec<String>>) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a subscribe frame must arrive")
+            .expect("channel open")
+    }
+
+    #[tokio::test]
+    async fn the_pool_subscribes_every_shard_and_a_diff_only_resubscribes_what_moved() {
+        let (url, mut subscriptions) = mock_channel().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // One token per connection, so shard boundaries are unambiguous.
+        let mut cfg = Config::default();
+        cfg.stream.url = url;
+        cfg.stream.max_subs_per_connection = 1;
+        cfg.stream.debounce_ms = 10;
+
+        let mut manager = StreamManager::start(&cfg, &[tok(1), tok(2)], shutdown_rx);
+        let mut seen = vec![
+            next_subscription(&mut subscriptions).await,
+            next_subscription(&mut subscriptions).await,
+        ];
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![vec!["t1".to_string()], vec!["t2".to_string()]],
+            "every shard subscribes exactly its own tokens"
+        );
+
+        // Swap one token out for a new one: shard 0 keeps its socket, shard 1 resubscribes.
+        manager.update_universe(&[tok(1), tok(3)]);
+        assert_eq!(
+            manager.shard_tokens(),
+            vec![vec![tok(1)], vec![tok(3)]],
+            "the surviving token must not be moved between shards"
+        );
+        assert_eq!(
+            next_subscription(&mut subscriptions).await,
+            vec!["t3".to_string()],
+            "only the changed shard reconnects"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), subscriptions.recv())
+                .await
+                .is_err(),
+            "the untouched shard must not be resubscribed"
+        );
+
+        manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_trips_the_fallback_and_stops_the_pool() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut cfg = Config::default();
+        // Port 1 refuses connections immediately.
+        cfg.stream.url = "ws://127.0.0.1:1/ws/market".into();
+        cfg.stream.fallback_after_failures = 2;
+
+        let manager = StreamManager::start(&cfg, &[tok(1)], shutdown_rx);
+        let health = manager.health().clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !health.fallen_back() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            health.fallen_back(),
+            "two refused connections must trip the permanent fallback"
+        );
+        assert!(manager.books().stats.snapshot().connect_failures >= 2);
+        assert_eq!(health.live_connections(), 0);
+        manager.stop().await;
+    }
+
     #[test]
     fn the_subscribe_frame_names_every_token() {
         let message = subscribe_message(&tokens(3));
         let parsed: Value = serde_json::from_str(&message).expect("valid JSON");
         assert_eq!(parsed["type"], "market");
-        assert_eq!(
-            parsed["assets_ids"],
-            Value::from(vec!["t0", "t1", "t2"])
-        );
+        assert_eq!(parsed["assets_ids"], Value::from(vec!["t0", "t1", "t2"]));
     }
 }

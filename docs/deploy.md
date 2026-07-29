@@ -470,7 +470,11 @@ confident-looking report full of zeros.
 From the **`## Scan loop`** section of each report:
 
 - [ ] **`cycles`** ≈ 17,280/day (86,400 seconds ÷ the 5-second interval). Materially fewer
-      means downtime or a loop that fell behind.
+      means downtime or a loop that fell behind. **With `stream.enabled = true` (the
+      default) this number is no longer a clock**: it counts every detection pass, and a
+      stream-triggered pass happens whenever books move, so expect *more* than 17,280 on a
+      busy day and far fewer on a quiet one. Under streaming, read `cycles` together with
+      the `## Detection latency (stream)` section, not on its own.
 - [ ] **`failed`** is at or near zero. A meaningful count means the Polymarket APIs were
       rejecting or timing out, and everything downstream is under-counted.
 - [ ] **`cycle duration: mean`** is comfortably under 5,000 ms. If the mean approaches the
@@ -481,7 +485,7 @@ From the **`## Scan loop`** section of each report:
 
 ### Part B — did the live-API assumptions hold?
 
-Seven modules carry `TODO(verify-live)` markers: shapes inferred from Polymarket's public
+Eight modules carry `TODO(verify-live)` markers: shapes inferred from Polymarket's public
 docs that had never met the real API, because the development container could not reach
 it. The soak is their first contact with reality. Each of these checks maps to one
 assumption; run them on the server.
@@ -532,6 +536,57 @@ Interpreting them:
       public taxonomy. If everything lands in `other`, opportunities are being costed at
       the 0.05 fallback rate — which would understate fee-free geopolitics and understate
       crypto's 0.07, distorting every net figure.
+
+#### The WebSocket stream (M6) — the least verified thing in the build
+
+Every wire detail of the CLOB market channel was **guessed** from the public docs: the
+container could not reach it at all, so unlike the REST shapes it has never even been
+seen. It ships on by default because it is what takes detection latency from seconds to
+milliseconds, and it fails safe — an unreachable or unusable channel becomes REST polling,
+which is exactly the M3 daemon. Check it explicitly:
+
+```bash
+# 6. Did it ever connect? One line per shard per connection.
+docker compose logs --no-color | grep -c "market stream connected"
+
+# 7. Did it give up? This is the loud, permanent fallback to polling.
+docker compose logs --no-color | grep "falling back to REST polling"
+
+# 8. Frame health at shutdown (snapshots/deltas/unknown/malformed/out_of_order/divergences).
+docker compose logs --no-color | grep "market stream stopping"
+
+# 9. Did our locally maintained books disagree with REST?
+docker compose logs --no-color | grep "disagreed with REST at the top of book"
+```
+
+- [ ] **Check 6 is non-zero.** Zero → `stream.url` is wrong, or the handshake is rejected.
+      Nothing is lost (the daemon polls), but the whole latency benefit is.
+- [ ] **Check 7 is empty.** A hit means the endpoint was unreachable
+      `stream.fallback_after_failures` times in a row and streaming is off for that
+      process. Every latency number in the report after that point is absent, not zero.
+- [ ] **Check 8 shows `snapshots` > 0 and `deltas` > 0.** `snapshots: 0` with a successful
+      connection means the subscribe frame shape (`assets_ids`, `type: "market"` in
+      `subscribe_message`, `src/ws.rs`) is wrong — we connected and were ignored.
+      `deltas: 0` with snapshots flowing means the `price_change` event name or its
+      `changes[]`/`side` shape is wrong.
+- [ ] **Check 8 shows `unknown_frames` / `malformed_frames` low.** A large
+      `malformed_frames` is the direct signal that a field we *do* model has a different
+      shape (asset id, side vocabulary, level arrays). `unknown_frames` is benign — event
+      types we do not model.
+- [ ] **Check 8 shows `orphan_deltas` and `out_of_order` near zero.** Sustained
+      `out_of_order` means `timestamp` is not what we assume (milliseconds, monotone per
+      asset) and the guard is throwing away good updates.
+- [ ] **Check 9 is empty, and `divergences` in check 8 is 0.** This is the one that
+      matters most: the frames may carry no checksum we can verify, so the slow REST sweep
+      is the *only* thing that can tell us our streamed books are wrong. A non-zero
+      divergence count means detection has been running on a book that does not match the
+      venue — treat every stream-detected opportunity as unproven until it is explained,
+      and re-soak with `stream.enabled = false` to get a clean REST baseline.
+- [ ] **`## Detection latency (stream)` p50 is in the tens of milliseconds.** Hundreds of
+      ms or more points at `stream.debounce_ms`, a saturated shard, or a `timestamp` unit
+      we guessed wrong (the fallback measurement — time since we read the frame — cannot
+      exceed the debounce by much, so an implausibly *small* number with a large p95 is
+      also worth a look).
 
 > Docker keeps roughly the last two weeks of logs (10 MB × 5 files) before rotating, so
 > these greps still reach back over a one-week soak. The daily reports are permanent; the

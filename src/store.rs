@@ -925,7 +925,9 @@ pub(crate) mod tests {
         let books = sample_books();
         let t0 = Utc::now();
 
-        let a = store.record_opportunity(&op, &books, t0, Some(11)).expect("insert");
+        let a = store
+            .record_opportunity(&op, &books, t0, Some(11))
+            .expect("insert");
         let b = store
             .record_opportunity(&op, &books, t0 + chrono::Duration::seconds(5), Some(999))
             .expect("second sighting");

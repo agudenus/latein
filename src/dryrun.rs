@@ -57,7 +57,7 @@ use crate::store::{
     CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, ScanTotals, Store,
 };
 use crate::types::{BookMap, Opportunity, Side, TokenId, Universe};
-use crate::ws::{DirtyBatch, StreamManager};
+use crate::ws::{DirtyBatch, StreamManager, DIVERGENCE_SAMPLE};
 
 /// Phase A is dry-run only. Live execution does not exist yet — not behind a flag, not
 /// behind a feature: there is no order-placing code in this binary.
@@ -471,8 +471,11 @@ impl Daemon {
             .await
         {
             Ok(books) => {
-                tracing::info!(books = books.len(), "seeded the stream book state over REST");
-                manager.books().apply_rest(&books, Instant::now());
+                tracing::info!(
+                    books = books.len(),
+                    "seeded the stream book state over REST"
+                );
+                manager.books().apply_rest(&tokens, &books, Instant::now());
             }
             Err(err) => tracing::warn!(
                 %err,
@@ -482,7 +485,12 @@ impl Daemon {
     }
 
     /// Incremental detection: re-evaluate **only** the events whose books just moved.
-    async fn stream_cycle(&mut self, universe: &Universe, manager: &StreamManager, batch: &DirtyBatch) {
+    async fn stream_cycle(
+        &mut self,
+        universe: &Universe,
+        manager: &StreamManager,
+        batch: &DirtyBatch,
+    ) {
         let started = Instant::now();
         let mut dirty: Vec<usize> = batch
             .tokens()
@@ -561,7 +569,7 @@ impl Daemon {
                     .stats
                     .resynced
                     .fetch_add(books.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                manager.books().apply_rest(&books, Instant::now());
+                manager.books().apply_rest(&stale, &books, Instant::now());
             }
             Err(err) => tracing::warn!(%err, stale = stale.len(), "stale-book resync failed"),
         }
@@ -605,7 +613,7 @@ impl Daemon {
                  view wins; investigate before trusting stream-only detection"
             );
         }
-        manager.books().apply_rest(&books, Instant::now());
+        manager.books().apply_rest(&tokens, &books, Instant::now());
 
         let opportunities = detect::scan(&self.cfg, universe, &books);
         let new_opportunities = self
@@ -746,10 +754,6 @@ impl Daemon {
 fn elapsed_ms(since: Instant) -> i64 {
     i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
-
-/// How many books the full sweep cross-checks against our local copy. Comparing every
-/// book on every sweep is pointless work: drift is systematic, so a sample finds it.
-const DIVERGENCE_SAMPLE: usize = 64;
 
 /// Await the next dirty batch, or never resolve when there is no stream. Written as a
 /// helper so the `select!` arm reads the same either way.
@@ -1813,8 +1817,12 @@ mod tests {
         {"asset_id":"1002","bids":[{"price":"0.54","size":"500"}],"asks":[{"price":"0.55","size":"500"}]}
     ]"#;
 
-    /// Minimal HTTP/1.1 stub for the two Polymarket endpoints. Returns its base URL.
     async fn mock_api() -> String {
+        mock_api_with(MOCK_EVENTS, MOCK_BOOKS).await
+    }
+
+    /// Minimal HTTP/1.1 stub for the two Polymarket endpoints. Returns its base URL.
+    async fn mock_api_with(events: &'static str, books: &'static str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1830,9 +1838,9 @@ mod tests {
                     let n = socket.read(&mut buf).await.unwrap_or(0);
                     let head = String::from_utf8_lossy(&buf[..n]).to_string();
                     let body = if head.starts_with("GET /events") {
-                        MOCK_EVENTS
+                        events
                     } else {
-                        MOCK_BOOKS
+                        books
                     };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
@@ -1866,6 +1874,9 @@ mod tests {
         cfg.storage.database_path = tmp.join("polyarb.sqlite").display().to_string();
         cfg.storage.log_dir = tmp.join("logs").display().to_string();
         cfg.storage.report_dir = tmp.join("reports").display().to_string();
+        // This is the REST-only daemon — the mode the owner runs today, and the one the
+        // stream must never be allowed to regress.
+        cfg.stream.enabled = false;
         cfg.validate().expect("smoke config must validate");
 
         run(cfg.clone(), Some(2)).await.expect("daemon run");
@@ -1914,6 +1925,254 @@ mod tests {
         let md = std::fs::read_to_string(&path).expect("report file");
         assert!(md.contains("polyarb daily summary"));
         assert!(md.contains("| binary_yes_no | politics | 1 |"));
+        assert!(
+            md.contains("no opportunity was detected from a streamed book update today"),
+            "a REST-only day must say so rather than print an invented latency:\n{md}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- M6: end-to-end over a mock market channel -----------------------------------
+
+    /// Two events. Only the first one is ever touched by the stream; the second carries a
+    /// standing arb in its REST books that **only a full scan could find**, which is how
+    /// this test proves detection really is incremental.
+    const STREAM_EVENTS: &str = r#"[
+        {"id": "1", "slug": "mock-event-a", "title": "Touched by the stream",
+         "negRisk": false, "category": "Politics", "active": true, "closed": false,
+         "markets": [{"conditionId": "0xaaa", "question": "A?",
+                      "clobTokenIds": "[\"1001\",\"1002\"]", "outcomes": "[\"Yes\",\"No\"]",
+                      "active": true, "closed": false, "enableOrderBook": true}]},
+        {"id": "2", "slug": "mock-event-b", "title": "Never touched",
+         "negRisk": false, "category": "Politics", "active": true, "closed": false,
+         "markets": [{"conditionId": "0xbbb", "question": "B?",
+                      "clobTokenIds": "[\"2001\",\"2002\"]", "outcomes": "[\"Yes\",\"No\"]",
+                      "active": true, "closed": false, "enableOrderBook": true}]}
+    ]"#;
+
+    /// A: 0.50 + 0.55 = 1.05 → no gap at all until the stream moves it.
+    /// B: 0.40 + 0.55 = 0.95 → a 5¢ gap sitting there the whole time.
+    const STREAM_BOOKS: &str = r#"[
+        {"asset_id":"1001","bids":[{"price":"0.49","size":"500"}],"asks":[{"price":"0.50","size":"500"}]},
+        {"asset_id":"1002","bids":[{"price":"0.54","size":"500"}],"asks":[{"price":"0.55","size":"500"}]},
+        {"asset_id":"2001","bids":[{"price":"0.39","size":"500"}],"asks":[{"price":"0.40","size":"500"}]},
+        {"asset_id":"2002","bids":[{"price":"0.54","size":"500"}],"asks":[{"price":"0.55","size":"500"}]}
+    ]"#;
+
+    /// A stub of the CLOB market channel.
+    ///
+    /// It only pushes frames for tokens the client actually asked for, so a wrong
+    /// subscribe frame shows up as "nothing was ever detected" rather than passing
+    /// silently. Returns its `ws://` URL.
+    async fn mock_market_channel(gap: Duration) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                        return;
+                    };
+                    // The subscribe frame comes first, and decides what we push.
+                    let Some(Ok(message)) = ws.next().await else {
+                        return;
+                    };
+                    let subscribed: Vec<String> = serde_json::from_str::<serde_json::Value>(
+                        message.to_text().unwrap_or_default(),
+                    )
+                    .ok()
+                    .and_then(|v| {
+                        v.get("assets_ids").and_then(|a| {
+                            a.as_array().map(|ids| {
+                                ids.iter()
+                                    .filter_map(|i| i.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                        })
+                    })
+                    .unwrap_or_default();
+                    if !subscribed.iter().any(|id| id == "1001") {
+                        return;
+                    }
+
+                    let ts = || Utc::now().timestamp_millis().to_string();
+                    // 1. A snapshot that agrees with REST: no gap, one detection pass.
+                    let snapshot = json!({
+                        "event_type": "book", "asset_id": "1001", "timestamp": ts(),
+                        "hash": "h1",
+                        "bids": [{"price": "0.49", "size": "500"}],
+                        "asks": [{"price": "0.50", "size": "500"}]
+                    });
+                    if ws.send(Message::Text(snapshot.to_string())).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(gap).await;
+                    // 2. A delta that puts a 0.40 ask on top: 0.40 + 0.55 = 0.95.
+                    let delta = json!({
+                        "event_type": "price_change", "asset_id": "1001", "timestamp": ts(),
+                        "changes": [{"price": "0.40", "size": "500", "side": "SELL"}]
+                    });
+                    if ws.send(Message::Text(delta.to_string())).await.is_err() {
+                        return;
+                    }
+                    // Stay open; the daemon closes us on shutdown.
+                    while let Some(Ok(_)) = ws.next().await {}
+                });
+            }
+        });
+        format!("ws://{addr}/ws/market")
+    }
+
+    fn stream_test_config(rest: String, ws_url: String, tmp: &Path) -> Config {
+        let mut cfg = Config::default();
+        cfg.api.gamma_base_url = rest.clone();
+        cfg.api.clob_base_url = rest;
+        cfg.api.min_request_interval_ms = 0;
+        cfg.api.max_retries = 0;
+        cfg.daemon.scan_interval_secs = 1;
+        cfg.lifecycle.repoll_interval_secs = 1;
+        cfg.lifecycle.repoll_window_secs = 1;
+        cfg.alerts.telegram_api_base = "http://127.0.0.1:1".into();
+        cfg.storage.database_path = tmp.join("polyarb.sqlite").display().to_string();
+        cfg.storage.log_dir = tmp.join("logs").display().to_string();
+        cfg.storage.report_dir = tmp.join("reports").display().to_string();
+        cfg.stream.enabled = true;
+        cfg.stream.url = ws_url;
+        cfg.stream.debounce_ms = 50;
+        cfg.stream.stale_after_secs = 60;
+        // Long enough that no full REST sweep runs inside the test window: what is
+        // detected here was detected from the stream, and nothing else.
+        cfg.stream.resync_interval_secs = 3_600;
+        cfg.stream.fallback_after_failures = 5;
+        cfg
+    }
+
+    /// A pushed delta creates a gap; only the event that moved is re-evaluated, and the
+    /// opportunity flows through the ordinary persist/alert/track pipeline with a
+    /// measured detection latency.
+    #[tokio::test]
+    async fn a_streamed_delta_detects_only_the_affected_event_and_records_its_latency() {
+        let rest = mock_api_with(STREAM_EVENTS, STREAM_BOOKS).await;
+        let ws_url = mock_market_channel(Duration::from_millis(150)).await;
+        let tmp = std::env::temp_dir().join(format!("polyarb-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let cfg = stream_test_config(rest, ws_url, &tmp);
+        cfg.validate().expect("stream config must validate");
+        run(cfg.clone(), Some(3)).await.expect("daemon run");
+
+        let store = Store::open(Path::new(&cfg.storage.database_path)).expect("reopen db");
+        let rows = store
+            .opportunities_for_day(Utc::now().date_naive())
+            .expect("rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the streamed event may be re-evaluated; got {:?}",
+            rows.iter()
+                .map(|r| (r.event_slug.clone(), r.net_taker))
+                .collect::<Vec<_>>()
+        );
+        let row = &rows[0];
+        assert_eq!(
+            row.event_slug, "mock-event-a",
+            "event B's standing 5¢ gap must stay unseen — nothing touched it"
+        );
+        assert_eq!(row.kind, "binary_yes_no");
+        assert_eq!(row.category, "politics");
+        // asks 0.40 + 0.55 = 0.95 → gross 0.05
+        // fee (politics 0.04): 0.04*0.40*0.60 + 0.04*0.55*0.45 = 0.0096 + 0.0099 = 0.0195
+        // net_taker = 0.0305 ; size capped at 50 / 0.95 = 52.6315... shares
+        assert_eq!(row.net_taker, dec!(0.0305));
+        assert!(row.executable_size > dec!(52.6) && row.executable_size <= dec!(52.64));
+        assert!(row.capital_required <= dec!(50));
+
+        let latency = row
+            .detection_latency_ms
+            .expect("a stream-detected row must carry its latency");
+        assert!(
+            (0..60_000).contains(&latency),
+            "implausible latency {latency} ms"
+        );
+        assert!(
+            latency < 5_000,
+            "streamed detection must beat the 5 s polling floor, got {latency} ms"
+        );
+
+        // The same number reaches the JSONL log and the daily summary.
+        let log = std::fs::read_to_string(tmp.join("logs").join("events.jsonl")).expect("log");
+        let logged: Vec<serde_json::Value> = log
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|v: &serde_json::Value| v["event"] == "opportunity")
+            .collect();
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0]["detection_latency_ms"].as_i64(), Some(latency));
+
+        let summary = emit_daily_summary(
+            &cfg,
+            &store,
+            &Alerter::new(
+                &cfg.alerts,
+                Arc::new(EventLog::open(Path::new(&cfg.storage.log_dir)).expect("log")),
+            ),
+            Utc::now().date_naive(),
+            false,
+        )
+        .await
+        .expect("summary");
+        assert_eq!(summary.stream_detected, 1);
+        assert_eq!(summary.latency_p50_ms, Some(latency));
+        assert_eq!(summary.latency_p95_ms, Some(latency));
+        assert!(summary
+            .to_markdown()
+            .contains("detected from streamed book updates: 1 of 1"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An unreachable market channel must degrade to the M3 polling daemon, not stop it.
+    #[tokio::test]
+    async fn an_unreachable_stream_falls_back_to_rest_polling() {
+        let rest = mock_api().await; // MOCK_BOOKS: 0.40 + 0.55 = 0.95, a detectable gap
+        let tmp = std::env::temp_dir().join(format!("polyarb-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // Port 1 refuses connections immediately, so the failure streak is fast.
+        let mut cfg = stream_test_config(rest, "ws://127.0.0.1:1/ws/market".into(), &tmp);
+        cfg.stream.fallback_after_failures = 2;
+        cfg.validate().expect("config must validate");
+        run(cfg.clone(), Some(4)).await.expect("daemon run");
+
+        let store = Store::open(Path::new(&cfg.storage.database_path)).expect("reopen db");
+        let rows = store
+            .opportunities_for_day(Utc::now().date_naive())
+            .expect("rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "REST polling must have carried on and found the gap"
+        );
+        assert_eq!(rows[0].kind, "binary_yes_no");
+        assert_eq!(
+            rows[0].detection_latency_ms, None,
+            "a REST-detected row has no triggering frame to measure against"
+        );
+        let totals = store
+            .scan_totals_for_day(Utc::now().date_naive())
+            .expect("totals");
+        assert!(
+            totals.cycles >= 2,
+            "the daemon must keep scanning after giving up on the stream (cycles={})",
+            totals.cycles
+        );
+        assert_eq!(totals.errors, 0);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

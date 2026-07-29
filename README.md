@@ -26,14 +26,26 @@ headline number:
 - **Honest fill accounting.** Every detected opportunity is re-polled after detection. If
   the walked fills are gone by the first re-poll it is recorded as `vanished`, and the
   verdict is never revised in its favour.
+- **Event-driven detection.** Books are maintained live from the CLOB WebSocket market
+  channel and only the events whose books actually moved are re-evaluated, so detection
+  happens tens of milliseconds after the market moves rather than on a five-second timer.
+  REST is not retired: it seeds the books, re-fetches anything stale, sweeps the whole
+  universe on a slow cadence as an integrity check, and takes over entirely if the socket
+  cannot be reached.
 
 Money is `Decimal` throughout — no `f64` ever touches a price or a size.
 
 ## Status: Phase A, dry-run
 
-Milestones M1–M4 are complete: market ingestion, the detectors and cost model, the
-continuous daemon with SQLite persistence, Telegram alerts and daily reports, and
-deployment packaging.
+Milestones M1–M4 and M6 are complete: market ingestion, the detectors and cost model, the
+continuous daemon with SQLite persistence, Telegram alerts and daily reports, deployment
+packaging, and the streaming market-data layer.
+
+Every wire detail of the WebSocket channel is inferred from the public docs and has never
+met the real API — the build container cannot reach Polymarket at all. It is marked
+`TODO(verify-live)` throughout `src/ws.rs` and `config/default.toml`, and it fails safe:
+if the endpoint is unreachable or unusable the daemon logs loudly and reverts to the
+REST polling loop. `stream.enabled = false` turns it off entirely.
 
 **It cannot trade.** There is no signing code, no order placement, no wallet and no
 private key anywhere in the repository. `mode` is locked to `dry-run` in config and the
@@ -59,7 +71,7 @@ Needs Rust 1.94+. No credentials of any kind.
 
 ```bash
 cargo build --release
-cargo test                  # 97 tests
+cargo test                  # 128 tests
 
 ./target/release/polyarb markets      # discover the tracked universe, fetch one book batch
 ./target/release/polyarb scan         # run the detectors once, with the full cost breakdown

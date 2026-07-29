@@ -10,7 +10,7 @@ The core idea: prediction market prices represent implied probabilities. When re
 
 ## Current Status
 
-**Early stage — no code yet.** The repository was repurposed from a previous project. The owner is providing research material about Polymarket and arbitrage strategies, which informs the architecture and implementation. Do not assume implementation details described below are final until code exists.
+**Phase A complete and soaking.** The dry-run scanner (M1–M6: ingestion, detectors, cost model, daemon, packaging, WebSocket streaming) is built, tested, and running on the owner's machine collecting go/no-go evidence. Phase B (execution/live trading) is designed but NOT built — it requires an explicit owner decision after the soak review. The research below informed the architecture and remains the strategy source of truth.
 
 Research collected so far lives in `research/`:
 - `awesome-prediction-market-tools.md` — survey of the prediction-market tool ecosystem: existing arbitrage tools (competitive landscape), data/API providers, and open-source projects worth studying (Polymarket JB Bot, PMXT, TREMOR, pykalshi).
@@ -55,9 +55,10 @@ Rust binary crate `polyarb` (Phase A: scanner + dry-run only; no wallet/key code
 - `src/detect.rs` — binary, NegRisk YES-side, NegRisk NO-side detectors; depth-walked joint sizing.
 - `src/risk.rs` — per-trade cap (Phase A scope).
 - `src/store.rs` — SQLite persistence; money stored as TEXT Decimal strings, never REAL.
-- `src/dryrun.rs` — daemon loop, opportunity lifecycle (filled_simulated vs vanished decided by first re-poll, never revised), daily summaries.
+- `src/ws.rs` — M6 streaming market data: CLOB WebSocket market channel, sharded connection pool, defensively parsed frames, locally maintained books with staleness/resync, debounced dirty-event detection. Every wire shape is `TODO(verify-live)` (the container cannot reach the endpoint); unreachable ⇒ loud permanent fallback to REST polling.
+- `src/dryrun.rs` — daemon loop (REST-timer *and* stream-triggered detection through one shared `process_opportunities` path), opportunity lifecycle (filled_simulated vs vanished decided by first re-poll, never revised), daily summaries incl. detection-latency p50/p95.
 - `src/alert.rs` — Telegram send-only alerts with JSONL fallback + circuit breaker; token never logged.
-- `config/default.toml` — all knobs; secrets only via env (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
+- `config/default.toml` — all knobs, including `[stream]` (enabled by default); secrets only via env (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`).
 - `tests/fixtures/` — recorded API-shape fixtures (live Polymarket APIs unreachable from dev container; `TODO(verify-live)` markers track unverified API shape assumptions).
 
 Quality gate for every change: `cargo build && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check`.

@@ -252,6 +252,14 @@ stream is what makes the dry run informative.
 > market channel is public (no auth) and what its message schema is. Assume
 > `wss://ws-subscriptions-clob.polymarket.com/ws/market` until confirmed.
 
+**Update (M6).** The book-tracking half of this now exists: `src/ws.rs` subscribes the
+market channel, maintains books from `book`/`price_change` frames and drives incremental
+detection, with REST as the resync and fallback path. Every wire shape in it is still a
+guess carrying the marker above — M6 does not close this item, it only makes it cheap to
+close. What M6 deliberately does **not** provide is the trade-vs-cancel distinction §8.2
+needs: we see a level shrink, not why. That remains blocking, and it is the reason this
+recommendation still reads "WebSocket required before C2" rather than "done".
+
 ### 4.3 The latency budget, and what it rules out
 
 Honest end-to-end accounting for a *future* WebSocket build, from an EU VPS:

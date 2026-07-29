@@ -942,6 +942,92 @@ mod tests {
     }
 
     #[test]
+    fn shipped_config_carries_the_m6_stream_section() {
+        let cfg = Config::from_toml_str(SHIPPED).expect("parse");
+        cfg.validate().expect("validate");
+        assert!(cfg.stream.enabled, "streaming ships on by default");
+        assert_eq!(
+            cfg.stream.url,
+            "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+        );
+        assert_eq!(cfg.stream.max_subs_per_connection, 500);
+        assert_eq!(cfg.stream.debounce_ms, 50);
+        assert_eq!(cfg.stream.stale_after_secs, 60);
+        assert_eq!(cfg.stream.resync_interval_secs, 300);
+        assert_eq!(cfg.stream.fallback_after_failures, 5);
+        // The shipped section must agree with the compiled defaults.
+        assert_eq!(cfg.stream, StreamConfig::default());
+        // And the file must say out loud that the wire shapes are unverified.
+        assert!(
+            SHIPPED.contains("TODO(verify-live)"),
+            "the stream section must keep its unverified-API warning"
+        );
+    }
+
+    #[test]
+    fn stream_settings_are_validated_only_when_streaming_is_on() {
+        let with = |stream: StreamConfig| Config {
+            stream,
+            ..Config::default()
+        };
+
+        for bad in [
+            StreamConfig {
+                url: "https://clob.polymarket.com".into(),
+                ..StreamConfig::default()
+            },
+            StreamConfig {
+                max_subs_per_connection: 0,
+                ..StreamConfig::default()
+            },
+            StreamConfig {
+                stale_after_secs: 0,
+                ..StreamConfig::default()
+            },
+            StreamConfig {
+                resync_interval_secs: 0,
+                ..StreamConfig::default()
+            },
+            StreamConfig {
+                // 0 would fall back before the first attempt.
+                fallback_after_failures: 0,
+                ..StreamConfig::default()
+            },
+            StreamConfig {
+                // A debounce at/above the scan interval is slower than the polling it
+                // replaces (the default scan interval is 5 s).
+                debounce_ms: 5_000,
+                ..StreamConfig::default()
+            },
+        ] {
+            assert!(
+                with(bad.clone()).validate().is_err(),
+                "must be rejected: {bad:?}"
+            );
+            // …but a disabled stream is never in the way of starting up.
+            assert!(with(StreamConfig {
+                enabled: false,
+                ..bad
+            })
+            .validate()
+            .is_ok());
+        }
+
+        // A plain ws:// URL (what the tests use) is fine.
+        assert!(with(StreamConfig {
+            url: "ws://127.0.0.1:9001/ws/market".into(),
+            ..StreamConfig::default()
+        })
+        .validate()
+        .is_ok());
+
+        assert!(
+            Config::from_toml_str("[stream]\nenabledd = true\n").is_err(),
+            "a typo in the stream section must not be silently ignored"
+        );
+    }
+
+    #[test]
     fn shipped_config_contains_no_credentials() {
         // Belt and braces for the CLAUDE.md rule: secrets live in the environment only.
         // Comments may *name* the environment variables; no key may ever carry a value.
