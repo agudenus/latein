@@ -238,11 +238,20 @@ impl Daemon {
                     self.cfg.api.gamma_base_url
                 )
             })?;
+        let partial_negrisk = universe
+            .events
+            .iter()
+            .filter(|e| e.neg_risk && !e.coverage_complete())
+            .count();
         tracing::info!(
             events = universe.events.len(),
             markets = universe.market_count(),
             negrisk_events = universe.neg_risk_event_count(),
-            dropped_markets = stats.markets_unusable + stats.markets_inactive,
+            partial_negrisk_events = partial_negrisk,
+            markets_seen = stats.markets_seen,
+            dropped_markets = stats.markets_dropped(),
+            drop_reasons = %stats.drops.summary(),
+            truncated = stats.truncated,
             "market universe refreshed"
         );
         Ok(universe)

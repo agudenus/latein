@@ -417,6 +417,15 @@ pub fn format_opportunity(op: &Opportunity) -> String {
     if let Some(total) = op.net_maker_total {
         out.push_str(&format!(" · net maker ${total:.2}"));
     }
+    if let Some((tracked, total)) = op.partial_coverage {
+        // The single most important caveat on the message: without it a reader sees a
+        // NegRisk sweep summing under $1 and assumes it is a lock.
+        out.push_str(&format!(
+            "\nNOT risk-free: {tracked} of {total} outcomes covered — {} outcome(s) of this \
+             event were dropped in discovery and are unhedged. Relative value, not arbitrage.",
+            total.saturating_sub(tracked)
+        ));
+    }
     if op.maker_only {
         out.push_str("\nMAKER-ONLY: taker net is below the floor; requires resting fills.");
     }

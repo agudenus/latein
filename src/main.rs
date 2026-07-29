@@ -189,18 +189,41 @@ async fn run_markets(cfg: &Config, show: usize) -> Result<()> {
         cfg.api.gamma_base_url, cfg.mode
     );
     println!(
-        "  events:  {} kept / {} seen  ({} inactive or closed)",
-        stats.events_kept, stats.events_seen, stats.events_inactive
+        "  events:  {} kept / {} seen  ({} inactive or closed, {} with no priceable market)",
+        stats.events_kept, stats.events_seen, stats.events_inactive, stats.events_no_usable_market
     );
     println!(
-        "  markets: {} kept / {} seen  ({} inactive, {} unusable token ids)",
-        stats.markets_kept, stats.markets_seen, stats.markets_inactive, stats.markets_unusable
+        "  markets: {} kept / {} seen  ({} dropped: {})",
+        stats.markets_kept,
+        stats.markets_seen,
+        stats.markets_dropped(),
+        stats.drops.summary(),
     );
     println!(
         "  negrisk events: {} of {}",
         universe.neg_risk_event_count(),
         universe.events.len()
     );
+    // Partial coverage is why a "3.2¢ two-outcome election arb" is not one; say so up
+    // front rather than leaving it to be discovered in the opportunity flags.
+    let partial = universe
+        .events
+        .iter()
+        .filter(|e| e.neg_risk && !e.coverage_complete())
+        .count();
+    if partial > 0 {
+        println!(
+            "  negrisk events with INCOMPLETE outcome coverage: {partial} \
+             (sweeps suppressed unless scan.report_partial_negrisk = true)"
+        );
+    }
+    if stats.truncated {
+        println!(
+            "  WARNING: discovery stopped at scan.max_events = {} — the universe is \
+             incomplete; raise it.",
+            cfg.scan.max_events
+        );
+    }
 
     let tokens = universe.token_ids();
     let with_asks = books.values().filter(|b| b.best_ask().is_some()).count();
@@ -243,10 +266,16 @@ async fn run_markets(cfg: &Config, show: usize) -> Result<()> {
                 .count();
             let n = event.markets.len();
             println!(
-                "    [{}] {:<12} {n:>2} market{} ({priced} fully priced)  {}",
+                "    [{}] {:<12} {n:>2}/{:<2} outcome{} ({priced} fully priced){}  {}",
                 if event.neg_risk { "negrisk" } else { "binary " },
                 event.category.as_str(),
+                event.total_outcomes,
                 if n == 1 { " " } else { "s" },
+                if event.neg_risk && !event.coverage_complete() {
+                    "  PARTIAL"
+                } else {
+                    ""
+                },
                 truncate(&event.title, 60),
             );
         }

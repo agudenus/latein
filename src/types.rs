@@ -246,7 +246,32 @@ pub struct TrackedEvent {
     pub title: String,
     pub neg_risk: bool,
     pub category: Category,
+    /// The markets we can actually price — a *subset* of the event's outcome set.
     pub markets: Vec<TrackedMarket>,
+    /// How many markets Gamma listed for this event **before** any filtering: closed,
+    /// inactive, order-book-disabled and unparseable ones all count.
+    ///
+    /// This is the denominator of the full-coverage guard. A NegRisk sweep only pays $1
+    /// (YES-side) or $(N−1) (NO-side) when it spans *every* outcome of the event; if an
+    /// outcome was dropped during discovery, buying the tracked subset leaves the dropped
+    /// outcome uncovered and the position is not risk-free. Sweeps over a partial outcome
+    /// set must never be labelled `true-arb`.
+    pub total_outcomes: usize,
+}
+
+impl TrackedEvent {
+    /// True when every outcome Gamma listed for this event is tracked and priceable.
+    ///
+    /// `total_outcomes == 0` means the count was never populated; treat that as unknown
+    /// (i.e. *not* complete) rather than optimistically assuming full coverage.
+    pub fn coverage_complete(&self) -> bool {
+        self.total_outcomes > 0 && self.markets.len() == self.total_outcomes
+    }
+
+    /// Outcomes Gamma listed that we are not tracking.
+    pub fn missing_outcomes(&self) -> usize {
+        self.total_outcomes.saturating_sub(self.markets.len())
+    }
 }
 
 /// The full set of markets the scanner watches on a tick.
@@ -385,6 +410,11 @@ pub struct Opportunity {
     pub capital_required: Decimal,
     pub net_taker_total: Decimal,
     pub net_maker_total: Option<Decimal>,
+
+    /// `Some((tracked, total))` when this construction spans only part of the event's
+    /// outcome set. Always `None` for a `true-arb` row: a partial sweep is relative value,
+    /// never arbitrage, because the untracked outcomes can win and pay us nothing.
+    pub partial_coverage: Option<(usize, usize)>,
 
     /// Execution / resolution caveats a human must read before trusting the number.
     pub resolution_flags: Vec<String>,

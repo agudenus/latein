@@ -88,10 +88,24 @@ pub struct ApiConfig {
 pub struct ScanConfig {
     /// Gamma `/events` page size.
     pub page_size: usize,
-    /// Stop paginating after this many events (rate-limit guard).
+    /// Hard stop on Gamma `/events` pagination — a rate-limit backstop, **not** the
+    /// intended stopping point. Normal discovery ends when the API returns a short page.
+    /// When this cap is what stops us the universe is incomplete (a NegRisk event can
+    /// even be split across the boundary), so `fetch_universe` logs
+    /// `WARN universe truncated at max_events`. Keep it comfortably above the live event
+    /// count (~500 and growing).
     pub max_events: usize,
     /// Skip NegRisk events with more outcomes than this (leg count blows up capital).
     pub max_negrisk_outcomes: usize,
+    /// Report NegRisk sweeps that cover only part of an event's outcome set.
+    ///
+    /// Off by default, and deliberately so: if discovery dropped an outcome, buying the
+    /// tracked subset is not a lock — the dropped outcome can win and pay us nothing.
+    /// When enabled, such a sweep is surfaced as `relative-value` with a
+    /// `partial_coverage` flag and is never labelled `true-arb`. The NO-side construction
+    /// is suppressed regardless, because its `$(N−1)` payout is only valid for a complete
+    /// sweep.
+    pub report_partial_negrisk: bool,
     /// Smallest share count worth reporting.
     pub min_size_shares: Decimal,
     /// Binary-search resolution for the depth walker, in shares.
@@ -208,8 +222,9 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             page_size: 100,
-            max_events: 500,
+            max_events: 2_000,
             max_negrisk_outcomes: 30,
+            report_partial_negrisk: false,
             min_size_shares: Decimal::new(5, 0),
             size_search_tolerance: Decimal::new(1, 2),
             net_floor: [

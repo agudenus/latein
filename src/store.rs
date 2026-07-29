@@ -783,6 +783,7 @@ pub(crate) mod tests {
             capital_required: d!(95),
             net_taker_total: d!(3.05),
             net_maker_total: Some(d!(7)),
+            partial_coverage: None,
             resolution_flags: vec!["single condition".into()],
             conversion_required: false,
             maker_only: false,

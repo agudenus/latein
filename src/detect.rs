@@ -11,6 +11,25 @@
 //! Every candidate is then depth-walked: we binary-search the largest size at which
 //! *every* leg's VWAP still leaves net-per-share above the configured floor, with the
 //! per-trade capital cap enforced inside the search.
+//!
+//! ## Full-coverage guard (why both NegRisk forms check `total_outcomes`)
+//!
+//! Both sweeps are only risk-free when they span **every** outcome of the event. Discovery
+//! drops markets that are closed, inactive, order-book-disabled or unparseable, so
+//! `event.markets` is a *subset* of the event's real outcome set. Sweeping that subset
+//! leaves the dropped outcomes uncovered: if one of them wins, every leg we bought pays
+//! zero. A two-outcome sweep of a three-outcome election summing to $0.968 looks like a
+//! 3.2¢ lock and is not one.
+//!
+//! Therefore:
+//!
+//! * `tracked == total` → the sweep is a genuine lock → `true-arb`.
+//! * `tracked < total` → suppressed by default; with `scan.report_partial_negrisk = true`
+//!   the **YES-side** may be surfaced as `relative-value` carrying a `partial_coverage`
+//!   flag, never as arbitrage.
+//! * `tracked < total` on the **NO-side** is always suppressed: its `$(N−1)` payout is
+//!   derived from the full outcome count, and with a partial sweep the number of NOs that
+//!   pay is not `tracked − 1` at all. There is no honest way to report it.
 
 use rust_decimal::{Decimal, RoundingStrategy};
 
@@ -34,6 +53,16 @@ struct CandidateLeg<'a> {
     market: &'a TrackedMarket,
     outcome: String,
     book: &'a OrderBook,
+}
+
+/// How much of the event's outcome set a construction covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Coverage {
+    /// Either not an event-wide sweep (a single binary condition, whose YES and NO always
+    /// sum to $1 on their own) or a sweep spanning every outcome Gamma listed.
+    Complete,
+    /// Only `tracked` of the event's `total` outcomes are priced. NOT risk-free.
+    Partial { tracked: usize, total: usize },
 }
 
 impl<'a> Detector<'a> {
@@ -90,9 +119,15 @@ impl<'a> Detector<'a> {
                     },
                 },
             ];
-            if let Some(op) =
-                self.evaluate(event, OpportunityKind::BinaryYesNo, Decimal::ONE, &legs)
-            {
+            if let Some(op) = self.evaluate(
+                event,
+                OpportunityKind::BinaryYesNo,
+                Decimal::ONE,
+                &legs,
+                // A single condition is self-contained: YES + NO of the same market sum to
+                // $1 at resolution no matter what else the event lists.
+                Coverage::Complete,
+            ) {
                 out.push(op);
             }
         }
@@ -100,24 +135,69 @@ impl<'a> Detector<'a> {
         if !event.neg_risk {
             return;
         }
-        let n = event.markets.len();
-        if n < 2 || n > self.cfg.scan.max_negrisk_outcomes {
+        let tracked = event.markets.len();
+        let total = event.total_outcomes;
+        if tracked < 2 || tracked > self.cfg.scan.max_negrisk_outcomes {
             return;
         }
 
+        // The full-coverage guard. `total` is Gamma's pre-filter outcome count, so
+        // `tracked < total` means discovery dropped outcomes and the sweep is incomplete.
+        let coverage = if event.coverage_complete() {
+            Coverage::Complete
+        } else {
+            if !self.cfg.scan.report_partial_negrisk {
+                tracing::debug!(
+                    event = %event.slug,
+                    tracked,
+                    total,
+                    "suppressing NegRisk sweep: outcome coverage is incomplete"
+                );
+                return;
+            }
+            Coverage::Partial { tracked, total }
+        };
+
         // YES-side sweep: buy YES on every outcome, exactly one pays $1.
         if let Some(legs) = self.negrisk_legs(event, books, true) {
-            if let Some(op) =
-                self.evaluate(event, OpportunityKind::NegRiskYesSide, Decimal::ONE, &legs)
-            {
+            if let Some(op) = self.evaluate(
+                event,
+                OpportunityKind::NegRiskYesSide,
+                Decimal::ONE,
+                &legs,
+                coverage,
+            ) {
                 out.push(op);
             }
         }
 
         // NO-side sweep: buy NO on every outcome, exactly one loses → N−1 pay $1.
+        //
+        // `N` is the event's *full* outcome count. That payout is only defensible when we
+        // hold a NO on every outcome; over a partial set the guaranteed payout is a
+        // different number entirely, so quoting `total − 1` would overstate the lock and
+        // quoting `tracked − 1` would silently turn this into a different construction
+        // (one whose NegRisk conversion path assumes the complete set). Neither is
+        // honest, so a partial NO-side sweep is suppressed outright — not even as
+        // relative value.
+        if coverage != Coverage::Complete {
+            tracing::debug!(
+                event = %event.slug,
+                tracked,
+                total,
+                "suppressing NegRisk NO-side sweep: the $(N−1) payout requires full coverage"
+            );
+            return;
+        }
         if let Some(legs) = self.negrisk_legs(event, books, false) {
-            let payout = Decimal::from(n) - Decimal::ONE;
-            if let Some(op) = self.evaluate(event, OpportunityKind::NegRiskNoSide, payout, &legs) {
+            let payout = Decimal::from(total) - Decimal::ONE;
+            if let Some(op) = self.evaluate(
+                event,
+                OpportunityKind::NegRiskNoSide,
+                payout,
+                &legs,
+                coverage,
+            ) {
                 out.push(op);
             }
         }
@@ -155,6 +235,7 @@ impl<'a> Detector<'a> {
         kind: OpportunityKind,
         payout: Decimal,
         legs: &[CandidateLeg<'_>],
+        coverage: Coverage,
     ) -> Option<Opportunity> {
         let books: Vec<&OrderBook> = legs.iter().map(|l| l.book).collect();
         let best_asks: Option<Vec<Decimal>> = books.iter().map(|b| b.best_ask()).collect();
@@ -184,6 +265,7 @@ impl<'a> Detector<'a> {
                 sized.cost,
                 fee_rate,
                 false,
+                coverage,
             ));
         }
 
@@ -194,7 +276,7 @@ impl<'a> Detector<'a> {
         Some(self.build(
             event, kind, payout, legs, &best_asks, &best_bids,
             &best_asks, // a maker never walks the ask book; taker fields are top-of-book
-            maker, fee_rate, true,
+            maker, fee_rate, true, coverage,
         ))
     }
 
@@ -308,9 +390,27 @@ impl<'a> Detector<'a> {
         cost: CostBreakdown,
         fee_rate: Decimal,
         maker_only: bool,
+        coverage: Coverage,
     ) -> Opportunity {
         let conversion_required = matches!(kind, OpportunityKind::NegRiskNoSide);
         let mut flags = Vec::new();
+
+        // A sweep that does not span every outcome is relative value, full stop. The
+        // label is what downstream consumers key on, so it is decided here and nowhere
+        // else.
+        let (label, partial_coverage) = match coverage {
+            Coverage::Complete => (Label::TrueArb, None),
+            Coverage::Partial { tracked, total } => {
+                flags.push(format!(
+                    "partial_coverage: NOT risk-free — {tracked} of {total} outcomes covered. \
+                     Discovery dropped {} outcome(s) of this event (closed, inactive, no order \
+                     book, or unparseable), so the untracked outcome(s) can win and pay these \
+                     legs nothing. Relative value, not arbitrage.",
+                    total.saturating_sub(tracked)
+                ));
+                (Label::RelativeValue, Some((tracked, total)))
+            }
+        };
 
         flags.push(match kind {
             OpportunityKind::BinaryYesNo => {
@@ -372,9 +472,10 @@ impl<'a> Detector<'a> {
 
         Opportunity {
             kind,
-            // All three constructions lock the payout at resolution inside one event and
-            // one oracle. Relative value is reserved for combinatorial/cross-platform.
-            label: Label::TrueArb,
+            // `true-arb` only when the construction locks the payout at resolution: a
+            // single condition, or a sweep covering every outcome of one event under one
+            // oracle. A partial sweep is downgraded to relative value above.
+            label,
             event_slug: event.slug.clone(),
             event_title: event.title.clone(),
             category: event.category.clone(),
@@ -391,6 +492,7 @@ impl<'a> Detector<'a> {
             capital_required: cost.capital_required,
             net_taker_total: cost.net_taker_total,
             net_maker_total: cost.net_maker_total,
+            partial_coverage,
             resolution_flags: flags,
             conversion_required,
             maker_only,
@@ -467,13 +569,26 @@ mod tests {
         }
     }
 
+    /// Fully covered event: every outcome Gamma listed is tracked.
     fn event(neg_risk: bool, category: &str, markets: Vec<TrackedMarket>) -> TrackedEvent {
+        let total = markets.len();
+        event_with_total(neg_risk, category, markets, total)
+    }
+
+    /// Event where Gamma listed `total` outcomes but only `markets` survived discovery.
+    fn event_with_total(
+        neg_risk: bool,
+        category: &str,
+        markets: Vec<TrackedMarket>,
+        total: usize,
+    ) -> TrackedEvent {
         TrackedEvent {
             id: "1".into(),
             slug: "test-event".into(),
             title: "Test Event".into(),
             neg_risk,
             category: Category::new(category),
+            total_outcomes: total,
             markets,
         }
     }
@@ -703,6 +818,9 @@ mod tests {
         assert_eq!(yes.spread_cost, Some(dec!(0.03)));
         assert_eq!(yes.net_maker, Some(dec!(0.09))); // 1 − (0.29+0.30+0.32)
         assert!(!yes.conversion_required);
+        // All 3 of 3 listed outcomes are tracked, so this really is a lock.
+        assert_eq!(yes.label, Label::TrueArb);
+        assert_eq!(yes.partial_coverage, None);
         // Capital cap binds: 50 / 0.94 = 53.1914893... shares.
         assert_size_near(
             yes.executable_size,
@@ -763,6 +881,195 @@ mod tests {
             .iter()
             .any(|f| f.contains("NegRisk adapter")));
         assert_eq!(no.label, Label::TrueArb);
+    }
+
+    // --- NegRisk full-coverage guard -------------------------------------------------
+    //
+    // Reproduces the live false positive: a US Senate event whose Gamma outcome list has
+    // three markets, one of which discovery dropped. Sweeping the surviving two sums to
+    // $0.968 and looks like a 3.2¢ lock — it is not, because the dropped outcome can win.
+
+    /// Two YES books priced like the observed "Tennessee Senate" sweep, plus NO books
+    /// deliberately priced so neither the binary nor the NO-side detector can fire.
+    fn senate_like_books() -> Vec<OrderBook> {
+        vec![
+            // YES A: ask 0.026 / bid 0.024      NO A: ask 0.980 → binary 1.006, no gap.
+            book("0-yes", &[(dec!(0.024), dec!(1000))], &[(dec!(0.026), dec!(1000))]),
+            book("0-no", &[(dec!(0.970), dec!(1000))], &[(dec!(0.980), dec!(1000))]),
+            // YES B: ask 0.942 / bid 0.940      NO B: ask 0.062 → binary 1.004, no gap.
+            book("1-yes", &[(dec!(0.940), dec!(1000))], &[(dec!(0.942), dec!(1000))]),
+            book("1-no", &[(dec!(0.055), dec!(1000))], &[(dec!(0.062), dec!(1000))]),
+        ]
+    }
+
+    fn senate_like_markets() -> Vec<TrackedMarket> {
+        vec![market(0, "Will the Democrat win?"), market(1, "Will the Republican win?")]
+    }
+
+    #[test]
+    fn partial_negrisk_coverage_is_suppressed_by_default() {
+        // Gamma listed 3 outcomes; discovery kept 2. Σ YES asks = 0.968 → a 3.2¢ "gap"
+        // that is not a lock, so with the default config nothing is reported at all.
+        let ops = run(
+            &cfg(),
+            event_with_total(true, "politics", senate_like_markets(), 3),
+            senate_like_books(),
+        );
+        assert!(
+            ops.is_empty(),
+            "an incomplete NegRisk sweep must not be reported by default; got {:?}",
+            ops.iter().map(|o| o.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn partial_negrisk_coverage_is_relative_value_never_true_arb() {
+        // Same event, with the opt-in flag set.
+        //   Σ YES asks = 0.026 + 0.942 = 0.968 → gross gap 0.032
+        //   fee (politics 0.04) = 0.04*0.026*0.974 + 0.04*0.942*0.058
+        //                       = 0.00101296 + 0.00218544 = 0.0031984
+        //   net_taker = 0.032 − 0 − 0.0031984 = 0.0288016
+        //   spread    = (0.026−0.024) + (0.942−0.940) = 0.004
+        //   net_maker = 1 − (0.024 + 0.940) = 0.036  (= gross + spread)
+        //   size: capital cap 50 / 0.968 = 51.6528925... shares (depth 1000 is ample)
+        let mut c = cfg();
+        c.scan.report_partial_negrisk = true;
+        let ops = run(
+            &c,
+            event_with_total(true, "politics", senate_like_markets(), 3),
+            senate_like_books(),
+        );
+
+        assert_eq!(ops.len(), 1, "unexpected: {ops:#?}");
+        let op = &ops[0];
+        assert_eq!(op.kind, OpportunityKind::NegRiskYesSide);
+        assert_eq!(
+            op.label,
+            Label::RelativeValue,
+            "a partial sweep is never risk-free"
+        );
+        assert_eq!(op.partial_coverage, Some((2, 3)));
+        assert_eq!(op.gross_gap, dec!(0.032));
+        assert_eq!(op.fee_taker, dec!(0.0031984));
+        assert_eq!(op.net_taker, dec!(0.0288016));
+        assert_eq!(op.spread_cost, Some(dec!(0.004)));
+        assert_eq!(op.net_maker, Some(dec!(0.036)));
+        assert!(!op.maker_only);
+        assert_size_near(
+            op.executable_size,
+            dec!(50) / dec!(0.968),
+            c.scan.size_search_tolerance,
+        );
+        assert!(op.capital_required <= dec!(50));
+
+        // The caveat has to be legible to a human and greppable in the JSONL/DB.
+        let flag = op
+            .resolution_flags
+            .iter()
+            .find(|f| f.starts_with("partial_coverage:"))
+            .expect("a partial sweep must carry the partial_coverage flag");
+        assert!(flag.contains("NOT risk-free"), "got: {flag}");
+        assert!(flag.contains("2 of 3 outcomes covered"), "got: {flag}");
+
+        // And the alert rendering must repeat it — the label alone is easy to skim past.
+        let text = crate::alert::format_opportunity(op);
+        assert!(text.contains("relative-value"), "got: {text}");
+        assert!(text.contains("NOT risk-free: 2 of 3 outcomes covered"), "got: {text}");
+    }
+
+    #[test]
+    fn complete_coverage_of_the_same_shape_still_fires_as_true_arb() {
+        // Identical books, but Gamma really does list only the two outcomes. Then the
+        // sweep *is* exhaustive and the 3.2¢ gap is a genuine lock.
+        let ops = run(
+            &cfg(),
+            event_with_total(true, "politics", senate_like_markets(), 2),
+            senate_like_books(),
+        );
+        assert_eq!(ops.len(), 1, "unexpected: {ops:#?}");
+        assert_eq!(ops[0].kind, OpportunityKind::NegRiskYesSide);
+        assert_eq!(ops[0].label, Label::TrueArb);
+        assert_eq!(ops[0].partial_coverage, None);
+        assert_eq!(ops[0].net_taker, dec!(0.0288016));
+        assert!(!ops[0]
+            .resolution_flags
+            .iter()
+            .any(|f| f.starts_with("partial_coverage:")));
+    }
+
+    /// NO books that would fire an unguarded NO-side sweep, with YES asks set so neither
+    /// the binary nor the YES-side detector can fire:
+    ///   binary A 0.62 + 0.40 = 1.02 ; binary B 0.55 + 0.50 = 1.05 ; Σ YES asks = 1.17.
+    ///   Σ NO asks = 0.90 → against a $1 payout that is a 10¢ gap.
+    fn no_side_books() -> Vec<OrderBook> {
+        vec![
+            book("0-yes", &[(dec!(0.60), dec!(1000))], &[(dec!(0.62), dec!(1000))]),
+            book("0-no", &[(dec!(0.38), dec!(1000))], &[(dec!(0.40), dec!(1000))]),
+            book("1-yes", &[(dec!(0.53), dec!(1000))], &[(dec!(0.55), dec!(1000))]),
+            book("1-no", &[(dec!(0.48), dec!(1000))], &[(dec!(0.50), dec!(1000))]),
+        ]
+    }
+
+    #[test]
+    fn partial_negrisk_no_side_is_never_reported_even_when_partials_are_enabled() {
+        // The permissive setting, which still must not let a NO-side sweep through: its
+        // $(N−1) payout is only defined over the complete outcome set.
+        let mut c = cfg();
+        c.scan.report_partial_negrisk = true;
+        let ops = run(
+            &c,
+            event_with_total(true, "geopolitics", senate_like_markets(), 3),
+            no_side_books(),
+        );
+        assert!(
+            !ops.iter()
+                .any(|o| o.kind == OpportunityKind::NegRiskNoSide),
+            "a partial NO-side sweep must never be reported; got {:?}",
+            ops.iter().map(|o| o.kind).collect::<Vec<_>>()
+        );
+        assert!(ops.is_empty(), "unexpected: {ops:#?}");
+    }
+
+    #[test]
+    fn complete_no_side_coverage_still_fires_as_true_arb() {
+        // Proves the books above really are NO-side arb shaped, so the previous test is
+        // measuring the guard and not an accidentally dead scenario.
+        //   payout = N − 1 = 1 ; Σ NO asks 0.90 → gross 0.10 ; geopolitics fee 0
+        //   spread = 0.02 + 0.02 = 0.04 ; net_maker = 1 − (0.38 + 0.48) = 0.14
+        //   size: 50 / 0.90 = 55.5555... shares
+        let ops = run(
+            &cfg(),
+            event_with_total(true, "geopolitics", senate_like_markets(), 2),
+            no_side_books(),
+        );
+        assert_eq!(ops.len(), 1, "unexpected: {ops:#?}");
+        let op = &ops[0];
+        assert_eq!(op.kind, OpportunityKind::NegRiskNoSide);
+        assert_eq!(op.label, Label::TrueArb);
+        assert_eq!(op.partial_coverage, None);
+        assert_eq!(op.payout, dec!(1));
+        assert_eq!(op.gross_gap, dec!(0.10));
+        assert_eq!(op.fee_taker, dec!(0));
+        assert_eq!(op.net_taker, dec!(0.10));
+        assert_eq!(op.spread_cost, Some(dec!(0.04)));
+        assert_eq!(op.net_maker, Some(dec!(0.14)));
+        assert_size_near(
+            op.executable_size,
+            dec!(50) / dec!(0.90),
+            cfg().scan.size_search_tolerance,
+        );
+    }
+
+    #[test]
+    fn an_unknown_outcome_count_is_treated_as_incomplete() {
+        // `total_outcomes == 0` means discovery never populated the count. Assuming full
+        // coverage there would re-open exactly the hole this guard closes.
+        let ops = run(
+            &cfg(),
+            event_with_total(true, "politics", senate_like_markets(), 0),
+            senate_like_books(),
+        );
+        assert!(ops.is_empty(), "unexpected: {ops:#?}");
     }
 
     #[test]
@@ -842,10 +1149,13 @@ mod tests {
     #[test]
     fn end_to_end_from_gamma_and_clob_fixtures() {
         // Gamma fixture → universe; CLOB fixture → books; detectors → opportunities.
-        // The book fixture deliberately covers only tokens 1001/1002/1004/2002, so:
-        //  - the NegRisk YES sweep needs 1001 + 1003 → 1003 has no book → suppressed;
-        //  - the NegRisk NO sweep (1002 + 1004) prices at 0.58 + 0.59 = 1.17 vs a $1
-        //    payout for N=2 → no gap;
+        // The Gamma fixture's NegRisk event lists 3 outcomes and one is closed, so
+        // coverage is 2 of 3 and *both* sweeps are suppressed by the full-coverage guard
+        // before books are even considered. Independently, the book fixture covers only
+        // tokens 1001/1002/1004/2002, so:
+        //  - the NegRisk YES sweep would also need 1003, which has no book;
+        //  - the NegRisk NO sweep (1002 + 1004) would price at 0.58 + 0.59 = 1.17, with
+        //    no gap against any payout it could claim;
         //  - the sports market (2001/2002) is missing a leg → skipped;
         //  - only market 1001/1002 is fully priced: 0.41 + 0.58 = 0.99 → gross gap 0.01.
         let raw = crate::gamma::parse_events_page(

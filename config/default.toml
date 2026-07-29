@@ -36,10 +36,25 @@ user_agent = "polyarb/0.1.0"
 
 [scan]
 page_size = 100
-max_events = 500
+# Hard stop on Gamma /events pagination — a rate-limit backstop, NOT the normal
+# stopping point (discovery ends when the API returns a short page). If this cap is
+# what stops us the universe is incomplete and a NegRisk event can be split across the
+# boundary, so the scanner logs "WARN universe truncated at max_events". Keep it well
+# above the live event count (~500 and growing); raise it if that warning appears.
+max_events = 2000
 # NegRisk events with more outcomes than this are skipped: every extra outcome is
 # another leg of capital and another leg of fill risk.
 max_negrisk_outcomes = 30
+# Report NegRisk sweeps that cover only part of an event's outcome set.
+#
+# Discovery drops markets that are closed, inactive, order-book-disabled or unparseable,
+# so an event's tracked markets can be a subset of its real outcomes. Sweeping that
+# subset is NOT risk-free: a dropped outcome can win and pay every leg nothing. With this
+# off (the default) such sweeps are suppressed entirely. With it on, the YES-side is
+# surfaced as "relative-value" carrying a partial_coverage flag and is never labelled
+# true-arb; the NO-side stays suppressed either way, because its $(N-1) payout is only
+# valid for a complete sweep.
+report_partial_negrisk = false
 # Smallest share count worth reporting (Polymarket's own minimum order is ~5 shares).
 min_size_shares = 5
 # Binary-search resolution of the depth walker, in shares.
