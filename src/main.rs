@@ -222,9 +222,11 @@ async fn run_markets(cfg: &Config, show: usize) -> Result<()> {
     }
     if stats.truncated {
         println!(
-            "  WARNING: discovery stopped at scan.max_events = {} — the universe is \
-             incomplete; raise it.",
-            cfg.scan.max_events
+            "  WARNING: discovery stopped early — the universe is INCOMPLETE. Either it hit \
+             scan.max_events = {} (raise it), or the API refused to paginate deeper (see the \
+             WARN in the log for which). Check scan.keyset_cursor_param = {:?} if the log \
+             says the cursor did not advance.",
+            cfg.scan.max_events, cfg.scan.keyset_cursor_param
         );
     }
 

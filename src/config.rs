@@ -89,8 +89,16 @@ pub struct ApiConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanConfig {
-    /// Gamma `/events` page size.
+    /// Gamma events page size.
     pub page_size: usize,
+    /// Query parameter that carries the keyset cursor back to `/events/keyset`.
+    ///
+    /// Optional, and only here because the ecosystem disagrees about the name (see
+    /// [`crate::gamma::DEFAULT_KEYSET_CURSOR_PARAM`]): if a live run shows the universe
+    /// truncating with `keyset pagination did not advance`, the wrong name is the first
+    /// suspect and this changes it without a rebuild.
+    #[serde(default = "default_keyset_cursor_param")]
+    pub keyset_cursor_param: String,
     /// Hard stop on Gamma `/events` pagination — a rate-limit backstop, **not** the
     /// intended stopping point. Normal discovery ends when the API returns a short page.
     /// When this cap is what stops us the universe is incomplete (a NegRisk event can
@@ -312,6 +320,10 @@ fn default_mode() -> String {
     "dry-run".to_string()
 }
 
+fn default_keyset_cursor_param() -> String {
+    crate::gamma::DEFAULT_KEYSET_CURSOR_PARAM.to_string()
+}
+
 /// Categories that always get a line in the daily summary, even at zero, and the order
 /// they appear in. The MVP focus set (CLAUDE.md): politics/NegRisk is primary, sports
 /// secondary, geopolitics the fee-free opportunistic tier, crypto the staged second focus.
@@ -381,6 +393,7 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             page_size: 100,
+            keyset_cursor_param: default_keyset_cursor_param(),
             // Raised from 2 000 after a live run filled all 20 pages: the active-event
             // count is past that, and a truncated universe can split a NegRisk event.
             max_events: 6_000,
@@ -615,6 +628,13 @@ impl Config {
         if self.scan.page_size == 0 || self.api.books_batch_size == 0 {
             return Err(ConfigError::Invalid(
                 "scan.page_size and api.books_batch_size must be > 0".into(),
+            ));
+        }
+        if self.scan.keyset_cursor_param.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "scan.keyset_cursor_param must not be empty (it is the query parameter that \
+                 carries the keyset cursor; the default is \"after_cursor\")"
+                    .into(),
             ));
         }
         if !self.scan.floors.contains_key("default") {
@@ -973,6 +993,42 @@ mod tests {
             .alert_min_net_by_category
             .insert("crypto".into(), dec!(-0.01));
         assert!(bad.validate().is_err());
+    }
+
+    /// The keyset cursor parameter is the one request detail that could not be verified
+    /// against the live API, so it ships as a knob: named in the file, defaulted when an
+    /// older copy of the file lacks it, and never allowed to be blank.
+    #[test]
+    fn the_keyset_cursor_param_is_shipped_defaulted_and_validated() {
+        let cfg = Config::from_toml_str(SHIPPED).expect("parse");
+        cfg.validate().expect("validate");
+        assert_eq!(
+            cfg.scan.keyset_cursor_param,
+            crate::gamma::DEFAULT_KEYSET_CURSOR_PARAM
+        );
+        assert_eq!(
+            cfg.scan.keyset_cursor_param,
+            ScanConfig::default().keyset_cursor_param
+        );
+
+        let older = SHIPPED
+            .lines()
+            .filter(|l| !l.starts_with("keyset_cursor_param"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = Config::from_toml_str(&older).expect("a config without the key must load");
+        cfg.validate().expect("validate");
+        assert_eq!(
+            cfg.scan.keyset_cursor_param,
+            crate::gamma::DEFAULT_KEYSET_CURSOR_PARAM
+        );
+
+        let mut blank = Config::default();
+        blank.scan.keyset_cursor_param = "  ".into();
+        assert!(
+            blank.validate().is_err(),
+            "an empty cursor parameter would silently re-request page one"
+        );
     }
 
     #[test]

@@ -60,7 +60,7 @@ use crate::alert::{format_opportunity, AlertStats, Alerter, Delivery, EventLog, 
 use crate::clob::ClobClient;
 use crate::config::{Config, REPORTED_CATEGORIES};
 use crate::detect;
-use crate::gamma::GammaClient;
+use crate::gamma::{GammaClient, PaginationState};
 use crate::http::HttpClient;
 use crate::store::{
     CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, ScanTotals, Store,
@@ -138,6 +138,7 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
         trackers: JoinSet::new(),
         last_summary_day: None,
         token_events: HashMap::new(),
+        gamma: Arc::new(PaginationState::default()),
     };
     daemon.main_loop(max_cycles).await
 }
@@ -188,13 +189,32 @@ struct Daemon {
     /// token id → index into `universe.events`. Rebuilt on every universe refresh; this is
     /// what turns "this book moved" into "re-evaluate exactly this event".
     token_events: HashMap<TokenId, usize>,
+    /// Which Gamma listing endpoint works, remembered across refreshes so a missing keyset
+    /// endpoint is probed (and logged) once per process rather than once per refresh.
+    gamma: Arc<PaginationState>,
+}
+
+/// Backoff between failed startup discovery attempts: start at the daemon's own scan
+/// cadence, double, cap at a minute. With the shipped 5 s interval that is 5→10→20→40→60 s.
+fn discovery_backoff(scan_interval_secs: u64, attempt: u32) -> Duration {
+    const CAP_SECS: u64 = 60;
+    let base = scan_interval_secs.clamp(1, CAP_SECS);
+    let secs = base
+        .saturating_mul(1u64 << attempt.saturating_sub(1).min(6))
+        .min(CAP_SECS);
+    Duration::from_secs(secs)
 }
 
 impl Daemon {
     async fn main_loop(&mut self, max_cycles: Option<u64>) -> Result<()> {
-        // Startup must prove connectivity: a daemon that cannot see any market is not
-        // "quietly idle", it is broken.
-        let mut universe = self.fetch_universe().await?;
+        // Discovery is market data, and market data is never allowed to kill the process:
+        // this retries until it works (or we are told to shut down). Exiting instead put the
+        // owner's live daemon in a Docker restart loop the night Gamma started rejecting
+        // deep `offset` pagination with an HTTP 422.
+        let Some(mut universe) = self.initial_universe().await else {
+            tracing::info!("shutdown requested before the first universe was discovered");
+            return Ok(());
+        };
         let mut universe_fetched = Instant::now();
         self.index_universe(&universe);
 
@@ -273,8 +293,16 @@ impl Daemon {
                         }
                     }
                     Err(err) => {
-                        // Keep trading off the last known universe rather than going blind.
-                        tracing::warn!(%err, "universe refresh failed — keeping the previous one");
+                        // Keep scanning the last known universe rather than going blind — and
+                        // never propagate: a discovery hiccup mid-run must not end the run.
+                        tracing::error!(
+                            %err,
+                            events = universe.events.len(),
+                            markets = universe.market_count(),
+                            universe_refresh_secs = self.cfg.daemon.universe_refresh_secs,
+                            "universe refresh failed — keeping the previous universe and \
+                             carrying on; it will be retried on the next refresh interval"
+                        );
                     }
                 }
                 universe_fetched = Instant::now();
@@ -408,8 +436,50 @@ impl Daemon {
         }
     }
 
+    /// The first universe, retried until it arrives. `None` = shut down before it did.
+    ///
+    /// A market-data failure at startup is a hiccup, not a configuration error: the process
+    /// stays up, logs loudly, and keeps asking. Nothing else can start until it succeeds —
+    /// there is nothing to scan — so this is the one place in the daemon that loops on
+    /// failure rather than carrying on with what it had.
+    async fn initial_universe(&mut self) -> Option<Universe> {
+        let mut attempt = 0u32;
+        loop {
+            match self.fetch_universe().await {
+                Ok(universe) => {
+                    if attempt > 0 {
+                        tracing::info!(
+                            attempts = attempt + 1,
+                            events = universe.events.len(),
+                            "market discovery recovered — the daemon never went down"
+                        );
+                    }
+                    return Some(universe);
+                }
+                Err(err) => {
+                    attempt += 1;
+                    let wait = discovery_backoff(self.cfg.daemon.scan_interval_secs, attempt);
+                    tracing::error!(
+                        %err,
+                        attempt,
+                        retry_in_secs = wait.as_secs(),
+                        "market discovery failed at startup — retrying; the daemon stays up \
+                         (a market-data failure must never end the process)"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = self.shutdown.changed() => {}
+                    }
+                    if *self.shutdown.borrow() {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
     async fn fetch_universe(&self) -> Result<Universe> {
-        let (universe, stats) = GammaClient::new(&self.http, &self.cfg)
+        let (universe, stats) = GammaClient::with_state(&self.http, &self.cfg, self.gamma.clone())
             .fetch_universe()
             .await
             .with_context(|| {
@@ -2107,6 +2177,189 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- market discovery must never kill the daemon ---------------------------------
+
+    /// Which discovery requests the stub should fail. Everything else (the books) keeps
+    /// working, so a test failure means the *daemon* stopped, not the mock.
+    #[derive(Debug, Clone, Copy)]
+    enum EventsFailure {
+        /// Only the first attempt — the one that used to be fatal at startup.
+        FirstAttempt,
+        /// The first attempt succeeds; every refresh after it fails.
+        EveryAttemptAfterTheFirst,
+    }
+
+    /// [`mock_api_with`] with a programmable failure on the events endpoint. Returns the base
+    /// URL and the number of discovery requests served (keyset or legacy — both begin
+    /// `GET /events`).
+    async fn mock_api_flaky_events(
+        events: &'static str,
+        books: &'static str,
+        failure: EventsFailure,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (status, body) = if head.starts_with("GET /events") {
+                        let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                        let fail = match failure {
+                            EventsFailure::FirstAttempt => attempt == 0,
+                            EventsFailure::EveryAttemptAfterTheFirst => attempt > 0,
+                        };
+                        if fail {
+                            (500, r#"{"error":"upstream is having a moment"}"#)
+                        } else {
+                            (200, events)
+                        }
+                    } else {
+                        (200, books)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), attempts)
+    }
+
+    /// The crash loop, from the daemon's side: discovery fails at startup. It used to
+    /// propagate out of `run`, exit the process, and let Docker restart it forever. Now it
+    /// logs, waits, and tries again — and the daemon that comes out of it scans normally.
+    #[tokio::test]
+    async fn a_failed_first_discovery_is_retried_instead_of_ending_the_process() {
+        let (base, attempts) =
+            mock_api_flaky_events(MOCK_EVENTS, MOCK_BOOKS, EventsFailure::FirstAttempt).await;
+        let tmp = std::env::temp_dir().join(format!("polyarb-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mut cfg = Config::default();
+        cfg.api.gamma_base_url = base.clone();
+        cfg.api.clob_base_url = base;
+        cfg.api.min_request_interval_ms = 0;
+        cfg.api.max_retries = 0;
+        // Also the first retry delay (see `discovery_backoff`), so the test waits 1 s.
+        cfg.daemon.scan_interval_secs = 1;
+        cfg.lifecycle.repoll_interval_secs = 1;
+        cfg.lifecycle.repoll_window_secs = 1;
+        cfg.alerts.telegram_api_base = "http://127.0.0.1:1".into();
+        cfg.storage.database_path = tmp.join("polyarb.sqlite").display().to_string();
+        cfg.storage.log_dir = tmp.join("logs").display().to_string();
+        cfg.storage.report_dir = tmp.join("reports").display().to_string();
+        cfg.stream.enabled = false;
+        cfg.validate().expect("config must validate");
+
+        run(cfg.clone(), Some(1))
+            .await
+            .expect("a discovery failure at startup must not end the daemon");
+
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "discovery must have been retried, not given up on"
+        );
+        let store = Store::open(Path::new(&cfg.storage.database_path)).expect("reopen db");
+        let rows = store
+            .opportunities_for_day(Utc::now().date_naive())
+            .expect("rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the universe must have been built on the retry and scanned"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A refresh that fails mid-run is a hiccup, not the end: the previous universe stays,
+    /// and every scan cycle keeps happening.
+    #[tokio::test]
+    async fn a_failed_universe_refresh_keeps_the_previous_universe_and_keeps_scanning() {
+        let (base, attempts) = mock_api_flaky_events(
+            MOCK_EVENTS,
+            MOCK_BOOKS,
+            EventsFailure::EveryAttemptAfterTheFirst,
+        )
+        .await;
+        let tmp = std::env::temp_dir().join(format!("polyarb-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mut cfg = Config::default();
+        cfg.api.gamma_base_url = base.clone();
+        cfg.api.clob_base_url = base;
+        cfg.api.min_request_interval_ms = 0;
+        cfg.api.max_retries = 0;
+        cfg.daemon.scan_interval_secs = 1;
+        // Refresh on every cycle after the first, so the failure is exercised twice.
+        cfg.daemon.universe_refresh_secs = 1;
+        cfg.lifecycle.repoll_interval_secs = 1;
+        cfg.lifecycle.repoll_window_secs = 1;
+        cfg.alerts.telegram_api_base = "http://127.0.0.1:1".into();
+        cfg.storage.database_path = tmp.join("polyarb.sqlite").display().to_string();
+        cfg.storage.log_dir = tmp.join("logs").display().to_string();
+        cfg.storage.report_dir = tmp.join("reports").display().to_string();
+        cfg.stream.enabled = false;
+        cfg.validate().expect("config must validate");
+
+        run(cfg.clone(), Some(3))
+            .await
+            .expect("a refresh failure must not end the daemon");
+
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "at least one refresh must have been attempted (and failed)"
+        );
+        let store = Store::open(Path::new(&cfg.storage.database_path)).expect("reopen db");
+        let rows = store
+            .opportunities_for_day(Utc::now().date_naive())
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].seen_count, 3,
+            "every cycle must have scanned the kept universe"
+        );
+        let totals = store
+            .scan_totals_for_day(Utc::now().date_naive())
+            .expect("totals");
+        assert_eq!(totals.cycles, 3);
+        assert_eq!(totals.errors, 0, "the books never failed");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn discovery_backoff_grows_from_the_scan_cadence_and_is_capped() {
+        // The shipped 5 s scan interval gives the intended 5 → 10 → 20 → 40 → 60 s ramp.
+        let secs = |attempt| discovery_backoff(5, attempt).as_secs();
+        assert_eq!(
+            [secs(1), secs(2), secs(3), secs(4), secs(5), secs(9)],
+            [5, 10, 20, 40, 60, 60]
+        );
+        // Never zero (a hot loop) and never longer than a minute, whatever the config says.
+        assert_eq!(discovery_backoff(0, 1).as_secs(), 1);
+        assert_eq!(discovery_backoff(86_400, 1).as_secs(), 60);
     }
 
     // -- M6: end-to-end over a mock market channel -----------------------------------

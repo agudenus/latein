@@ -38,8 +38,17 @@ user_agent = "polyarb/0.1.0"
 
 [scan]
 page_size = 100
-# Hard stop on Gamma /events pagination — a rate-limit backstop, NOT the normal
-# stopping point (discovery ends when the API returns a short page). If this cap is
+# Query parameter that carries the keyset cursor back to /events/keyset.
+#
+# Discovery paginates /events/keyset (the legacy /events list endpoint is deprecated and
+# caps offset depth with an HTTP 422). The endpoint returns a next_cursor, but the
+# parameter that actually advances is reported to be after_cursor — passing it back as
+# cursor= re-serves the first page for some clients. If a run logs
+# "WARN keyset pagination did not advance — universe truncated", this name is the first
+# thing to change; "cursor" is the other candidate.
+keyset_cursor_param = "after_cursor"
+# Hard stop on Gamma events pagination — a rate-limit backstop, NOT the normal
+# stopping point (discovery ends when the API runs out of pages). If this cap is
 # what stops us the universe is incomplete and a NegRisk event can be split across the
 # boundary, so the scanner logs "WARN universe truncated at max_events".
 #

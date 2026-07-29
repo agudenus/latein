@@ -1,13 +1,30 @@
 //! Gamma API client — market discovery.
 //!
-//! `GET https://gamma-api.polymarket.com/events?active=true&closed=false` returns events,
-//! each with a `negRisk` flag and a nested `markets[]` array. We keep NegRisk events (the
-//! primary strategy) and the binary markets inside every event.
+//! `GET https://gamma-api.polymarket.com/events/keyset?active=true&closed=false` returns
+//! events, each with a `negRisk` flag and a nested `markets[]` array. We keep NegRisk events
+//! (the primary strategy) and the binary markets inside every event.
+//!
+//! ## Why keyset, not `offset`
+//!
+//! The legacy `/events` list endpoint caps how deep `offset` may go. Past roughly 2 000
+//! events it answers
+//! `HTTP 422 {"error":"offset too large, use /events/keyset for deeper pagination"}` —
+//! which is exactly what killed the owner's live daemon the night `scan.max_events` was
+//! raised from 2 000 to 6 000. Polymarket also deprecates the legacy `/events` and
+//! `/markets` list endpoints (2026-05-01) in favour of the cursor-based keyset ones.
+//!
+//! So: keyset is the primary path, offset pagination survives only as a fallback for a
+//! deployment where `/events/keyset` is not there yet (404/405), and in *neither* path is a
+//! pagination cap treated as an error — it truncates the universe loudly and returns what
+//! it has. Market data is not allowed to kill the process.
 //!
 //! Parsing is deliberately permissive: unknown fields are ignored, every field we do not
 //! strictly need is optional, and prices/ids arrive as strings. The wire shapes marked
 //! `TODO(verify-live)` are inferred from the public docs and must be confirmed against a
 //! real response (this container cannot reach the API).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -29,8 +46,10 @@ pub struct DiscoveryStats {
     pub markets_kept: usize,
     /// Why the rest were dropped. `markets_seen == markets_kept + drops.total()`.
     pub drops: DropCounts,
-    /// True when pagination stopped at `scan.max_events` rather than at the end of the
-    /// event list — discovery is incomplete and the numbers above are a lower bound.
+    /// True when pagination stopped before the end of the event list — `scan.max_events`,
+    /// the API's own offset-depth cap (HTTP 422), or a keyset cursor that stopped
+    /// advancing. Discovery is incomplete and the numbers above are a lower bound; the log
+    /// line at the point of truncation says which of the three it was.
     pub truncated: bool,
 }
 
@@ -187,13 +206,19 @@ pub struct RawMarket {
 // Parsing
 // ---------------------------------------------------------------------------------
 
-/// Parse one `/events` page. Accepts either a bare array or `{"data": [...]}`.
+/// Parse one events page. Accepts either a bare array or `{"data": [...]}`.
+///
+/// TODO(verify-live): the keyset page is *assumed* to carry the same event shape as the
+/// legacy list endpoint, wrapped in `{data, next_cursor}`. If it nests the events under a
+/// different key, discovery will read zero events (and say so, loudly, as an empty page)
+/// rather than mis-parse — add the key here once a live response is in hand.
 pub fn parse_events_page(url: &str, body: &str) -> Result<Vec<RawEvent>, ApiError> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Page {
         Bare(Vec<RawEvent>),
-        // TODO(verify-live): some Gamma endpoints wrap results in `{data, pagination}`.
+        // Some Gamma endpoints wrap results in `{data, pagination}` — the keyset endpoint
+        // is documented as one of them.
         Wrapped { data: Vec<RawEvent> },
     }
 
@@ -204,6 +229,38 @@ pub fn parse_events_page(url: &str, body: &str) -> Result<Vec<RawEvent>, ApiErro
             source,
         }),
     }
+}
+
+/// The cursor that asks for the page *after* this one, or `None` when there is no next page.
+///
+/// Written to accept every shape the endpoint has been reported to use, because we cannot
+/// check from here: a top-level `next_cursor` / `nextCursor` / `cursor`, or the same keys
+/// nested under `pagination`. A bare array (the legacy shape) carries no cursor and yields
+/// `None`, which ends pagination — the same as the legacy short-page rule.
+///
+/// TODO(verify-live): confirm which of these the live `/events/keyset` actually returns, and
+/// whether an exhausted list signals the end by omitting the field or by returning an empty
+/// string (both are handled here).
+pub fn parse_next_cursor(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    // Cursors are opaque; a numeric one is still a cursor, so accept numbers as strings.
+    let at = |v: &serde_json::Value, key: &str| -> Option<String> {
+        match v.get(key) {
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        }
+    };
+    let one_of = |v: &serde_json::Value| -> Option<String> {
+        at(v, "next_cursor")
+            .or_else(|| at(v, "nextCursor"))
+            .or_else(|| at(v, "cursor"))
+    };
+    one_of(&value)
+        .or_else(|| value.get("pagination").and_then(one_of))
+        .map(|c| c.trim().to_string())
+        // An empty cursor is "no more pages", never a request for `after_cursor=`.
+        .filter(|c| !c.is_empty())
 }
 
 /// Turn raw events into the tracked universe, dropping anything we cannot price.
@@ -331,75 +388,91 @@ fn classify_market(m: &RawMarket) -> Result<TrackedMarket, DropReason> {
 // Client
 // ---------------------------------------------------------------------------------
 
+/// The query parameter that carries a keyset cursor back to the API.
+///
+/// TODO(verify-live): unverifiable from this container, and the ecosystem disagrees. The
+/// keyset endpoints return a `next_cursor`, but a community bug report
+/// (Polymarket/agents#227) says feeding it back as `cursor=` re-serves the *first* page for
+/// some clients, and that `after_cursor=` is the parameter that actually advances — so that
+/// is the default. `scan.keyset_cursor_param` overrides it without a rebuild if a live run
+/// shows otherwise, and the same-page guard in [`GammaClient::fetch_keyset`] means a wrong
+/// name truncates the universe with a WARN instead of looping forever.
+pub const DEFAULT_KEYSET_CURSOR_PARAM: &str = "after_cursor";
+
+/// Which listing endpoint this process found working, remembered across universe refreshes.
+///
+/// The daemon builds a fresh [`GammaClient`] on every refresh, so without shared state it
+/// would re-probe a missing `/events/keyset` — and re-log the fallback — every ten minutes.
+#[derive(Debug, Default)]
+pub struct PaginationState {
+    /// Set the first time `/events/keyset` answers 404/405.
+    keyset_unavailable: AtomicBool,
+}
+
+/// One pagination pass: the events collected, and whether we stopped before the end of the
+/// list (cap reached, API refused to go deeper, or the cursor stopped advancing).
+struct Fetched {
+    events: Vec<RawEvent>,
+    truncated: bool,
+}
+
 pub struct GammaClient<'a> {
     http: &'a HttpClient,
     base_url: String,
     page_size: usize,
     max_events: usize,
+    cursor_param: String,
+    state: Arc<PaginationState>,
 }
 
 impl<'a> GammaClient<'a> {
+    /// A client with its own pagination state — right for one-shot commands (`markets`,
+    /// `scan`) and tests. Long-running callers should share one state; see
+    /// [`GammaClient::with_state`].
     pub fn new(http: &'a HttpClient, cfg: &Config) -> Self {
+        Self::with_state(http, cfg, Arc::new(PaginationState::default()))
+    }
+
+    pub fn with_state(http: &'a HttpClient, cfg: &Config, state: Arc<PaginationState>) -> Self {
         Self {
             http,
             base_url: cfg.api.gamma_base_url.trim_end_matches('/').to_string(),
             page_size: cfg.scan.page_size,
             max_events: cfg.scan.max_events,
+            cursor_param: cfg.scan.keyset_cursor_param.trim().to_string(),
+            state,
         }
     }
 
-    /// Paginate `/events?active=true&closed=false` until the API returns a short or empty
-    /// page — i.e. until the event list is genuinely exhausted.
+    /// Discover the whole active event list, keyset-first.
     ///
-    /// `scan.max_events` is a rate-limit backstop, not the intended stopping point. When
-    /// it is what stops us, discovery is incomplete: the universe is missing events, and
-    /// (worse) a NegRisk event can be split across the boundary. That is loud, not silent.
+    /// `scan.max_events` is a rate-limit backstop, not the intended stopping point. When it
+    /// is what stops us, discovery is incomplete: the universe is missing events, and
+    /// (worse) a NegRisk event can be split across the boundary. That is loud, not silent —
+    /// as is every other reason we stop early.
     pub async fn fetch_universe(&self) -> Result<(Universe, DiscoveryStats), ApiError> {
-        let url = format!("{}/events", self.base_url);
-        let mut raw: Vec<RawEvent> = Vec::new();
-        let mut offset = 0usize;
-        let mut pages = 0usize;
-        let mut truncated = false;
-
-        loop {
-            let remaining = self.max_events.saturating_sub(raw.len());
-            if remaining == 0 {
-                truncated = true;
-                break;
+        let fetched = if self.state.keyset_unavailable.load(Ordering::Relaxed) {
+            self.fetch_legacy().await?
+        } else {
+            match self.fetch_keyset().await? {
+                Some(fetched) => fetched,
+                None => {
+                    // Log the hand-over once per process, not once per refresh.
+                    if !self.state.keyset_unavailable.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            url = %format!("{}/events/keyset", self.base_url),
+                            "the keyset events endpoint is missing (404/405) — falling back to \
+                             legacy offset pagination for the life of this process; the API caps \
+                             offset depth, so the universe may be truncated"
+                        );
+                    }
+                    self.fetch_legacy().await?
+                }
             }
-            let limit = self.page_size.min(remaining);
-            let query = [
-                ("active", "true".to_string()),
-                ("closed", "false".to_string()),
-                ("limit", limit.to_string()),
-                ("offset", offset.to_string()),
-            ];
-            let body = self.http.get_json(&url, &query).await?;
-            let page = parse_events_page(&url, &body)?;
-            let got = page.len();
-            pages += 1;
-            tracing::debug!(offset, got, limit, "fetched gamma events page");
-            raw.extend(page);
-            // A short (or empty) page is the end of the list — the only clean stop.
-            if got < limit {
-                break;
-            }
-            offset += got;
-        }
+        };
 
-        if truncated {
-            tracing::warn!(
-                max_events = self.max_events,
-                page_size = self.page_size,
-                pages,
-                events = raw.len(),
-                "universe truncated at max_events — discovery is incomplete; \
-                 raise scan.max_events (or pass --limit) to cover the whole event list"
-            );
-        }
-
-        let (universe, mut stats) = build_universe(&raw);
-        stats.truncated = truncated;
+        let (universe, mut stats) = build_universe(&fetched.events);
+        stats.truncated = fetched.truncated;
         tracing::info!(
             events_seen = stats.events_seen,
             events_kept = stats.events_kept,
@@ -410,6 +483,183 @@ impl<'a> GammaClient<'a> {
             "market discovery drop breakdown"
         );
         Ok((universe, stats))
+    }
+
+    /// Cursor pagination over `/events/keyset` — the primary path.
+    ///
+    /// `Ok(None)` means "this endpoint does not exist here" (404/405) and asks the caller to
+    /// fall back to offset pagination. Every other stop is a normal termination:
+    ///
+    /// * an empty page, or a page with no next cursor — the list is exhausted;
+    /// * the cursor did not change, or the page repeated its first event id — the API is not
+    ///   advancing (a wrong cursor parameter name looks exactly like this), so stop with a
+    ///   WARN rather than fetching page one forever;
+    /// * `scan.max_events` — the backstop, with the long-standing truncation WARN.
+    async fn fetch_keyset(&self) -> Result<Option<Fetched>, ApiError> {
+        const NOT_ADVANCING: &str = "keyset pagination did not advance — universe truncated";
+
+        let url = format!("{}/events/keyset", self.base_url);
+        let mut events: Vec<RawEvent> = Vec::new();
+        let mut pages = 0usize;
+        let mut truncated = false;
+        let mut cursor: Option<String> = None;
+        // The previous page's first event id — the cheap "did we just get page one again?"
+        // check, for an API that hands back a *fresh* cursor while ignoring it.
+        let mut previous_first: Option<String> = None;
+
+        loop {
+            let remaining = self.max_events.saturating_sub(events.len());
+            if remaining == 0 {
+                truncated = true;
+                self.warn_max_events(pages, events.len());
+                break;
+            }
+            let limit = self.page_size.min(remaining);
+            let mut query = vec![
+                ("active", "true".to_string()),
+                ("closed", "false".to_string()),
+                ("limit", limit.to_string()),
+            ];
+            if let Some(cursor) = cursor.as_ref() {
+                query.push((self.cursor_param.as_str(), cursor.clone()));
+            }
+
+            let body = match self.http.get_json(&url, &query).await {
+                Ok(body) => body,
+                // The endpoint is not deployed here. Nothing collected so far is lost: the
+                // caller restarts from the top over the legacy endpoint.
+                Err(ApiError::Status {
+                    status: 404 | 405, ..
+                }) => {
+                    tracing::debug!(%url, pages, "keyset endpoint not found");
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
+            };
+            let page = parse_events_page(&url, &body)?;
+            let next = parse_next_cursor(&body);
+            pages += 1;
+            tracing::debug!(
+                page = pages,
+                got = page.len(),
+                limit,
+                has_next_cursor = next.is_some(),
+                "fetched gamma keyset events page"
+            );
+            if page.is_empty() {
+                break;
+            }
+
+            let first = page.first().and_then(|e| e.id.clone());
+            // Only a *known* id can prove a repeat; an id-less page falls through to the
+            // cursor check below.
+            if first.is_some() && first == previous_first {
+                tracing::warn!(
+                    pages,
+                    events = events.len(),
+                    cursor_param = %self.cursor_param,
+                    first_event_id = ?first,
+                    "{NOT_ADVANCING} (the API re-served the same page — check \
+                     scan.keyset_cursor_param)"
+                );
+                truncated = true;
+                break;
+            }
+            previous_first = first;
+            events.extend(page);
+
+            match next {
+                // The normal case: a new cursor, so there is another page to ask for.
+                Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                Some(_) => {
+                    tracing::warn!(
+                        pages,
+                        events = events.len(),
+                        cursor_param = %self.cursor_param,
+                        "{NOT_ADVANCING} (the API returned the same cursor twice)"
+                    );
+                    truncated = true;
+                    break;
+                }
+                // No cursor = no further pages. This is also what a bare-array response
+                // (the legacy shape served from the keyset path) does, deliberately.
+                None => break,
+            }
+        }
+
+        Ok(Some(Fetched { events, truncated }))
+    }
+
+    /// Offset pagination over the legacy `/events` list endpoint — the fallback.
+    ///
+    /// The API caps how deep `offset` may go and answers HTTP 422 beyond it. That is a
+    /// *limit*, not a failure: keep everything fetched so far, mark the universe truncated,
+    /// and let the daemon scan what it has. A 422 must never reach the caller as an error —
+    /// propagating it is what put the live daemon in a Docker restart loop.
+    async fn fetch_legacy(&self) -> Result<Fetched, ApiError> {
+        let url = format!("{}/events", self.base_url);
+        let mut events: Vec<RawEvent> = Vec::new();
+        let mut offset = 0usize;
+        let mut pages = 0usize;
+        let mut truncated = false;
+
+        loop {
+            let remaining = self.max_events.saturating_sub(events.len());
+            if remaining == 0 {
+                truncated = true;
+                self.warn_max_events(pages, events.len());
+                break;
+            }
+            let limit = self.page_size.min(remaining);
+            let query = [
+                ("active", "true".to_string()),
+                ("closed", "false".to_string()),
+                ("limit", limit.to_string()),
+                ("offset", offset.to_string()),
+            ];
+            let body = match self.http.get_json(&url, &query).await {
+                Ok(body) => body,
+                Err(ApiError::Status { status: 422, .. }) => {
+                    // Deeper pagination needs the keyset endpoint, which is not available
+                    // (that is the only way we get here).
+                    let message = "offset pagination capped by the API — universe truncated; \
+                                   keyset endpoint unavailable";
+                    if events.is_empty() {
+                        // Rejected at offset 0: this is not a depth cap, and the universe is
+                        // now *empty*. Still not fatal, but it must not read as routine.
+                        tracing::error!(offset, %url, "{message} (and nothing was fetched at all)");
+                    } else {
+                        tracing::warn!(offset, events = events.len(), pages, "{message}");
+                    }
+                    truncated = true;
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            let page = parse_events_page(&url, &body)?;
+            let got = page.len();
+            pages += 1;
+            tracing::debug!(offset, got, limit, "fetched gamma events page");
+            events.extend(page);
+            // A short (or empty) page is the end of the list — the only clean stop.
+            if got < limit {
+                break;
+            }
+            offset += got;
+        }
+
+        Ok(Fetched { events, truncated })
+    }
+
+    fn warn_max_events(&self, pages: usize, events: usize) {
+        tracing::warn!(
+            max_events = self.max_events,
+            page_size = self.page_size,
+            pages,
+            events,
+            "universe truncated at max_events — discovery is incomplete; \
+             raise scan.max_events (or pass --limit) to cover the whole event list"
+        );
     }
 }
 
@@ -457,6 +707,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     const EVENTS: &str = include_str!("../tests/fixtures/gamma_events.json");
@@ -676,17 +928,18 @@ mod tests {
 
     // --- pagination --------------------------------------------------------------------
 
-    /// Serve `total` synthetic events, honouring `limit`/`offset`, and return the base URL
-    /// plus a counter of how many pages were requested.
-    async fn paging_gamma(
-        total: usize,
-    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+    /// Minimal HTTP/1.1 stub. Every request line is handed to `respond`, which answers
+    /// `(status, body)`. Returns the base URL and the log of request lines, so a test can
+    /// assert *which* endpoint was called and *which* cursor parameter it carried.
+    async fn gamma_stub<F>(respond: F) -> (String, Arc<std::sync::Mutex<Vec<String>>>)
+    where
+        F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let requests = Arc::new(AtomicUsize::new(0));
-        let counter = requests.clone();
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = log.clone();
+        let respond = Arc::new(respond);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -696,33 +949,23 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
-                let counter = counter.clone();
+                let (respond, sink) = (respond.clone(), sink.clone());
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let n = socket.read(&mut buf).await.unwrap_or(0);
                     let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let param = |name: &str| -> usize {
-                        head.split(&format!("{name}="))
-                            .nth(1)
-                            .and_then(|rest| {
-                                rest.split(['&', ' ']).next().and_then(|v| v.parse().ok())
-                            })
-                            .unwrap_or(0)
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    let (status, body) = respond(&line);
+                    sink.lock().expect("request log").push(line);
+                    let phrase = match status {
+                        200 => "OK",
+                        404 => "Not Found",
+                        405 => "Method Not Allowed",
+                        422 => "Unprocessable Entity",
+                        _ => "Error",
                     };
-                    let (limit, offset) = (param("limit"), param("offset"));
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    let events: Vec<String> = (offset..(offset + limit).min(total))
-                        .map(|i| {
-                            format!(
-                                r#"{{"id":"{i}","slug":"e{i}","active":true,"closed":false,
-                                   "markets":[{{"conditionId":"0x{i}",
-                                   "clobTokenIds":"[\"{i}a\",\"{i}b\"]"}}]}}"#
-                            )
-                        })
-                        .collect();
-                    let body = format!("[{}]", events.join(","));
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                        "HTTP/1.1 {status} {phrase}\r\nContent-Type: application/json\r\n\
                          Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
@@ -732,7 +975,100 @@ mod tests {
                 });
             }
         });
-        (format!("http://{addr}"), requests)
+        (format!("http://{addr}"), log)
+    }
+
+    /// `GET /events/keyset?limit=10 HTTP/1.1` → `/events/keyset`.
+    fn path_of(request_line: &str) -> String {
+        request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .split('?')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn query_param(request_line: &str, name: &str) -> Option<String> {
+        let target = request_line.split_whitespace().nth(1)?;
+        let query = target.split('?').nth(1)?;
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+            .map(str::to_string)
+    }
+
+    fn number_param(request_line: &str, name: &str) -> usize {
+        query_param(request_line, name)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A bare JSON array of synthetic single-market events with ids `range`.
+    fn events_json(range: std::ops::Range<usize>) -> String {
+        let events: Vec<String> = range
+            .map(|i| {
+                format!(
+                    r#"{{"id":"{i}","slug":"e{i}","active":true,"closed":false,
+                       "markets":[{{"conditionId":"0x{i}",
+                       "clobTokenIds":"[\"{i}a\",\"{i}b\"]"}}]}}"#
+                )
+            })
+            .collect();
+        format!("[{}]", events.join(","))
+    }
+
+    /// A Gamma that only speaks the legacy list endpoint: `/events/keyset` answers 404 (an
+    /// older deployment), and `/events` honours `limit`/`offset` over `total` synthetic
+    /// events but refuses any offset at or beyond `offset_cap` with the live 422 body.
+    async fn legacy_gamma(
+        total: usize,
+        offset_cap: usize,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        gamma_stub(move |line| {
+            if path_of(line) == "/events/keyset" {
+                return (404, r#"{"error":"not found"}"#.to_string());
+            }
+            let (limit, offset) = (number_param(line, "limit"), number_param(line, "offset"));
+            if offset >= offset_cap {
+                return (
+                    422,
+                    r#"{"type":"validation error",
+                        "error":"offset too large, use /events/keyset for deeper pagination"}"#
+                        .to_string(),
+                );
+            }
+            (200, events_json(offset..(offset + limit).min(total)))
+        })
+        .await
+    }
+
+    /// A Gamma that speaks keyset properly: `{data, next_cursor}` pages, the cursor being
+    /// the index to resume from, and no cursor at all on the last page. The legacy endpoint
+    /// answers 422 at every offset, so a fallback that should not happen fails loudly.
+    async fn keyset_gamma(total: usize) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        gamma_stub(move |line| {
+            if path_of(line) != "/events/keyset" {
+                return (
+                    422,
+                    r#"{"error":"offset too large, use /events/keyset for deeper pagination"}"#
+                        .to_string(),
+                );
+            }
+            let limit = number_param(line, "limit");
+            let start = number_param(line, DEFAULT_KEYSET_CURSOR_PARAM);
+            let end = (start + limit).min(total);
+            let data = events_json(start..end);
+            let body = if end < total {
+                format!(r#"{{"data":{data},"next_cursor":"{end}"}}"#)
+            } else {
+                // The terminator: a page with no next cursor is the end of the list.
+                format!(r#"{{"data":{data}}}"#)
+            };
+            (200, body)
+        })
+        .await
     }
 
     fn paging_config(base: &str, page_size: usize, max_events: usize) -> Config {
@@ -745,12 +1081,18 @@ mod tests {
         cfg
     }
 
-    /// Two full pages then a short one: pagination must continue past the full pages and
-    /// stop only on the short page, collecting every event.
+    fn requests(log: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().expect("request log").clone()
+    }
+
+    /// The primary path: two full keyset pages plus a terminator page, every event kept, and
+    /// the cursor fed back under the parameter name the client claims to use. If the cursor
+    /// were dropped the stub would serve page one forever and the same-page guard would trip
+    /// — so a clean run here is also proof the cursor round-trips.
     #[tokio::test]
-    async fn pagination_runs_until_a_short_page() {
-        let (base, requests) = paging_gamma(25).await;
-        let cfg = paging_config(&base, 10, 2_000);
+    async fn keyset_pagination_follows_the_cursor_to_the_end_of_the_list() {
+        let (base, log) = keyset_gamma(25).await;
+        let cfg = paging_config(&base, 10, 6_000);
         let http = HttpClient::new(&cfg.api).expect("client");
         let (universe, stats) = GammaClient::new(&http, &cfg)
             .fetch_universe()
@@ -760,34 +1102,83 @@ mod tests {
         assert_eq!(stats.events_seen, 25, "every event must be collected");
         assert_eq!(universe.events.len(), 25);
         assert_eq!(universe.market_count(), 25);
-        // 10 + 10 + 5: the third page is short, so it is also the last.
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert!(!stats.truncated, "the cap must not have been the stopper");
+        assert!(!stats.truncated, "the list ended on its own terms");
+
+        let seen = requests(&log);
+        assert_eq!(
+            seen.len(),
+            3,
+            "10 + 10 + 5, then the missing cursor stops us"
+        );
+        assert!(
+            seen.iter().all(|l| path_of(l) == "/events/keyset"),
+            "the legacy endpoint must not be touched: {seen:?}"
+        );
+        // The cursor parameter name is the one thing we cannot verify from here, so assert
+        // exactly what went out on the wire.
+        assert_eq!(query_param(&seen[0], "after_cursor"), None, "{seen:?}");
+        assert_eq!(query_param(&seen[1], "after_cursor").as_deref(), Some("10"));
+        assert_eq!(query_param(&seen[2], "after_cursor").as_deref(), Some("20"));
+        // The filters ride along on every page.
+        for line in &seen {
+            assert_eq!(query_param(line, "active").as_deref(), Some("true"));
+            assert_eq!(query_param(line, "closed").as_deref(), Some("false"));
+            assert_eq!(query_param(line, "limit").as_deref(), Some("10"));
+        }
     }
 
-    /// An exactly-full last page is not the end of the list: the next request must still
-    /// be made, and it returns empty.
+    /// The infinite-loop guard. A cursor the API ignores (the reported `cursor=` vs
+    /// `after_cursor=` confusion) looks exactly like this: a fresh cursor every time, and the
+    /// same first page forever. Stop, say so, and keep what we have.
     #[tokio::test]
-    async fn pagination_probes_past_an_exactly_full_last_page() {
-        let (base, requests) = paging_gamma(20).await;
-        let cfg = paging_config(&base, 10, 2_000);
+    async fn keyset_pagination_stops_when_the_api_re_serves_the_same_page() {
+        let (base, log) = gamma_stub(|line| {
+            assert_eq!(path_of(line), "/events/keyset");
+            // Always page one — but always with a cursor, so only the same-page guard can
+            // end this.
+            (
+                200,
+                format!(
+                    r#"{{"data":{},"pagination":{{"next_cursor":"page-{}"}}}}"#,
+                    events_json(0..10),
+                    query_param(line, DEFAULT_KEYSET_CURSOR_PARAM).unwrap_or_default()
+                ),
+            )
+        })
+        .await;
+        let cfg = paging_config(&base, 10, 6_000);
         let http = HttpClient::new(&cfg.api).expect("client");
-        let (_, stats) = GammaClient::new(&http, &cfg)
-            .fetch_universe()
-            .await
-            .expect("fetch");
 
-        assert_eq!(stats.events_seen, 20);
-        // 10 + 10 + 0: the empty third page is what proves the list is exhausted.
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert!(!stats.truncated);
+        // A guard that did not work would hang until max_events (600 pages) or forever, so
+        // the timeout is part of the assertion.
+        let (universe, stats) = tokio::time::timeout(
+            Duration::from_secs(10),
+            GammaClient::new(&http, &cfg).fetch_universe(),
+        )
+        .await
+        .expect("pagination must terminate, not loop")
+        .expect("a stuck cursor is a truncation, not an error");
+
+        assert!(
+            stats.truncated,
+            "a universe cut short by a stuck cursor must be reported as truncated"
+        );
+        assert_eq!(
+            universe.events.len(),
+            10,
+            "the first page is kept; the repeat is not duplicated into the universe"
+        );
+        assert_eq!(
+            requests(&log).len(),
+            2,
+            "one page, one repeat, then stop — bounded"
+        );
     }
 
-    /// The `events=500` symptom: `max_events` — not the API — ends discovery. That is the
-    /// bug that hid whole NegRisk outcome sets, so it must be reported, not silent.
+    /// `max_events` still backstops the keyset path.
     #[tokio::test]
-    async fn hitting_max_events_is_reported_as_truncation() {
-        let (base, _requests) = paging_gamma(60).await;
+    async fn keyset_pagination_reports_hitting_max_events() {
+        let (base, _log) = keyset_gamma(60).await;
         let cfg = paging_config(&base, 10, 25);
         let http = HttpClient::new(&cfg.api).expect("client");
         let (universe, stats) = GammaClient::new(&http, &cfg)
@@ -799,6 +1190,198 @@ mod tests {
         assert!(
             stats.truncated,
             "discovery stopped at max_events and must say so"
+        );
+    }
+
+    /// A deployment without the keyset endpoint: 404 hands over to offset pagination, which
+    /// must still work end to end.
+    #[tokio::test]
+    async fn a_missing_keyset_endpoint_falls_back_to_legacy_offset_pagination() {
+        let (base, log) = legacy_gamma(25, 2_000).await;
+        let cfg = paging_config(&base, 10, 6_000);
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let (universe, stats) = GammaClient::new(&http, &cfg)
+            .fetch_universe()
+            .await
+            .expect("a missing keyset endpoint is not an error");
+
+        assert_eq!(
+            universe.events.len(),
+            25,
+            "the fallback collected everything"
+        );
+        assert!(!stats.truncated);
+
+        let seen = requests(&log);
+        assert_eq!(path_of(&seen[0]), "/events/keyset", "keyset is tried first");
+        let legacy: Vec<&String> = seen.iter().filter(|l| path_of(l) == "/events").collect();
+        // 10 + 10 + 5: a short page is the end of the legacy list.
+        assert_eq!(legacy.len(), 3, "got {seen:?}");
+        assert_eq!(query_param(legacy[1], "offset").as_deref(), Some("10"));
+    }
+
+    /// A client that shares one [`PaginationState`] (the daemon) probes the missing keyset
+    /// endpoint once, not once per universe refresh.
+    #[tokio::test]
+    async fn the_legacy_fallback_is_remembered_across_refreshes() {
+        let (base, log) = legacy_gamma(5, 2_000).await;
+        let cfg = paging_config(&base, 10, 6_000);
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let state = Arc::new(PaginationState::default());
+
+        for _ in 0..3 {
+            let (universe, _) = GammaClient::with_state(&http, &cfg, state.clone())
+                .fetch_universe()
+                .await
+                .expect("fetch");
+            assert_eq!(universe.events.len(), 5);
+        }
+
+        let probes = requests(&log)
+            .iter()
+            .filter(|l| path_of(l) == "/events/keyset")
+            .count();
+        assert_eq!(probes, 1, "the 404 must be remembered for the process");
+    }
+
+    /// The crash: `offset` past the API's cap answers HTTP 422, and propagating it killed the
+    /// daemon at startup. It is a depth limit, not a failure — keep the events already
+    /// fetched, mark the universe truncated, return no error.
+    #[tokio::test]
+    async fn a_legacy_offset_cap_truncates_instead_of_failing() {
+        // The live shape: no keyset endpoint, 422 from offset 2 000 on.
+        let (base, log) = legacy_gamma(6_000, 2_000).await;
+        let cfg = paging_config(&base, 500, 6_000);
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let (universe, stats) = GammaClient::new(&http, &cfg)
+            .fetch_universe()
+            .await
+            .expect("HTTP 422 mid-pagination must never be fatal");
+
+        assert_eq!(
+            universe.events.len(),
+            2_000,
+            "everything fetched before the cap is kept"
+        );
+        assert!(
+            stats.truncated,
+            "a universe cut short by the API's offset cap must be reported as truncated"
+        );
+        let legacy = requests(&log)
+            .iter()
+            .filter(|l| path_of(l) == "/events")
+            .count();
+        assert_eq!(legacy, 5, "4 pages of 500, then the 422 at offset 2 000");
+    }
+
+    /// Legacy pagination probes past an exactly-full last page: an empty page is what proves
+    /// the list is exhausted.
+    #[tokio::test]
+    async fn legacy_pagination_probes_past_an_exactly_full_last_page() {
+        let (base, log) = legacy_gamma(20, 2_000).await;
+        let cfg = paging_config(&base, 10, 6_000);
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let (_, stats) = GammaClient::new(&http, &cfg)
+            .fetch_universe()
+            .await
+            .expect("fetch");
+
+        assert_eq!(stats.events_seen, 20);
+        assert!(!stats.truncated);
+        let legacy = requests(&log)
+            .iter()
+            .filter(|l| path_of(l) == "/events")
+            .count();
+        assert_eq!(legacy, 3, "10 + 10 + 0");
+    }
+
+    /// A bare array from the keyset path (no envelope, no cursor) is a single page and a
+    /// clean stop — the shape our own test mocks and any transitional deployment serve.
+    #[tokio::test]
+    async fn a_keyset_page_without_a_cursor_ends_pagination() {
+        let (base, log) = gamma_stub(|_| (200, events_json(0..3))).await;
+        let cfg = paging_config(&base, 10, 6_000);
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let (universe, stats) = GammaClient::new(&http, &cfg)
+            .fetch_universe()
+            .await
+            .expect("fetch");
+
+        assert_eq!(universe.events.len(), 3);
+        assert!(!stats.truncated);
+        assert_eq!(requests(&log).len(), 1);
+    }
+
+    /// The cursor may arrive under any of the reported names, at the top level or nested,
+    /// and an empty one means "no more pages".
+    #[test]
+    fn next_cursor_is_read_from_every_reported_shape() {
+        assert_eq!(
+            parse_next_cursor(r#"{"data":[],"next_cursor":"abc"}"#).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            parse_next_cursor(r#"{"data":[],"nextCursor":"abc"}"#).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            parse_next_cursor(r#"{"data":[],"cursor":"abc"}"#).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            parse_next_cursor(r#"{"data":[],"pagination":{"next_cursor":"abc"}}"#).as_deref(),
+            Some("abc")
+        );
+        // Numeric cursors are cursors too.
+        assert_eq!(
+            parse_next_cursor(r#"{"next_cursor":1234}"#).as_deref(),
+            Some("1234")
+        );
+        // Absent, empty, blank, null or not-an-object all mean "stop".
+        assert_eq!(parse_next_cursor(r#"{"data":[]}"#), None);
+        assert_eq!(parse_next_cursor(r#"{"next_cursor":""}"#), None);
+        assert_eq!(parse_next_cursor(r#"{"next_cursor":"  "}"#), None);
+        assert_eq!(parse_next_cursor(r#"{"next_cursor":null}"#), None);
+        assert_eq!(parse_next_cursor("[]"), None);
+        assert_eq!(parse_next_cursor("not json"), None);
+    }
+
+    /// The cursor parameter name is the one unverified piece of the request, so it is
+    /// configurable — and the shipped default is the one the ecosystem reports working.
+    #[tokio::test]
+    async fn the_cursor_parameter_name_is_configurable() {
+        assert_eq!(
+            Config::default().scan.keyset_cursor_param,
+            DEFAULT_KEYSET_CURSOR_PARAM
+        );
+        assert_eq!(DEFAULT_KEYSET_CURSOR_PARAM, "after_cursor");
+
+        // A deployment where only `cursor=` advances: two pages, driven by the override.
+        let (base, log) = gamma_stub(|line| {
+            let start: usize = query_param(line, "cursor")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let body = if start == 0 {
+                format!(r#"{{"data":{},"next_cursor":"5"}}"#, events_json(0..5))
+            } else {
+                format!(r#"{{"data":{}}}"#, events_json(5..8))
+            };
+            (200, body)
+        })
+        .await;
+        let mut cfg = paging_config(&base, 5, 6_000);
+        cfg.scan.keyset_cursor_param = "cursor".into();
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let (universe, stats) = GammaClient::new(&http, &cfg)
+            .fetch_universe()
+            .await
+            .expect("fetch");
+
+        assert_eq!(universe.events.len(), 8);
+        assert!(!stats.truncated);
+        assert_eq!(
+            query_param(&requests(&log)[1], "cursor").as_deref(),
+            Some("5")
         );
     }
 
