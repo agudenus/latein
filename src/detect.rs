@@ -256,9 +256,14 @@ impl<'a> Detector<'a> {
         // resting for as a maker.
         let floor = self.cfg.floor_for(&event.category);
 
-        if let Some(sized) =
-            self.size_taker(&books, &best_asks, &best_bids, payout, fee_rate, floor.taker)
-        {
+        if let Some(sized) = self.size_taker(
+            &books,
+            &best_asks,
+            &best_bids,
+            payout,
+            fee_rate,
+            floor.taker,
+        ) {
             return Some(self.build(
                 event,
                 kind,
@@ -794,6 +799,134 @@ mod tests {
             books,
         );
         assert!(ops.is_empty());
+    }
+
+    // --- per-category floors ---------------------------------------------------------
+
+    /// Books priced away from 50/50 so the crypto fee curve does not simply annihilate the
+    /// gap: YES ask 0.10 (bid 0.09), NO ask 0.88 (bid 0.87).
+    fn crypto_edge_books() -> Vec<OrderBook> {
+        vec![
+            book(
+                "0-yes",
+                &[(dec!(0.09), dec!(1000))],
+                &[(dec!(0.10), dec!(1000))],
+            ),
+            book(
+                "0-no",
+                &[(dec!(0.87), dec!(1000))],
+                &[(dec!(0.88), dec!(1000))],
+            ),
+        ]
+    }
+
+    /// The same gap, costed in two fee tiers against two taker floors.
+    ///
+    ///   Σask = 0.98 → gross_gap = 0.02
+    ///   Σ p(1−p)    = 0.10*0.90 + 0.88*0.12 = 0.09 + 0.1056 = 0.1956
+    ///   crypto   (rate 0.07): fee = 0.013692 → net_taker = 0.006308, floor 0.008 → NO
+    ///   politics (rate 0.04): fee = 0.007824 → net_taker = 0.012176, floor 0.005 → YES
+    ///
+    /// A single global floor could not separate these: 0.006308 clears 0.005, and it is
+    /// exactly the kind of number the 0.07 tier turns into noise.
+    #[test]
+    fn the_crypto_taker_floor_rejects_a_gap_the_politics_floor_takes() {
+        let crypto = run(
+            &cfg(),
+            event(false, "crypto", vec![market(0, "BTC up?")]),
+            crypto_edge_books(),
+        );
+        assert_eq!(crypto.len(), 1, "unexpected: {crypto:#?}");
+        let op = &crypto[0];
+        assert_eq!(op.fee_rate, dec!(0.07));
+        assert_eq!(op.gross_gap, dec!(0.02));
+        assert_eq!(op.fee_taker, dec!(0.013692));
+        assert_eq!(op.net_taker, dec!(0.006308));
+        assert!(
+            op.maker_only,
+            "0.006308 is under the 0.008 crypto taker floor"
+        );
+        // Maker capture is the path that survives: 1 − (0.09 + 0.87) = 0.04.
+        assert_eq!(op.net_maker, Some(dec!(0.04)));
+        assert!(op.capital_required <= dec!(50));
+        assert!(
+            op.resolution_flags
+                .iter()
+                .any(|f| f.contains("maker capture")),
+            "the crypto fee reality must be spelled out: {:?}",
+            op.resolution_flags
+        );
+
+        let politics = run(
+            &cfg(),
+            event(false, "politics", vec![market(0, "Q?")]),
+            crypto_edge_books(),
+        );
+        assert_eq!(politics.len(), 1);
+        assert_eq!(politics[0].fee_taker, dec!(0.007824));
+        assert_eq!(politics[0].net_taker, dec!(0.012176));
+        assert!(
+            !politics[0].maker_only,
+            "the same gap is takeable in the 0.04 tier"
+        );
+        assert!(!politics[0]
+            .resolution_flags
+            .iter()
+            .any(|f| f.contains("maker capture")));
+    }
+
+    /// The maker floor is resolved separately, which is the whole reason crypto carries
+    /// `{ taker = 0.008, maker = 0.005 }`: a maker pays no fee, so a gap that is noise as a
+    /// taker can still be worth resting for.
+    ///
+    ///   asks 0.125 + 0.873 = 0.998 → gross_gap 0.002, and the 0.07 fee (≈0.0154) buries it
+    ///   bids 0.124 + 0.870 = 0.994 → net_maker = 0.006
+    ///
+    /// 0.006 sits between the two crypto floors: reported under the shipped config, gone
+    /// the moment the maker floor is made to follow the taker floor.
+    #[test]
+    fn the_crypto_maker_floor_is_applied_independently_of_the_taker_floor() {
+        let books = || {
+            vec![
+                book(
+                    "0-yes",
+                    &[(dec!(0.124), dec!(1000))],
+                    &[(dec!(0.125), dec!(1000))],
+                ),
+                book(
+                    "0-no",
+                    &[(dec!(0.870), dec!(1000))],
+                    &[(dec!(0.873), dec!(1000))],
+                ),
+            ]
+        };
+
+        let ops = run(
+            &cfg(),
+            event(false, "crypto", vec![market(0, "BTC up?")]),
+            books(),
+        );
+        assert_eq!(ops.len(), 1, "unexpected: {ops:#?}");
+        assert!(ops[0].maker_only);
+        assert_eq!(ops[0].gross_gap, dec!(0.002));
+        assert_eq!(ops[0].net_maker, Some(dec!(0.006)));
+        assert!(ops[0].net_taker < Decimal::ZERO);
+
+        // Same books, same taker floor — only the maker floor is raised to match it.
+        let mut strict = cfg();
+        strict.scan.floors.insert(
+            "crypto".into(),
+            crate::config::CategoryFloor::flat(dec!(0.008)),
+        );
+        assert!(
+            run(
+                &strict,
+                event(false, "crypto", vec![market(0, "BTC up?")]),
+                books(),
+            )
+            .is_empty(),
+            "a 0.006 maker net must not survive a 0.008 maker floor"
+        );
     }
 
     // --- NegRisk -------------------------------------------------------------------

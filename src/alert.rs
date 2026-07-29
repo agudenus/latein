@@ -538,6 +538,46 @@ mod tests {
         assert_eq!(alertable_net(&op), dec!(0.07));
     }
 
+    /// The crypto default (0.008) is below the general one (0.01) on purpose: crypto gaps
+    /// are rare and already had to clear the strictest floor, so they must not be filtered
+    /// out by a threshold that exists to tame the politics flow.
+    #[test]
+    fn the_alert_threshold_is_resolved_per_category() {
+        let cfg = cfg(); // general 0.01, crypto 0.008
+        let events = std::sync::Arc::new(
+            EventLog::open(&std::env::temp_dir().join("polyarb-test-threshold-category"))
+                .expect("log"),
+        );
+        let alerter = Alerter::new(&cfg, events);
+
+        // Net 0.009: clears crypto's 0.008, misses the general 0.01.
+        let mut op = sample_opportunity();
+        op.net_taker = dec!(0.009);
+        assert!(
+            !alerter.passes_threshold(&op),
+            "politics must still be judged at 0.01"
+        );
+        op.category = crate::types::Category::new("crypto");
+        assert!(
+            alerter.passes_threshold(&op),
+            "crypto must be judged at its own 0.008"
+        );
+
+        // And the crypto threshold is a floor, not a free pass.
+        op.net_taker = dec!(0.0079);
+        assert!(!alerter.passes_threshold(&op));
+
+        // An unlisted category falls back to the general threshold.
+        op.category = crate::types::Category::new("weather");
+        op.net_taker = dec!(0.009);
+        assert!(!alerter.passes_threshold(&op));
+        op.net_taker = dec!(0.01);
+        assert!(
+            alerter.passes_threshold(&op),
+            "exactly at the threshold passes"
+        );
+    }
+
     #[tokio::test]
     async fn without_credentials_alerts_fall_back_to_the_jsonl_log() {
         let dir = std::env::temp_dir().join(format!("polyarb-test-jsonl-{}", std::process::id()));

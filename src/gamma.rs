@@ -550,6 +550,49 @@ mod tests {
         assert_eq!(u.events[0].category.as_str(), "other");
     }
 
+    /// `endDate` exists only so the daemon can say "these markets die before I next look".
+    /// Anything it cannot parse must stay `None` — a guessed close time would be worse
+    /// than no close time.
+    #[test]
+    fn event_end_dates_are_parsed_and_bad_ones_become_unknown() {
+        let body = r#"[
+          {"id":"1","slug":"z","endDate":"2026-07-29T12:05:00Z","markets":[
+            {"conditionId":"0x1","clobTokenIds":"[\"1\",\"2\"]"}]},
+          {"id":"2","slug":"naive","endDate":"2026-07-29T12:05:00","markets":[
+            {"conditionId":"0x2","clobTokenIds":"[\"3\",\"4\"]"}]},
+          {"id":"3","slug":"offset","endDate":"2026-07-29T14:05:00+02:00","markets":[
+            {"conditionId":"0x3","clobTokenIds":"[\"5\",\"6\"]"}]},
+          {"id":"4","slug":"junk","endDate":"soon","markets":[
+            {"conditionId":"0x4","clobTokenIds":"[\"7\",\"8\"]"}]},
+          {"id":"5","slug":"absent","markets":[
+            {"conditionId":"0x5","clobTokenIds":"[\"9\",\"10\"]"}]}
+        ]"#;
+        let (universe, _) = build_universe(&parse_events_page("test", body).expect("parses"));
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-07-29T12:05:00Z")
+            .expect("literal")
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(universe.events[0].end_date, Some(expected));
+        assert_eq!(universe.events[1].end_date, Some(expected), "no zone = UTC");
+        assert_eq!(
+            universe.events[2].end_date,
+            Some(expected),
+            "offset applied"
+        );
+        assert_eq!(universe.events[3].end_date, None, "junk is unknown");
+        assert_eq!(universe.events[4].end_date, None, "absent is unknown");
+
+        assert!(
+            universe.events[0].ends_by(expected),
+            "the boundary is inclusive"
+        );
+        assert!(!universe.events[0].ends_by(expected - chrono::Duration::seconds(1)));
+        assert!(
+            !universe.events[4].ends_by(expected + chrono::Duration::days(3_650)),
+            "an unknown end time is never treated as short-lived"
+        );
+    }
+
     #[test]
     fn wrapped_page_shape_is_accepted() {
         let body =

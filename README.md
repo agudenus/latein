@@ -41,6 +41,12 @@ daemon refuses to start on any other value. The purpose of Phase A is to collect
 evidence and answer one question: is there enough real, fillable edge to justify building
 an execution engine at all?
 
+Crypto is a staged second focus and is scanned like any other category, at its own higher
+taker floor — but the fast-cycling BTC/ETH Up-or-Down 5m/15m series open and resolve inside
+the 600 s universe-refresh interval, so most of them are never seen at all; a dedicated
+fast poller for those series is a later crypto-engine milestone, and until then a `crypto:
+0 opportunities` line in the daily summary means "not looked at properly", not "no edge".
+
 Phase B — authentication, execution, a full risk manager, live mode behind an explicit
 opt-in flag — is not built and will not begin without a deliberate go/no-go decision made
 on that evidence.
@@ -53,7 +59,7 @@ Needs Rust 1.94+. No credentials of any kind.
 
 ```bash
 cargo build --release
-cargo test                  # 76 tests
+cargo test                  # 97 tests
 
 ./target/release/polyarb markets      # discover the tracked universe, fetch one book batch
 ./target/release/polyarb scan         # run the detectors once, with the full cost breakdown

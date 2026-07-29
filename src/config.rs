@@ -296,7 +296,10 @@ impl Default for ScanConfig {
             min_size_shares: Decimal::new(5, 0),
             size_search_tolerance: Decimal::new(1, 2),
             floors: [
-                ("default".to_string(), CategoryFloor::flat(Decimal::new(5, 3))),
+                (
+                    "default".to_string(),
+                    CategoryFloor::flat(Decimal::new(5, 3)),
+                ),
                 (
                     "geopolitics".to_string(),
                     // Fee-free, so a thinner gap still survives.
@@ -720,34 +723,45 @@ mod tests {
                 "{name} must have a single effective floor"
             );
         }
-        assert_eq!(cfg.net_floor_maker(&Category::new("geopolitics")), dec!(0.003));
+        assert_eq!(
+            cfg.net_floor_maker(&Category::new("geopolitics")),
+            dec!(0.003)
+        );
         // Unknown categories fall through to `default`, on both sides.
         assert_eq!(cfg.net_floor_maker(&Category::new("nonsense")), dec!(0.005));
     }
 
     #[test]
     fn per_category_floors_parse_from_toml_and_reject_typos_and_negatives() {
+        const SHIPPED_CRYPTO: &str = "crypto = { taker = 0.008, maker = 0.005 }";
+        assert!(
+            SHIPPED.contains(SHIPPED_CRYPTO),
+            "shipped floor entry moved"
+        );
+
         let cfg = Config::from_toml_str(
-            "[scan.floors]\n\
-             default = { taker = 0.004 }\n\
-             crypto = { taker = 0.01, maker = 0.002 }\n",
+            &SHIPPED.replace(SHIPPED_CRYPTO, "crypto = { taker = 0.01, maker = 0.002 }"),
         )
         .expect("sided floors must parse");
         assert_eq!(cfg.net_floor_taker(&Category::new("crypto")), dec!(0.01));
         assert_eq!(cfg.net_floor_maker(&Category::new("crypto")), dec!(0.002));
-        assert_eq!(cfg.net_floor_taker(&Category::new("politics")), dec!(0.004));
+        assert_eq!(cfg.net_floor_taker(&Category::new("politics")), dec!(0.005));
 
         assert!(
-            Config::from_toml_str("[scan.floors]\ndefault = { takr = 0.004 }\n").is_err(),
+            Config::from_toml_str(&SHIPPED.replace(SHIPPED_CRYPTO, "crypto = { takr = 0.01 }"))
+                .is_err(),
             "a typo inside a floor entry must not be silently ignored"
         );
 
         let mut negative = Config::default();
-        negative
-            .scan
-            .floors
-            .insert("crypto".into(), CategoryFloor::sided(dec!(0.008), dec!(-0.001)));
-        assert!(negative.validate().is_err(), "a negative floor accepts losses");
+        negative.scan.floors.insert(
+            "crypto".into(),
+            CategoryFloor::sided(dec!(0.008), dec!(-0.001)),
+        );
+        assert!(
+            negative.validate().is_err(),
+            "a negative floor accepts losses"
+        );
 
         let mut no_default = Config::default();
         no_default.scan.floors.remove("default");
@@ -762,8 +776,14 @@ mod tests {
             dec!(0.008),
             "crypto alerts at its own taker floor, not the general 0.01"
         );
-        assert_eq!(cfg.alerts.min_net_for(&Category::new("politics")), dec!(0.01));
-        assert_eq!(cfg.alerts.min_net_for(&Category::new("nonsense")), dec!(0.01));
+        assert_eq!(
+            cfg.alerts.min_net_for(&Category::new("politics")),
+            dec!(0.01)
+        );
+        assert_eq!(
+            cfg.alerts.min_net_for(&Category::new("nonsense")),
+            dec!(0.01)
+        );
 
         let mut bad = Config::default();
         bad.alerts

@@ -754,7 +754,9 @@ pub fn summarize(
 /// A zero is a result: "crypto: 0 opportunities" is the daily evidence that the staged
 /// crypto focus is not yet finding anything, and it cannot be read off a table that only
 /// lists what fired.
-pub fn category_counts_in_report_order(by_category: &BTreeMap<String, usize>) -> Vec<(String, usize)> {
+pub fn category_counts_in_report_order(
+    by_category: &BTreeMap<String, usize>,
+) -> Vec<(String, usize)> {
     let mut out: Vec<(String, usize)> = REPORTED_CATEGORIES
         .iter()
         .map(|name| {
@@ -1290,6 +1292,123 @@ mod tests {
         assert!(md.contains("hypothetical"));
         assert!(md.contains("| binary_yes_no | politics | 1 |"));
         assert!(md.contains("taker (credited only for taker-sized fills): **$1.00**"));
+    }
+
+    /// A category that saw nothing is still a finding. Crypto in particular must appear at
+    /// zero, because "we found no crypto edge" and "we never looked" read identically on a
+    /// table that only lists what fired.
+    #[test]
+    fn the_summary_names_every_focus_category_including_an_empty_crypto() {
+        let empty = summarize(day(), &[], ScanTotals::default(), dec!(50)).to_markdown();
+        for line in [
+            "- politics: 0 opportunities",
+            "- sports: 0 opportunities",
+            "- geopolitics: 0 opportunities",
+            "- crypto: 0 opportunities",
+        ] {
+            assert!(empty.contains(line), "{line:?} missing from:\n{empty}");
+        }
+        // And the reason a zero is expected there is stated, not left to be inferred.
+        assert!(empty.contains("crypto-engine milestone"));
+
+        // Focus categories keep their fixed order; anything else follows, alphabetically.
+        let rows = vec![
+            row(
+                1,
+                "binary_yes_no",
+                "weather",
+                dec!(0.01),
+                "open",
+                None,
+                dec!(5),
+            ),
+            row(
+                2,
+                "binary_yes_no",
+                "crypto",
+                dec!(0.02),
+                "open",
+                None,
+                dec!(5),
+            ),
+            row(
+                3,
+                "binary_yes_no",
+                "crypto",
+                dec!(0.02),
+                "open",
+                None,
+                dec!(5),
+            ),
+            row(
+                4,
+                "binary_yes_no",
+                "culture",
+                dec!(0.03),
+                "open",
+                None,
+                dec!(5),
+            ),
+        ];
+        let s = summarize(day(), &rows, ScanTotals::default(), dec!(50));
+        assert_eq!(s.by_category["crypto"], 2);
+        assert_eq!(
+            category_counts_in_report_order(&s.by_category),
+            vec![
+                ("politics".to_string(), 0),
+                ("sports".to_string(), 0),
+                ("geopolitics".to_string(), 0),
+                ("crypto".to_string(), 2),
+                ("culture".to_string(), 1),
+                ("weather".to_string(), 1),
+            ]
+        );
+        let md = s.to_markdown();
+        assert!(md.contains("- crypto: 2 opportunities"), "got:\n{md}");
+        assert!(md.contains("- weather: 1 opportunities"), "got:\n{md}");
+    }
+
+    /// The refresh-cadence gap this milestone deliberately does *not* fix: count what we
+    /// can see closing before the next refresh, so the WARN is evidence rather than a
+    /// guess. Anything without a known end time is never counted.
+    #[test]
+    fn short_lived_crypto_events_are_counted_only_when_they_really_are_short_lived() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .expect("fixed clock")
+            .with_timezone(&Utc);
+        let at = |mins: i64| Some(now + chrono::Duration::minutes(mins));
+
+        let ev = |category: &str, end: Option<chrono::DateTime<Utc>>| crate::types::TrackedEvent {
+            id: "1".into(),
+            slug: format!("{category}-event"),
+            title: "t".into(),
+            neg_risk: false,
+            category: crate::types::Category::new(category),
+            markets: Vec::new(),
+            total_outcomes: 0,
+            end_date: end,
+        };
+
+        let universe = Universe {
+            events: vec![
+                ev("crypto", at(5)),   // a 5m series closing inside the window
+                ev("crypto", at(9)),   // ditto, still inside 600 s
+                ev("crypto", at(11)),  // 11 min out — survives the next refresh
+                ev("crypto", None),    // unknown end time is never assumed short-lived
+                ev("politics", at(5)), // not crypto: this is normal event churn
+            ],
+        };
+        // 600 s = 10 minutes, so only the 5- and 9-minute events count.
+        assert_eq!(short_lived_crypto_events(&universe, 600, now), 2);
+        // A 30-minute cadence would sweep the 11-minute one in too.
+        assert_eq!(short_lived_crypto_events(&universe, 1_800, now), 3);
+        // A cadence faster than every event catches none of them.
+        assert_eq!(short_lived_crypto_events(&universe, 60, now), 0);
+        assert_eq!(
+            short_lived_crypto_events(&Universe::default(), 600, now),
+            0,
+            "an empty universe must not produce a warning"
+        );
     }
 
     #[test]

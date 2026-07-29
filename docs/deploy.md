@@ -453,8 +453,8 @@ finding nothing is a real and decision-relevant finding.
 
 Run the scanner **untouched for at least seven full UTC days**. Not six: prediction market
 activity is strongly weekday/weekend and event-cycle dependent, and a partial week will
-mislead you. Resist the urge to tune thresholds mid-soak — changing `net_floor` or
-`alert_min_net` halfway through makes the week's statistics incomparable with themselves.
+mislead you. Resist the urge to tune thresholds mid-soak — changing `scan.floors` or the
+alert thresholds halfway through makes the week's statistics incomparable with themselves.
 Write down anything you want to change and do it after the review.
 
 The only thing worth doing during the week is a daily glance at

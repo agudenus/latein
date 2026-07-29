@@ -541,7 +541,7 @@ quote_px    = reservation − δ_adverse − δ_edge
   merely discouraged: at `d = 0`, `τ = 60s` it demands a 17.8¢ discount and no such quote
   will ever be worth placing.
 - **`δ_edge`** — the minimum profit we require per share, config, analogous to
-  `scan.net_floor`.
+  `scan.floors`.
 
 A quote is only placed if `quote_px` is at or better than one tick inside the current best
 bid *and* clears the minimum order size. Otherwise no quote — silence is a valid output.
