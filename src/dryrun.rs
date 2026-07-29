@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 
 use crate::alert::{format_opportunity, AlertStats, Alerter, EventLog, Priority};
 use crate::clob::ClobClient;
-use crate::config::Config;
+use crate::config::{Config, REPORTED_CATEGORIES};
 use crate::detect;
 use crate::gamma::GammaClient;
 use crate::http::HttpClient;
@@ -254,6 +254,17 @@ impl Daemon {
             truncated = stats.truncated,
             "market universe refreshed"
         );
+        // Once per refresh, and only when there is something to say.
+        let short_lived =
+            short_lived_crypto_events(&universe, self.cfg.daemon.universe_refresh_secs, Utc::now());
+        if short_lived > 0 {
+            tracing::warn!(
+                events = short_lived,
+                universe_refresh_secs = self.cfg.daemon.universe_refresh_secs,
+                "short-lived crypto markets present; refresh cadence misses most 5m/15m \
+                 series — crypto engine milestone"
+            );
+        }
         Ok(universe)
     }
 
@@ -430,6 +441,27 @@ fn elapsed_ms(since: Instant) -> i64 {
     i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
+/// Crypto events that will already have closed by the time the universe is next refreshed.
+///
+/// The BTC/ETH Up-or-Down series cycle every 5–15 minutes, far inside the 600 s universe
+/// refresh, so most of them are created and resolved without this scanner ever seeing
+/// them. Counting the ones we *did* catch on their way out is the cheap evidence that the
+/// cadence — not the market — is the limit. Fixing it (a dedicated fast poller for the
+/// crypto series) is the crypto-engine milestone, deliberately not this one.
+pub fn short_lived_crypto_events(
+    universe: &Universe,
+    universe_refresh_secs: u64,
+    now: chrono::DateTime<Utc>,
+) -> usize {
+    let horizon = i64::try_from(universe_refresh_secs).unwrap_or(i64::MAX);
+    let cutoff = now + chrono::Duration::seconds(horizon);
+    universe
+        .events
+        .iter()
+        .filter(|e| e.category.as_str() == "crypto" && e.ends_by(cutoff))
+        .count()
+}
+
 // ---------------------------------------------------------------------------------
 // Lifecycle tracking
 // ---------------------------------------------------------------------------------
@@ -589,6 +621,8 @@ pub struct DailySummary {
     pub maker_only: usize,
     /// `(strategy, category) → count`.
     pub by_strategy_category: BTreeMap<(String, String), usize>,
+    /// `category → count`, over every category that appeared that day.
+    pub by_category: BTreeMap<String, usize>,
     /// Net per share, as constructed (maker net for maker-only rows).
     pub net_p50: Option<Decimal>,
     pub net_p90: Option<Decimal>,
@@ -623,6 +657,7 @@ pub fn summarize(
     per_trade_cap: Decimal,
 ) -> DailySummary {
     let mut by_strategy_category: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut by_category: BTreeMap<String, usize> = BTreeMap::new();
     let mut nets: Vec<Decimal> = Vec::with_capacity(rows.len());
     let mut persistences: Vec<i64> = Vec::new();
     let mut capitals: Vec<Decimal> = Vec::with_capacity(rows.len());
@@ -637,6 +672,7 @@ pub fn summarize(
         *by_strategy_category
             .entry((row.kind.clone(), row.category.clone()))
             .or_default() += 1;
+        *by_category.entry(row.category.clone()).or_default() += 1;
 
         let net = if row.maker_only {
             row.net_maker.unwrap_or(Decimal::ZERO)
@@ -686,6 +722,7 @@ pub fn summarize(
         total: rows.len(),
         maker_only,
         by_strategy_category,
+        by_category,
         net_p50: quantile(&nets, 50),
         net_p90: quantile(&nets, 90),
         net_max: nets.last().copied(),
@@ -708,6 +745,33 @@ pub fn summarize(
         scan,
         alerts: None,
     }
+}
+
+/// Category counts in report order: the focus categories first, always, in
+/// [`REPORTED_CATEGORIES`] order and including the ones that saw nothing, then anything
+/// else that did appear, alphabetically.
+///
+/// A zero is a result: "crypto: 0 opportunities" is the daily evidence that the staged
+/// crypto focus is not yet finding anything, and it cannot be read off a table that only
+/// lists what fired.
+pub fn category_counts_in_report_order(by_category: &BTreeMap<String, usize>) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = REPORTED_CATEGORIES
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                by_category.get(*name).copied().unwrap_or(0),
+            )
+        })
+        .collect();
+    // BTreeMap iteration is already alphabetical, so the tail is sorted.
+    out.extend(
+        by_category
+            .iter()
+            .filter(|(name, _)| !REPORTED_CATEGORIES.contains(&name.as_str()))
+            .map(|(name, count)| (name.clone(), *count)),
+    );
+    out
 }
 
 /// Nearest-rank percentile over an already-sorted slice.
@@ -770,6 +834,18 @@ impl DailySummary {
                 out.push_str(&format!("| {kind} | {category} | {count} |\n"));
             }
         }
+
+        out.push_str("\n## By category\n\n");
+        for (category, count) in category_counts_in_report_order(&self.by_category) {
+            out.push_str(&format!("- {category}: {count} opportunities\n"));
+        }
+        out.push_str(
+            "\nThe focus categories are always listed, including at zero. Crypto is a \
+             staged second focus and is expected to read zero for now: the BTC/ETH \
+             Up-or-Down series cycle every 5–15 minutes, well inside the universe refresh \
+             interval, so most of those markets open and resolve without ever entering the \
+             scanned universe. Closing that gap is the crypto-engine milestone.\n",
+        );
 
         out.push_str("\n## Net edge per share (as constructed)\n\n");
         out.push_str(&format!(

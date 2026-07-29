@@ -257,6 +257,11 @@ pub struct TrackedEvent {
     /// outcome uncovered and the position is not risk-free. Sweeps over a partial outcome
     /// set must never be labelled `true-arb`.
     pub total_outcomes: usize,
+    /// When Gamma says the event closes, if it said. Used only to detect markets that live
+    /// and die *between* universe refreshes (the fast-cycling crypto series); nothing in
+    /// the detectors keys on it.
+    #[serde(default)]
+    pub end_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl TrackedEvent {
@@ -271,6 +276,12 @@ impl TrackedEvent {
     /// Outcomes Gamma listed that we are not tracking.
     pub fn missing_outcomes(&self) -> usize {
         self.total_outcomes.saturating_sub(self.markets.len())
+    }
+
+    /// True when this event closes at or before `cutoff`. An unknown end time is never
+    /// "short-lived": we do not guess.
+    pub fn ends_by(&self, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
+        self.end_date.is_some_and(|end| end <= cutoff)
     }
 }
 

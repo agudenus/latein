@@ -8,7 +8,7 @@
 #   POLYARB_GAMMA_BASE_URL      api.gamma_base_url
 #   POLYARB_CLOB_BASE_URL       api.clob_base_url
 #   POLYARB_PER_TRADE_CAP_USD   risk.per_trade_cap_usd
-#   POLYARB_NET_FLOOR_DEFAULT   scan.net_floor.default
+#   POLYARB_NET_FLOOR_DEFAULT   scan.floors.default.taker
 #   POLYARB_MODE                mode
 #   POLYARB_DB_PATH             storage.database_path
 #   POLYARB_LOG_DIR             storage.log_dir
@@ -65,11 +65,26 @@ report_maker_only = true
 # Empty = scan every category.
 include_categories = []
 
-# Minimum net profit per share required to report / size an opportunity.
-# Geopolitics is the only fee-free category, so a thinner gap still survives there.
-[scan.net_floor]
-default = 0.005
-geopolitics = 0.003
+# Minimum net profit per share required to report / size an opportunity, per category.
+#
+# Each entry is a table: `taker` is required, `maker` is optional and defaults to `taker`.
+# The two sides are floored separately because their costs differ — a taker pays
+# rate * p * (1 - p) on every leg, a maker pays nothing at all.
+#
+#   default      the fallback for every category without its own entry.
+#   geopolitics  the only fee-free category, so a thinner gap still survives there.
+#   crypto       the 0.07 tier. At mid prices the taker fee is ~0.035 per share-pair
+#                (2 * 0.07 * 0.5 * 0.5), so any taker gap under ~0.008/share is noise
+#                dressed as edge — hence the raised taker floor. The maker floor stays at
+#                the default: maker capture pays no fee and is rebate-subsidised, and it
+#                is the realistic path to crypto edge.
+#
+# NOTE (schema change): this table replaces the old flat `[scan.net_floor]` map of
+# category -> number. `net_floor = 0.005` becomes `floors = { taker = 0.005 }`.
+[scan.floors]
+default = { taker = 0.005 }
+geopolitics = { taker = 0.003 }
+crypto = { taker = 0.008, maker = 0.005 }
 
 [risk]
 # Hard per-opportunity capital cap in USDC, applied inside the depth walker.
@@ -83,6 +98,12 @@ per_trade_cap_usd = 50
 # Books are re-fetched and re-scanned this often.
 scan_interval_secs = 5
 # The market universe (Gamma /events) is refreshed on a much slower cadence.
+#
+# KNOWN LIMITATION: fast-cycling crypto series (BTC/ETH Up-or-Down 5m and 15m) are created
+# and resolved well inside this interval, so most of them never enter the scanned universe
+# at all. Lowering this value does not fix it — those series need a dedicated fast poller,
+# which is the crypto-engine milestone. The daemon logs one WARN per refresh counting the
+# short-lived crypto events it can see closing before the next one.
 universe_refresh_secs = 600
 # UTC time-of-day at which the daily summary is generated, stored and alerted.
 daily_summary_utc = "23:55"
@@ -100,6 +121,7 @@ max_concurrent = 32
 enabled = true
 # Minimum net profit per share before an opportunity is alerted (maker net is used for
 # maker-only constructions). Everything detected is still written to the event log.
+# Overridable per category — see [alerts.alert_min_net_by_category] below.
 alert_min_net_per_share = 0.01
 # Anti-spam spacing between opportunity alerts; daily summaries ignore it.
 min_seconds_between_alerts = 30
@@ -109,6 +131,16 @@ failure_circuit_break = 3
 circuit_reprobe_secs = 900
 telegram_api_base = "https://api.telegram.org"
 request_timeout_secs = 10
+
+# Per-category alert thresholds, overriding alert_min_net_per_share. One global number
+# cannot serve a busy politics flow and a rare, high-fee crypto one at the same time: tuned
+# for politics it hides crypto entirely, tuned for crypto it floods the chat.
+#
+# Crypto sits at 0.008 — the same number as its taker floor — so a crypto gap that already
+# survived the 0.07 fee tier always reaches the phone. Volume stays bounded precisely
+# because that floor is strict.
+[alerts.alert_min_net_by_category]
+crypto = 0.008
 
 [storage]
 # All three are gitignored.

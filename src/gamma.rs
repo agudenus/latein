@@ -139,6 +139,11 @@ pub struct RawEvent {
     pub active: Option<bool>,
     #[serde(default)]
     pub closed: Option<bool>,
+    /// Event close time. Only used to spot markets that live and die between universe
+    /// refreshes (see `short_lived_crypto_events`).
+    /// TODO(verify-live): confirm the field name (`endDate`) and that it is RFC 3339.
+    #[serde(default, rename = "endDate")]
+    pub end_date: Option<String>,
     #[serde(default)]
     pub markets: Vec<RawMarket>,
 }
@@ -262,11 +267,28 @@ pub fn build_universe(raw: &[RawEvent]) -> (Universe, DiscoveryStats) {
             // The *pre-filter* count: this is what the full-coverage guard compares
             // `markets.len()` against, so it must include everything we just dropped.
             total_outcomes: ev.markets.len(),
+            end_date: ev.end_date.as_deref().and_then(parse_end_date),
             markets,
         });
     }
 
     (Universe { events }, stats)
+}
+
+/// Parse Gamma's event close time. Unparseable input yields `None` (treated as "unknown"),
+/// never a guessed timestamp.
+fn parse_end_date(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // TODO(verify-live): some Gamma fields drop the zone marker; those are UTC.
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S")
+        .ok()
+        .map(|naive| naive.and_utc())
 }
 
 /// Turn one raw market into a tracked one, or say precisely why it cannot be tracked.

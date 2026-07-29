@@ -251,10 +251,13 @@ impl<'a> Detector<'a> {
 
         let best_bids: Vec<Option<Decimal>> = books.iter().map(|b| b.best_bid()).collect();
         let fee_rate = self.fees.rate_for(&event.category);
-        let floor = self.cfg.net_floor_for(&event.category);
+        // The two sides are floored separately: a taker pays the fee curve, a maker does
+        // not, so in a high-fee category the same gap can be noise as a taker and worth
+        // resting for as a maker.
+        let floor = self.cfg.floor_for(&event.category);
 
         if let Some(sized) =
-            self.size_taker(&books, &best_asks, &best_bids, payout, fee_rate, floor)
+            self.size_taker(&books, &best_asks, &best_bids, payout, fee_rate, floor.taker)
         {
             return Some(self.build(
                 event,
@@ -274,7 +277,13 @@ impl<'a> Detector<'a> {
         if !self.cfg.scan.report_maker_only {
             return None;
         }
-        let maker = self.size_maker(&best_asks, &best_bids, payout, fee_rate, floor)?;
+        let maker = self.size_maker(
+            &best_asks,
+            &best_bids,
+            payout,
+            fee_rate,
+            floor.maker_floor(),
+        )?;
         Some(self.build(
             event, kind, payout, legs, &best_asks, &best_bids,
             &best_asks, // a maker never walks the ask book; taker fields are top-of-book
@@ -455,6 +464,14 @@ impl<'a> Detector<'a> {
                     .to_string(),
             );
         }
+        if event.category.as_str() == "crypto" {
+            flags.push(
+                "crypto is the 0.07 taker tier: at mid prices the fee is ~0.035 per \
+                 share-pair, so thin taker gaps are noise — maker capture (fee-free, \
+                 rebate-subsidised) is the realistic path here"
+                    .to_string(),
+            );
+        }
 
         let out_legs = legs
             .iter()
@@ -591,6 +608,7 @@ mod tests {
             neg_risk,
             category: Category::new(category),
             total_outcomes: total,
+            end_date: None,
             markets,
         }
     }

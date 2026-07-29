@@ -245,14 +245,15 @@ async fn run_markets(cfg: &Config, show: usize) -> Result<()> {
         entry.0 += 1;
         entry.1 += event.markets.len();
     }
-    println!("\n  category        fee     net floor   events  markets");
+    println!("\n  category        fee     floor taker  floor maker   events  markets");
     for (name, (events, markets)) in &by_category {
         let category = Category::new(name.clone());
         println!(
-            "  {:<14}  {:<6}  {:<9}   {:>6}  {:>7}",
+            "  {:<14}  {:<6}  {:<11}  {:<11}   {:>6}  {:>7}",
             name,
             format!("{:.2}", fees.rate_for(&category)),
-            format!("{:.4}", cfg.net_floor_for(&category)),
+            format!("{:.4}", cfg.net_floor_taker(&category)),
+            format!("{:.4}", cfg.net_floor_maker(&category)),
             events,
             markets
         );

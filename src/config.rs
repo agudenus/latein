@@ -680,6 +680,14 @@ mod tests {
         assert_eq!(cfg.fees["politics"], dec!(0.04));
         assert_eq!(cfg.fees["sports"], dec!(0.05));
         assert_eq!(cfg.fees["crypto"], dec!(0.07));
+        // The shipped floor table must agree with the compiled defaults.
+        assert_eq!(cfg.scan.floors, Config::default().scan.floors);
+        assert_eq!(cfg.net_floor_taker(&Category::new("crypto")), dec!(0.008));
+        assert_eq!(cfg.net_floor_maker(&Category::new("crypto")), dec!(0.005));
+        assert_eq!(
+            cfg.alerts.min_net_for(&Category::new("crypto")),
+            dec!(0.008)
+        );
     }
 
     #[test]

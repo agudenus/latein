@@ -303,9 +303,14 @@ impl Alerter {
     }
 
     /// Threshold gate for opportunity alerts: the best *net per share* the construction
-    /// offers must clear `alert_min_net_per_share`.
+    /// offers must clear the threshold for its category (`alert_min_net_by_category`,
+    /// falling back to `alert_min_net_per_share`).
+    ///
+    /// Per-category matters because one global number cannot serve both a busy politics
+    /// flow and a rare, high-fee crypto one: set for politics it drowns crypto out, set for
+    /// crypto it floods the chat.
     pub fn passes_threshold(&self, op: &Opportunity) -> bool {
-        alertable_net(op) >= self.cfg.alert_min_net_per_share
+        alertable_net(op) >= self.cfg.min_net_for(&op.category)
     }
 }
 
