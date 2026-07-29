@@ -148,6 +148,41 @@ impl OrderBook {
         self
     }
 
+    /// Apply one aggregated level update from a streaming delta (M6).
+    ///
+    /// A zero (or negative) size **removes** the level — that is how the CLOB channel says
+    /// "this price is gone" — and any other size replaces it outright (levels are
+    /// aggregate resting size, not increments). The [`normalized`](Self::normalized)
+    /// invariant is maintained, so `best_bid`/`best_ask`/`vwap_for_size` stay correct after
+    /// any sequence of updates without re-sorting the whole book.
+    pub fn apply_level(&mut self, side: Side, price: Decimal, size: Decimal) {
+        if price <= Decimal::ZERO {
+            return; // same junk rule as `normalized`
+        }
+        let levels = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        let existing = levels.iter().position(|l| l.price == price);
+        if size <= Decimal::ZERO {
+            if let Some(i) = existing {
+                levels.remove(i);
+            }
+            return;
+        }
+        match existing {
+            Some(i) => levels[i].size = size,
+            None => {
+                let at = match side {
+                    Side::Bid => levels.iter().position(|l| l.price < price),
+                    Side::Ask => levels.iter().position(|l| l.price > price),
+                }
+                .unwrap_or(levels.len());
+                levels.insert(at, PriceLevel::new(price, size));
+            }
+        }
+    }
+
     pub fn best_bid(&self) -> Option<Decimal> {
         self.best(Side::Bid)
     }
@@ -484,6 +519,46 @@ mod tests {
         assert_eq!(b.spread(), Some(dec!(0.05)));
         assert_eq!(b.asks.len(), 2);
         assert_eq!(b.depth(Side::Ask), dec!(300));
+    }
+
+    #[test]
+    fn apply_level_sets_replaces_and_removes_while_keeping_the_ordering() {
+        let mut b = book(); // bids 0.45/50, 0.40/100 ; asks 0.50/100, 0.55/200
+
+        // A new best bid slots in at the front.
+        b.apply_level(Side::Bid, dec!(0.47), dec!(25));
+        assert_eq!(b.best_bid(), Some(dec!(0.47)));
+        assert_eq!(b.bids.len(), 3);
+
+        // A new inner ask sorts ahead of the existing ones.
+        b.apply_level(Side::Ask, dec!(0.52), dec!(10));
+        assert_eq!(
+            b.asks.iter().map(|l| l.price).collect::<Vec<_>>(),
+            vec![dec!(0.50), dec!(0.52), dec!(0.55)]
+        );
+
+        // An existing level is replaced, not accumulated.
+        b.apply_level(Side::Ask, dec!(0.50), dec!(7));
+        assert_eq!(b.asks[0].size, dec!(7));
+        assert_eq!(b.depth(Side::Ask), dec!(217));
+
+        // Zero size removes.
+        b.apply_level(Side::Ask, dec!(0.50), dec!(0));
+        assert_eq!(b.best_ask(), Some(dec!(0.52)));
+        assert_eq!(b.asks.len(), 2);
+
+        // Removing a level that is not there, and junk prices, are no-ops.
+        b.apply_level(Side::Bid, dec!(0.99), dec!(0));
+        b.apply_level(Side::Bid, dec!(0), dec!(100));
+        assert_eq!(b.bids.len(), 3);
+        assert_eq!(b.best_bid(), Some(dec!(0.47)));
+
+        // Emptying a side is allowed and leaves no phantom best price.
+        for price in [dec!(0.47), dec!(0.45), dec!(0.40)] {
+            b.apply_level(Side::Bid, price, Decimal::ZERO);
+        }
+        assert_eq!(b.best_bid(), None);
+        assert_eq!(b.spread(), None);
     }
 
     #[test]

@@ -14,6 +14,7 @@ mod http;
 mod risk;
 mod store;
 mod types;
+mod ws;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

@@ -110,8 +110,20 @@ CREATE TABLE daily_summaries (
 );
 "#;
 
+/// M6: how long after the market moved we detected the opportunity.
+///
+/// Nullable, and legitimately so: a REST-driven detection has no triggering frame, so it
+/// has no latency to report. Writing a 0 there would fabricate a measurement, and writing
+/// the scan interval would fabricate a different one.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE opportunities ADD COLUMN detection_latency_ms INTEGER;
+"#;
+
 /// `(version, name, ddl)`. Append-only: never edit a shipped migration.
-const MIGRATIONS: &[(i64, &str, &str)] = &[(1, "initial schema", SCHEMA_V1)];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "initial schema", SCHEMA_V1),
+    (2, "detection latency", SCHEMA_V2),
+];
 
 // ---------------------------------------------------------------------------------
 // Lifecycle
@@ -237,6 +249,9 @@ pub struct OpportunityRow {
     pub simulated_pnl_taker: Option<Decimal>,
     pub simulated_pnl_maker: Option<Decimal>,
     pub detected_at: String,
+    /// Milliseconds from the triggering market data to detection. `None` for anything the
+    /// REST scan found — there is no frame to measure against.
+    pub detection_latency_ms: Option<i64>,
 }
 
 /// Scan-loop telemetry for a day, summed over the hourly buckets.
@@ -376,11 +391,17 @@ impl Store {
 
     /// Insert a newly detected opportunity, or bump `last_seen_at` if it is the same one
     /// we already recorded (same [`dedupe_key`]).
+    ///
+    /// `detection_latency_ms` is the M6 stream measurement (`None` from the REST path) and
+    /// is written **only on first insert**: a repeat sighting is the same opportunity seen
+    /// again, and overwriting the first measurement with a later one would turn the honest
+    /// "how fast did we see it" into "how recently did we look".
     pub fn record_opportunity(
         &self,
         op: &Opportunity,
         books: &BookMap,
         now: DateTime<Utc>,
+        detection_latency_ms: Option<i64>,
     ) -> Result<Recorded> {
         let key = dedupe_key(op);
         let ts = now_str(now);
@@ -397,10 +418,11 @@ impl Store {
                      payout, gross_gap, slippage_cost, spread_cost, fee_taker, net_taker,
                      net_maker, executable_size, capital_required, net_taker_total,
                      net_maker_total, conversion_required, maker_only, resolution_flags,
-                     legs_json, books_json, detected_at, last_seen_at, seen_count, status
+                     legs_json, books_json, detected_at, last_seen_at, seen_count, status,
+                     detection_latency_ms
                  ) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?24, 1, ?25
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?24, 1, ?25, ?26
                  )
                  ON CONFLICT(dedupe_key) DO UPDATE SET
                      last_seen_at = excluded.last_seen_at,
@@ -432,6 +454,7 @@ impl Store {
                     books_json,
                     ts,
                     LifecycleStatus::Open.as_str(),
+                    detection_latency_ms,
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -518,7 +541,8 @@ impl Store {
                 "SELECT id, dedupe_key, kind, category, event_slug, net_taker, net_maker,
                         net_taker_total, net_maker_total, capital_required, executable_size,
                         maker_only, status, persistence_ms, seen_count,
-                        simulated_pnl_taker, simulated_pnl_maker, detected_at
+                        simulated_pnl_taker, simulated_pnl_maker, detected_at,
+                        detection_latency_ms
                  FROM opportunities
                  WHERE detected_at >= ?1 AND detected_at < ?2
                  ORDER BY detected_at ASC, id ASC",
@@ -546,6 +570,7 @@ impl Store {
                     simulated_pnl_taker: row.get(15)?,
                     simulated_pnl_maker: row.get(16)?,
                     detected_at: row.get(17)?,
+                    detection_latency_ms: row.get(18)?,
                 })
             })
             .map_err(|e| self.err(e))?
@@ -658,6 +683,7 @@ struct RawRow {
     simulated_pnl_taker: Option<String>,
     simulated_pnl_maker: Option<String>,
     detected_at: String,
+    detection_latency_ms: Option<i64>,
 }
 
 impl RawRow {
@@ -687,6 +713,7 @@ impl RawRow {
                 self.simulated_pnl_maker.as_deref(),
             )?,
             detected_at: self.detected_at,
+            detection_latency_ms: self.detection_latency_ms,
         })
     }
 }
@@ -860,7 +887,7 @@ pub(crate) mod tests {
         let now = Utc::now();
 
         let first = store
-            .record_opportunity(&op, &sample_books(), now)
+            .record_opportunity(&op, &sample_books(), now, Some(42))
             .expect("insert");
         assert!(first.is_new(), "first sighting must be a new row");
 
@@ -882,6 +909,7 @@ pub(crate) mod tests {
         assert_eq!(row.status, "open");
         assert_eq!(row.seen_count, 1);
         assert_eq!(row.dedupe_key, dedupe_key(&op));
+        assert_eq!(row.detection_latency_ms, Some(42));
 
         // The triggering snapshot is stored for the legs only.
         let snapshot = store.books_json(first.id()).expect("snapshot");
@@ -897,12 +925,12 @@ pub(crate) mod tests {
         let books = sample_books();
         let t0 = Utc::now();
 
-        let a = store.record_opportunity(&op, &books, t0).expect("insert");
+        let a = store.record_opportunity(&op, &books, t0, Some(11)).expect("insert");
         let b = store
-            .record_opportunity(&op, &books, t0 + chrono::Duration::seconds(5))
+            .record_opportunity(&op, &books, t0 + chrono::Duration::seconds(5), Some(999))
             .expect("second sighting");
         let c = store
-            .record_opportunity(&op, &books, t0 + chrono::Duration::seconds(10))
+            .record_opportunity(&op, &books, t0 + chrono::Duration::seconds(10), None)
             .expect("third sighting");
 
         assert!(a.is_new());
@@ -928,7 +956,7 @@ pub(crate) mod tests {
         let store = Store::in_memory().expect("db");
         let op = sample_opportunity();
         let id = store
-            .record_opportunity(&op, &sample_books(), Utc::now())
+            .record_opportunity(&op, &sample_books(), Utc::now(), None)
             .expect("insert")
             .id();
 
@@ -955,8 +983,11 @@ pub(crate) mod tests {
     #[test]
     fn migrations_are_recorded_and_idempotent() {
         let store = Store::in_memory().expect("db");
-        // Re-running the migration pass must be a no-op, not an error.
+        // Re-running the migration pass must be a no-op, not an error. This matters more
+        // for v2 than for v1: `ALTER TABLE ... ADD COLUMN` fails outright on a second run,
+        // so the version guard is the only thing that makes a restart safe.
         store.migrate().expect("second migrate");
+        store.migrate().expect("third migrate");
         let conn = store.lock();
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM migrations", [], |r| r.get(0))
@@ -965,7 +996,95 @@ pub(crate) mod tests {
         let latest: i64 = conn
             .query_row("SELECT MAX(version) FROM migrations", [], |r| r.get(0))
             .expect("max");
-        assert_eq!(latest, 1);
+        assert_eq!(latest, 2);
+        // The v2 column exists exactly once and is nullable.
+        let columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('opportunities')
+                 WHERE name = 'detection_latency_ms' AND \"notnull\" = 0",
+                [],
+                |r| r.get(0),
+            )
+            .expect("pragma");
+        assert_eq!(columns, 1);
+    }
+
+    /// A v1 database (no latency column) must migrate in place, keeping its rows.
+    #[test]
+    fn a_v1_database_upgrades_to_v2_without_losing_rows() {
+        let dir = std::env::temp_dir().join(format!("polyarb-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("polyarb.sqlite");
+
+        // Build a v1-only database by hand.
+        {
+            std::fs::create_dir_all(&dir).expect("dir");
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                                          applied_at TEXT NOT NULL);",
+            )
+            .expect("migrations table");
+            conn.execute_batch(SCHEMA_V1).expect("v1 schema");
+            conn.execute(
+                "INSERT INTO migrations (version, name, applied_at) VALUES (1, 'initial schema', ?1)",
+                params![now_str(Utc::now())],
+            )
+            .expect("record v1");
+        }
+
+        let store = Store::open(&path).expect("open and migrate");
+        let id = store
+            .record_opportunity(&sample_opportunity(), &sample_books(), Utc::now(), Some(7))
+            .expect("insert into the upgraded schema")
+            .id();
+        let rows = store
+            .opportunities_for_day(Utc::now().date_naive())
+            .expect("read back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].detection_latency_ms, Some(7));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detection_latency_is_recorded_once_and_never_revised() {
+        let store = Store::in_memory().expect("db");
+        let op = sample_opportunity();
+        let books = sample_books();
+        let t0 = Utc::now();
+
+        let first = store
+            .record_opportunity(&op, &books, t0, Some(37))
+            .expect("insert");
+        // The same opportunity seen again, with a different (later) measurement.
+        store
+            .record_opportunity(&op, &books, t0 + chrono::Duration::seconds(5), Some(4_000))
+            .expect("repeat");
+
+        let rows = store
+            .opportunities_for_day(t0.date_naive())
+            .expect("read back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, first.id());
+        assert_eq!(
+            rows[0].detection_latency_ms,
+            Some(37),
+            "the first detection's latency is the honest one"
+        );
+
+        // A REST-detected row has no latency at all rather than a fabricated zero.
+        let mut other = op;
+        other.legs[0].best_ask = d!(0.41);
+        store
+            .record_opportunity(&other, &books, t0, None)
+            .expect("rest insert");
+        let rows = store
+            .opportunities_for_day(t0.date_naive())
+            .expect("read back");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.detection_latency_ms.is_none()));
     }
 
     #[test]
@@ -1023,11 +1142,11 @@ pub(crate) mod tests {
 
         let mut op = sample_opportunity();
         store
-            .record_opportunity(&op, &sample_books(), inside)
+            .record_opportunity(&op, &sample_books(), inside, None)
             .expect("insert");
         op.legs[0].best_ask = d!(0.41); // different key → different row
         store
-            .record_opportunity(&op, &sample_books(), outside)
+            .record_opportunity(&op, &sample_books(), outside, None)
             .expect("insert");
 
         assert_eq!(store.opportunities_for_day(day).expect("rows").len(), 1);
@@ -1037,7 +1156,7 @@ pub(crate) mod tests {
     fn stale_open_rows_are_closed_on_restart() {
         let store = Store::in_memory().expect("db");
         let id = store
-            .record_opportunity(&sample_opportunity(), &sample_books(), Utc::now())
+            .record_opportunity(&sample_opportunity(), &sample_books(), Utc::now(), None)
             .expect("insert")
             .id();
         assert_eq!(store.close_stale_open_rows(Utc::now()).expect("close"), 1);

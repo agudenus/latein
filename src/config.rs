@@ -57,6 +57,9 @@ pub struct Config {
     /// M3 opportunity lifecycle re-polling.
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
+    /// M6 WebSocket market-data stream. Off → the daemon polls REST as before.
+    #[serde(default)]
+    pub stream: StreamConfig,
     /// M3 alerting. Credentials are *never* here — only in the environment.
     #[serde(default)]
     pub alerts: AlertConfig,
@@ -192,6 +195,42 @@ pub struct LifecycleConfig {
     /// Cap on concurrently tracked opportunities; the excess is recorded `untracked`
     /// rather than silently distorting the persistence statistics.
     pub max_concurrent: usize,
+}
+
+/// M6 streaming market data.
+///
+/// With the stream on, detection is event-driven: books are maintained from pushed frames
+/// and only the events whose books moved are re-evaluated. REST does not go away — it
+/// seeds the books at startup, re-fetches anything stale, sweeps the whole universe on a
+/// slow cadence as an integrity net, and takes over completely if the socket cannot be
+/// reached (see `fallback_after_failures`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamConfig {
+    /// Master switch. `false` = the pure-REST daemon, unchanged.
+    pub enabled: bool,
+    /// CLOB market-channel endpoint.
+    ///
+    /// TODO(verify-live): unverified from this container — confirm the host, path and
+    /// casing against docs.polymarket.com before trusting a live run.
+    pub url: String,
+    /// Token subscriptions per connection; the universe is sharded across as many
+    /// connections as this implies. TODO(verify-live): the real per-connection limit (if
+    /// any) is unknown; 500 is a deliberately conservative guess.
+    pub max_subs_per_connection: usize,
+    /// Quiet period after the last book update before the dirty events are re-evaluated.
+    /// Small enough to stay in the tens of milliseconds, large enough that a burst across
+    /// an event's legs is one detection pass rather than one per leg.
+    pub debounce_ms: u64,
+    /// A book not updated for this long is re-fetched over REST. This is the bound on how
+    /// wrong a silently-dead subscription can make us.
+    pub stale_after_secs: u64,
+    /// Cadence of the full REST sweep: re-fetch every book, cross-check a random sample
+    /// against the local state, and run detection over the whole universe.
+    pub resync_interval_secs: u64,
+    /// Consecutive failed connection attempts before streaming is abandoned for the life
+    /// of the process (logged at ERROR) and the daemon reverts to REST polling.
+    pub fallback_after_failures: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +388,20 @@ impl Default for LifecycleConfig {
     }
 }
 
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string(),
+            max_subs_per_connection: 500,
+            debounce_ms: 50,
+            stale_after_secs: 60,
+            resync_interval_secs: 300,
+            fallback_after_failures: 5,
+        }
+    }
+}
+
 impl Default for AlertConfig {
     fn default() -> Self {
         Self {
@@ -383,6 +436,7 @@ impl Default for Config {
             risk: RiskConfig::default(),
             daemon: DaemonConfig::default(),
             lifecycle: LifecycleConfig::default(),
+            stream: StreamConfig::default(),
             alerts: AlertConfig::default(),
             storage: StorageConfig::default(),
             fees: default_fee_rates(),
@@ -470,6 +524,12 @@ impl Config {
         if let Some(v) = env_decimal("POLYARB_ALERT_MIN_NET")? {
             self.alerts.alert_min_net_per_share = v;
         }
+        if let Some(v) = env_str("POLYARB_STREAM_URL") {
+            self.stream.url = v;
+        }
+        if let Some(v) = env_bool("POLYARB_STREAM_ENABLED")? {
+            self.stream.enabled = v;
+        }
         Ok(())
     }
 
@@ -544,6 +604,43 @@ impl Config {
                 "lifecycle.max_concurrent must be > 0".into(),
             ));
         }
+        // ---- M6 stream ---------------------------------------------------------------
+        if self.stream.enabled {
+            let url = self.stream.url.trim();
+            if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+                return Err(ConfigError::Invalid(format!(
+                    "stream.url must be a ws:// or wss:// URL (got {:?})",
+                    self.stream.url
+                )));
+            }
+            if self.stream.max_subs_per_connection == 0 {
+                return Err(ConfigError::Invalid(
+                    "stream.max_subs_per_connection must be > 0".into(),
+                ));
+            }
+            if self.stream.stale_after_secs == 0 || self.stream.resync_interval_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "stream.stale_after_secs and stream.resync_interval_secs must be > 0".into(),
+                ));
+            }
+            if self.stream.fallback_after_failures == 0 {
+                return Err(ConfigError::Invalid(
+                    "stream.fallback_after_failures must be > 0 (0 would fall back before the \
+                     first connection attempt)"
+                        .into(),
+                ));
+            }
+            // A debounce longer than the scan interval would make the "event-driven" path
+            // slower than the polling it replaces.
+            if self.stream.debounce_ms >= self.daemon.scan_interval_secs.saturating_mul(1_000) {
+                return Err(ConfigError::Invalid(format!(
+                    "stream.debounce_ms ({}) must be well under daemon.scan_interval_secs ({} s) \
+                     — otherwise streaming detects no faster than polling",
+                    self.stream.debounce_ms, self.daemon.scan_interval_secs
+                )));
+            }
+        }
+
         if self.alerts.alert_min_net_per_share < Decimal::ZERO {
             return Err(ConfigError::Invalid(
                 "alerts.alert_min_net_per_share must be >= 0".into(),
@@ -649,6 +746,21 @@ fn env_u64(var: &'static str) -> Result<Option<u64>, ConfigError> {
             expected: "positive integer",
             value: raw,
         }),
+    }
+}
+
+fn env_bool(var: &'static str) -> Result<Option<bool>, ConfigError> {
+    match env_str(var) {
+        None => Ok(None),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "no" | "off" => Ok(Some(false)),
+            _ => Err(ConfigError::Env {
+                var,
+                expected: "boolean",
+                value: raw,
+            }),
+        },
     }
 }
 

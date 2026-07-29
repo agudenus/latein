@@ -22,8 +22,20 @@
 //!   taker net is below the floor by construction, so crediting it would be fiction; its
 //!   maker number is reported separately and always labelled hypothetical, because we
 //!   never rest an order and therefore never learn whether it would have been crossed.
+//!
+//! ## Two ways in, one way through (M6)
+//!
+//! Detection is triggered either by the REST scan (a timer) or by the WebSocket stream (a
+//! book actually moved). Both hand their opportunities to the *same*
+//! [`Daemon::process_opportunities`], so persistence, alerting, lifecycle tracking and the
+//! daily summary cannot drift apart between the two paths. The only difference is what
+//! each can honestly report: a stream-triggered row carries `detection_latency_ms`
+//! measured from the triggering frame, a REST-triggered row carries none.
+//!
+//! With `stream.enabled = false` — or after the stream has been abandoned as unreachable —
+//! the daemon is exactly the M3 polling loop.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,6 +57,7 @@ use crate::store::{
     CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, ScanTotals, Store,
 };
 use crate::types::{BookMap, Opportunity, Side, TokenId, Universe};
+use crate::ws::{DirtyBatch, StreamManager};
 
 /// Phase A is dry-run only. Live execution does not exist yet — not behind a flag, not
 /// behind a feature: there is no order-placing code in this binary.
@@ -95,6 +108,7 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
         log = %events.path().display(),
         scan_interval_secs = cfg.daemon.scan_interval_secs,
         universe_refresh_secs = cfg.daemon.universe_refresh_secs,
+        market_data = if cfg.stream.enabled { "stream+rest" } else { "rest" },
         repoll = format!(
             "{}s/{}s",
             cfg.lifecycle.repoll_interval_secs, cfg.lifecycle.repoll_window_secs
@@ -114,6 +128,7 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
         shutdown: shutdown_rx,
         trackers: JoinSet::new(),
         last_summary_day: None,
+        token_events: HashMap::new(),
     };
     daemon.main_loop(max_cycles).await
 }
@@ -161,6 +176,9 @@ struct Daemon {
     shutdown: watch::Receiver<bool>,
     trackers: JoinSet<()>,
     last_summary_day: Option<NaiveDate>,
+    /// token id → index into `universe.events`. Rebuilt on every universe refresh; this is
+    /// what turns "this book moved" into "re-evaluate exactly this event".
+    token_events: HashMap<TokenId, usize>,
 }
 
 impl Daemon {
@@ -169,6 +187,7 @@ impl Daemon {
         // "quietly idle", it is broken.
         let mut universe = self.fetch_universe().await?;
         let mut universe_fetched = Instant::now();
+        self.index_universe(&universe);
 
         // If we start after today's summary time, do not immediately fire a partial-day
         // summary; wait for tomorrow's.
@@ -177,36 +196,97 @@ impl Daemon {
             self.last_summary_day = Some(Utc::now().date_naive());
         }
 
+        // The stream, when enabled. Books are seeded over REST first so the daemon is
+        // never blind while the first snapshots are in flight.
+        let mut stream = if self.cfg.stream.enabled {
+            let manager =
+                StreamManager::start(&self.cfg, &universe.token_ids(), self.shutdown.clone());
+            self.seed_stream_books(&manager, &universe).await;
+            Some(manager)
+        } else {
+            None
+        };
+
         let mut ticker =
             tokio::time::interval(Duration::from_secs(self.cfg.daemon.scan_interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let refresh_after = Duration::from_secs(self.cfg.daemon.universe_refresh_secs);
+        let resync_after = Duration::from_secs(self.cfg.stream.resync_interval_secs);
+        let stale_after = Duration::from_secs(self.cfg.stream.stale_after_secs);
+        let mut last_sweep = Instant::now();
         let mut cycles = 0u64;
+        let mut stream_passes = 0u64;
 
         loop {
-            tokio::select! {
+            // A tick and a dirty batch are the two ways detection starts; everything after
+            // the trigger is shared.
+            let batch = tokio::select! {
                 _ = self.shutdown.changed() => break,
-                _ = ticker.tick() => {}
-            }
+                _ = ticker.tick() => None,
+                batch = recv_batch(stream.as_mut()) => match batch {
+                    Some(batch) => Some(batch),
+                    // The pool is gone (fallback or shutdown): stop selecting on it.
+                    None => { stream = None; continue; }
+                },
+            };
             if *self.shutdown.borrow() {
                 break;
             }
 
+            if let Some(batch) = batch {
+                stream_passes += 1;
+                if let Some(manager) = stream.as_ref() {
+                    self.stream_cycle(&universe, manager, &batch).await;
+                }
+                continue;
+            }
+
+            // --- timer tick -----------------------------------------------------------
             if universe_fetched.elapsed() >= refresh_after {
                 match self.fetch_universe().await {
                     Ok(fresh) => {
                         universe = fresh;
-                        universe_fetched = Instant::now();
+                        self.index_universe(&universe);
+                        if let Some(manager) = stream.as_mut() {
+                            manager.update_universe(&universe.token_ids());
+                        }
                     }
                     Err(err) => {
                         // Keep trading off the last known universe rather than going blind.
                         tracing::warn!(%err, "universe refresh failed — keeping the previous one");
-                        universe_fetched = Instant::now();
                     }
+                }
+                universe_fetched = Instant::now();
+            }
+
+            // The stream can be given up on mid-run; from then on this is the M3 daemon.
+            if stream
+                .as_ref()
+                .is_some_and(|manager| manager.health().fallen_back())
+            {
+                tracing::error!(
+                    "falling back to REST polling for the rest of this process — detection \
+                     latency returns to the {} s scan interval",
+                    self.cfg.daemon.scan_interval_secs
+                );
+                if let Some(manager) = stream.take() {
+                    manager.stop().await;
                 }
             }
 
-            self.scan_cycle(&universe).await;
+            match stream.as_ref() {
+                Some(manager) => {
+                    // Cheap every tick: anything the stream has not refreshed recently.
+                    self.resync_stale(manager, &universe, stale_after).await;
+                    // Slow and thorough: the whole universe over REST, a divergence
+                    // cross-check, and a full detection pass as the integrity net.
+                    if last_sweep.elapsed() >= resync_after {
+                        last_sweep = Instant::now();
+                        self.full_sweep(manager, &universe).await;
+                    }
+                }
+                None => self.scan_cycle(&universe).await,
+            }
             self.maybe_daily_summary(summary_time).await;
 
             cycles += 1;
@@ -216,16 +296,48 @@ impl Daemon {
             }
         }
 
+        if let Some(manager) = stream.take() {
+            let stats = manager.books().stats.snapshot();
+            tracing::info!(
+                snapshots = stats.snapshots,
+                deltas = stats.deltas,
+                unknown_frames = stats.unknown_frames,
+                malformed_frames = stats.malformed_frames,
+                orphan_deltas = stats.orphan_deltas,
+                out_of_order = stats.out_of_order,
+                hash_contradictions = stats.hash_contradictions,
+                reconnects = stats.reconnects,
+                connect_failures = stats.connect_failures,
+                resynced = stats.resynced,
+                divergences = stats.divergences,
+                "market stream stopping"
+            );
+            manager.stop().await;
+        }
+
         self.drain_trackers().await;
         let stats = self.alerter.stats();
         tracing::info!(
             cycles,
+            stream_passes,
             alerts_sent = stats.sent,
             alerts_failed = stats.failed,
             alerts_suppressed = stats.suppressed,
             "polyarb daemon stopped"
         );
         Ok(())
+    }
+
+    /// Rebuild the token → event index used by incremental detection.
+    fn index_universe(&mut self, universe: &Universe) {
+        self.token_events.clear();
+        for (index, event) in universe.events.iter().enumerate() {
+            for market in &event.markets {
+                for token in &market.token_ids {
+                    self.token_events.insert(token.clone(), index);
+                }
+            }
+        }
     }
 
     async fn fetch_universe(&self) -> Result<Universe> {
@@ -268,7 +380,7 @@ impl Daemon {
         Ok(universe)
     }
 
-    /// One scan tick: fetch every tracked book, detect, persist, alert, track.
+    /// One REST scan tick: fetch every tracked book, detect, persist, alert, track.
     async fn scan_cycle(&mut self, universe: &Universe) {
         let started = Instant::now();
         let tokens = universe.token_ids();
@@ -291,23 +403,10 @@ impl Daemon {
         };
 
         let opportunities = detect::scan(&self.cfg, universe, &books);
-        let now = Utc::now();
-        let mut new_opportunities = 0i64;
-
-        for op in &opportunities {
-            match self.store.record_opportunity(op, &books, now) {
-                Ok(recorded) if recorded.is_new() => {
-                    new_opportunities += 1;
-                    self.on_new_opportunity(recorded.id(), op).await;
-                }
-                Ok(recorded) => {
-                    // Same construction at the same quotes: update `last_seen_at`, never
-                    // duplicate the row.
-                    tracing::debug!(id = recorded.id(), "opportunity still on the book");
-                }
-                Err(err) => tracing::warn!(%err, "could not persist an opportunity"),
-            }
-        }
+        // REST detection has no triggering frame, so it has no latency to report.
+        let new_opportunities = self
+            .process_opportunities(&opportunities, &books, None)
+            .await;
 
         let duration_ms = elapsed_ms(started);
         tracing::info!(
@@ -329,6 +428,212 @@ impl Daemon {
         });
     }
 
+    /// Persist / alert / track a detection pass's opportunities. The single point where
+    /// both the REST and the stream path meet, so neither can drift.
+    ///
+    /// Returns how many were new.
+    async fn process_opportunities(
+        &mut self,
+        opportunities: &[Opportunity],
+        books: &BookMap,
+        batch: Option<&DirtyBatch>,
+    ) -> i64 {
+        let now = Utc::now();
+        let instant = Instant::now();
+        let mut new_opportunities = 0i64;
+        for op in opportunities {
+            // The latency of the *slowest* leg we were told about: the age of the market
+            // data this construction actually rests on.
+            let latency =
+                batch.and_then(|b| b.latency_ms(op.legs.iter().map(|l| &l.token_id), instant, now));
+            match self.store.record_opportunity(op, books, now, latency) {
+                Ok(recorded) if recorded.is_new() => {
+                    new_opportunities += 1;
+                    self.on_new_opportunity(recorded.id(), op, latency).await;
+                }
+                Ok(recorded) => {
+                    // Same construction at the same quotes: update `last_seen_at`, never
+                    // duplicate the row.
+                    tracing::debug!(id = recorded.id(), "opportunity still on the book");
+                }
+                Err(err) => tracing::warn!(%err, "could not persist an opportunity"),
+            }
+        }
+        new_opportunities
+    }
+
+    /// Seed the stream's books from REST so detection works from the first tick, before
+    /// any snapshot frame has arrived.
+    async fn seed_stream_books(&self, manager: &StreamManager, universe: &Universe) {
+        let tokens = universe.token_ids();
+        match ClobClient::new(&self.http, &self.cfg)
+            .fetch_books(&tokens)
+            .await
+        {
+            Ok(books) => {
+                tracing::info!(books = books.len(), "seeded the stream book state over REST");
+                manager.books().apply_rest(&books, Instant::now());
+            }
+            Err(err) => tracing::warn!(
+                %err,
+                "could not seed book state over REST — detection waits for stream snapshots"
+            ),
+        }
+    }
+
+    /// Incremental detection: re-evaluate **only** the events whose books just moved.
+    async fn stream_cycle(&mut self, universe: &Universe, manager: &StreamManager, batch: &DirtyBatch) {
+        let started = Instant::now();
+        let mut dirty: Vec<usize> = batch
+            .tokens()
+            .filter_map(|token| self.token_events.get(token).copied())
+            .collect();
+        dirty.sort_unstable();
+        dirty.dedup();
+        if dirty.is_empty() {
+            // Books we track but no event claims (a universe refresh mid-flight).
+            return;
+        }
+
+        let subset = Universe {
+            events: dirty
+                .iter()
+                .filter_map(|i| universe.events.get(*i).cloned())
+                .collect(),
+        };
+        // Only the affected events' books are copied out of the shared state — the whole
+        // point of the incremental path is not to touch the other ~2 000 books.
+        let books = manager.books().snapshot_of(&subset.token_ids());
+        let opportunities = detect::scan(&self.cfg, &subset, &books);
+        let new_opportunities = self
+            .process_opportunities(&opportunities, &books, Some(batch))
+            .await;
+
+        let duration_ms = elapsed_ms(started);
+        tracing::debug!(
+            touched_tokens = batch.len(),
+            events = subset.events.len(),
+            books = books.len(),
+            opportunities = opportunities.len(),
+            new = new_opportunities,
+            duration_ms,
+            "stream detection pass complete"
+        );
+        self.record_cycle(CycleStats {
+            events: subset.events.len() as i64,
+            markets: subset.market_count() as i64,
+            books: books.len() as i64,
+            opportunities: opportunities.len() as i64,
+            new_opportunities,
+            duration_ms,
+            failed: false,
+        });
+    }
+
+    /// Targeted REST re-fetch of books the stream has not refreshed (or has flagged
+    /// unverified). Usually a no-op, and then it costs nothing at all.
+    async fn resync_stale(
+        &mut self,
+        manager: &StreamManager,
+        universe: &Universe,
+        stale_after: Duration,
+    ) {
+        let stale =
+            manager
+                .books()
+                .missing_or_stale(&universe.token_ids(), Instant::now(), stale_after);
+        if stale.is_empty() {
+            return;
+        }
+        match ClobClient::new(&self.http, &self.cfg)
+            .fetch_books(&stale)
+            .await
+        {
+            Ok(books) => {
+                tracing::info!(
+                    requested = stale.len(),
+                    returned = books.len(),
+                    stale_after_secs = stale_after.as_secs(),
+                    "resynced stale books over REST"
+                );
+                manager
+                    .books()
+                    .stats
+                    .resynced
+                    .fetch_add(books.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                manager.books().apply_rest(&books, Instant::now());
+            }
+            Err(err) => tracing::warn!(%err, stale = stale.len(), "stale-book resync failed"),
+        }
+    }
+
+    /// The integrity net: re-fetch the whole universe over REST, count how far a sample of
+    /// our locally maintained books had drifted, adopt the REST view, and run a full
+    /// detection pass over it.
+    ///
+    /// This is what makes a silently-wrong stream survivable. If the frames carry no
+    /// verifiable checksum (they may not — see `ws.rs`), this sweep is the *only* thing
+    /// that can tell us our books are wrong, so its divergence count is the number to
+    /// watch during the soak.
+    async fn full_sweep(&mut self, manager: &StreamManager, universe: &Universe) {
+        let started = Instant::now();
+        let tokens = universe.token_ids();
+        let books = match ClobClient::new(&self.http, &self.cfg)
+            .fetch_books(&tokens)
+            .await
+        {
+            Ok(books) => books,
+            Err(err) => {
+                tracing::warn!(%err, "full REST resync sweep failed");
+                self.record_cycle(CycleStats {
+                    events: universe.events.len() as i64,
+                    markets: universe.market_count() as i64,
+                    duration_ms: elapsed_ms(started),
+                    failed: true,
+                    ..CycleStats::default()
+                });
+                return;
+            }
+        };
+
+        let diverged = manager.books().count_divergence(&books, DIVERGENCE_SAMPLE);
+        if diverged > 0 {
+            tracing::warn!(
+                diverged,
+                sampled = books.len().min(DIVERGENCE_SAMPLE),
+                "locally streamed books disagreed with REST at the top of book — the REST \
+                 view wins; investigate before trusting stream-only detection"
+            );
+        }
+        manager.books().apply_rest(&books, Instant::now());
+
+        let opportunities = detect::scan(&self.cfg, universe, &books);
+        let new_opportunities = self
+            .process_opportunities(&opportunities, &books, None)
+            .await;
+        let duration_ms = elapsed_ms(started);
+        tracing::info!(
+            books = books.len(),
+            live_books = manager.books().len(),
+            connections = manager.health().live_connections(),
+            markets = universe.market_count(),
+            diverged,
+            opportunities = opportunities.len(),
+            new = new_opportunities,
+            duration_ms,
+            "full REST resync sweep complete"
+        );
+        self.record_cycle(CycleStats {
+            events: universe.events.len() as i64,
+            markets: universe.market_count() as i64,
+            books: books.len() as i64,
+            opportunities: opportunities.len() as i64,
+            new_opportunities,
+            duration_ms,
+            failed: false,
+        });
+    }
+
     fn record_cycle(&self, stats: CycleStats) {
         if let Err(err) = self.store.record_cycle(&stats, Utc::now()) {
             tracing::warn!(%err, "could not record scan-cycle stats");
@@ -336,10 +641,11 @@ impl Daemon {
     }
 
     /// Log, alert (if it clears the threshold), and start lifecycle tracking.
-    async fn on_new_opportunity(&mut self, id: i64, op: &Opportunity) {
+    async fn on_new_opportunity(&mut self, id: i64, op: &Opportunity, latency_ms: Option<i64>) {
         let mut payload = json!({
             "id": id,
             "dedupe_key": crate::store::dedupe_key(op),
+            "detection_latency_ms": latency_ms,
             "opportunity": op,
         });
 
@@ -439,6 +745,19 @@ impl Daemon {
 
 fn elapsed_ms(since: Instant) -> i64 {
     i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// How many books the full sweep cross-checks against our local copy. Comparing every
+/// book on every sweep is pointless work: drift is systematic, so a sample finds it.
+const DIVERGENCE_SAMPLE: usize = 64;
+
+/// Await the next dirty batch, or never resolve when there is no stream. Written as a
+/// helper so the `select!` arm reads the same either way.
+async fn recv_batch(stream: Option<&mut StreamManager>) -> Option<DirtyBatch> {
+    match stream {
+        Some(manager) => manager.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Crypto events that will already have closed by the time the universe is next refreshed.
@@ -630,6 +949,13 @@ pub struct DailySummary {
     pub persistence_p50_ms: Option<i64>,
     pub persistence_p90_ms: Option<i64>,
     pub persistence_max_ms: Option<i64>,
+    /// Rows detected from the stream (i.e. carrying a latency measurement), and the
+    /// distribution of that latency. REST-detected rows are excluded rather than counted
+    /// as some invented number.
+    pub stream_detected: usize,
+    pub latency_p50_ms: Option<i64>,
+    pub latency_p95_ms: Option<i64>,
+    pub latency_max_ms: Option<i64>,
     pub filled: usize,
     pub vanished: usize,
     pub unresolved: usize,
@@ -660,6 +986,7 @@ pub fn summarize(
     let mut by_category: BTreeMap<String, usize> = BTreeMap::new();
     let mut nets: Vec<Decimal> = Vec::with_capacity(rows.len());
     let mut persistences: Vec<i64> = Vec::new();
+    let mut latencies: Vec<i64> = Vec::new();
     let mut capitals: Vec<Decimal> = Vec::with_capacity(rows.len());
     let (mut filled, mut vanished, mut unresolved, mut untracked, mut open) = (0, 0, 0, 0, 0);
     let mut maker_only = 0usize;
@@ -705,10 +1032,14 @@ pub fn summarize(
         if let Some(ms) = row.persistence_ms {
             persistences.push(ms);
         }
+        if let Some(ms) = row.detection_latency_ms {
+            latencies.push(ms);
+        }
     }
 
     nets.sort();
     persistences.sort_unstable();
+    latencies.sort_unstable();
     let resolved = filled + vanished;
     let fill_rate_pct = (resolved > 0).then(|| {
         (Decimal::from(filled) * Decimal::ONE_HUNDRED / Decimal::from(resolved)).round_dp(1)
@@ -729,6 +1060,10 @@ pub fn summarize(
         persistence_p50_ms: quantile(&persistences, 50),
         persistence_p90_ms: quantile(&persistences, 90),
         persistence_max_ms: persistences.last().copied(),
+        stream_detected: latencies.len(),
+        latency_p50_ms: quantile(&latencies, 50),
+        latency_p95_ms: quantile(&latencies, 95),
+        latency_max_ms: latencies.last().copied(),
         filled,
         vanished,
         unresolved,
@@ -861,6 +1196,29 @@ impl DailySummary {
              floor by construction).\n",
         );
 
+        out.push_str("\n## Detection latency (stream)\n\n");
+        if self.stream_detected == 0 {
+            out.push_str(
+                "- no opportunity was detected from a streamed book update today \
+                 (REST-detected rows carry no latency measurement)\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "- detected from streamed book updates: {} of {}\n\
+                 - latency from the triggering market data: p50 {} ms, p95 {} ms, max {} ms\n",
+                self.stream_detected,
+                self.total,
+                fmt_opt_i64(self.latency_p50_ms),
+                fmt_opt_i64(self.latency_p95_ms),
+                fmt_opt_i64(self.latency_max_ms),
+            ));
+            out.push_str(
+                "\nMeasured from the triggering frame's server timestamp when it carries a \
+                 plausible one, otherwise from the moment we read the frame off the socket \
+                 (so it is a lower bound on true end-to-end latency, never an overstatement).\n",
+            );
+        }
+
         out.push_str("\n## Persistence and fills\n\n");
         out.push_str(&format!(
             "- persistence: p50 {}, p90 {}, max {}\n",
@@ -923,6 +1281,10 @@ fn usd(v: Decimal) -> Decimal {
 fn fmt_opt_dec(v: Option<Decimal>) -> String {
     v.map(|d| format!("{d:+.6}"))
         .unwrap_or_else(|| "n/a".into())
+}
+
+fn fmt_opt_i64(v: Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "n/a".into())
 }
 
 fn fmt_opt_ms(v: Option<i64>) -> String {
@@ -1130,6 +1492,7 @@ mod tests {
             simulated_pnl_taker: filled.then(|| net_taker * dec!(100)),
             simulated_pnl_maker: filled.then(|| (net_taker + dec!(0.01)) * dec!(100)),
             detected_at: "2026-07-26T00:00:00.000Z".into(),
+            detection_latency_ms: None,
         }
     }
 
