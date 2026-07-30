@@ -63,7 +63,8 @@ use crate::detect;
 use crate::gamma::{GammaClient, PaginationState};
 use crate::http::HttpClient;
 use crate::store::{
-    CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, ScanTotals, Store,
+    CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, RuntimeStatus, ScanTotals,
+    Store,
 };
 use crate::types::{BookMap, Opportunity, Side, TokenId, Universe};
 use crate::ws::{self, DirtyBatch, StreamManager, StreamStatsSnapshot, DIVERGENCE_SAMPLE};
@@ -137,6 +138,14 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
         shutdown: shutdown_rx,
         trackers: JoinSet::new(),
         last_summary_day: None,
+        status: DaemonStatus {
+            started_at: Utc::now(),
+            // Until the first REST call proves otherwise, assume nothing: `rest_ok` starts
+            // true so a daemon that has not yet made a request is not reported as blind.
+            rest_ok: true,
+            ..DaemonStatus::default()
+        },
+        last_status_publish: None,
         token_events: HashMap::new(),
         gamma: Arc::new(PaginationState::default()),
     };
@@ -177,6 +186,37 @@ async fn wait_for_signal() {
 // Daemon
 // ---------------------------------------------------------------------------------
 
+/// How often the daemon republishes [`RuntimeStatus`] to SQLite (M7).
+///
+/// One tiny upsert; at 5 s it is cheaper than a single scan cycle's own telemetry row and
+/// keeps the dashboard's "is it alive" question answerable without the dashboard ever
+/// touching the daemon. The dashboard treats a status older than
+/// [`RUNTIME_STATUS_STALE_SECS`] as "the daemon is not reporting".
+const STATUS_PUBLISH_SECS: u64 = 5;
+
+/// The daemon-memory state the dashboard cannot see any other way.
+///
+/// It is *state*, not telemetry: every field answers a question whose wrong answer would
+/// make the dashboard lie — whether discovery is returning an empty universe, whether REST
+/// is working while the socket is not, how much of the fee model came from a guess.
+#[derive(Debug, Clone, Default)]
+struct DaemonStatus {
+    started_at: chrono::DateTime<Utc>,
+    universe_events: i64,
+    universe_markets: i64,
+    universe_tokens: i64,
+    universe_refreshed_at: Option<chrono::DateTime<Utc>>,
+    last_good_discovery_at: Option<chrono::DateTime<Utc>>,
+    discovery_empty_streak: i64,
+    discovery_error: Option<String>,
+    rest_ok: bool,
+    rest_failure_streak: i64,
+    stream_rest_only: bool,
+    fee_fallback_markets: i64,
+    fee_unsupported_formula: i64,
+    markets_with_api_fee: i64,
+}
+
 struct Daemon {
     cfg: Arc<Config>,
     http: Arc<HttpClient>,
@@ -186,6 +226,9 @@ struct Daemon {
     shutdown: watch::Receiver<bool>,
     trackers: JoinSet<()>,
     last_summary_day: Option<NaiveDate>,
+    /// M7: republished to `runtime_status` every [`STATUS_PUBLISH_SECS`].
+    status: DaemonStatus,
+    last_status_publish: Option<Instant>,
     /// token id → index into `universe.events`. Rebuilt on every universe refresh; this is
     /// what turns "this book moved" into "re-evaluate exactly this event".
     token_events: HashMap<TokenId, usize>,
@@ -202,6 +245,21 @@ struct Daemon {
 /// what turns "discovery is broken" into "discovery parsed 0 events from /events/keyset".
 fn error_chain(err: &anyhow::Error) -> String {
     format!("{err:#}")
+}
+
+/// Is this discovery failure *the* one — a pass that parsed fine and produced no events?
+///
+/// The distinction matters because only this failure means the scanner is blind rather
+/// than merely unlucky: an HTTP 500 or a timeout leaves the previous universe standing and
+/// is retried, while an empty universe that parses cleanly looks exactly like a quiet
+/// market and would otherwise be reported as one.
+fn is_empty_discovery(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::http::ApiError>(),
+            Some(crate::http::ApiError::EmptyDiscovery { .. })
+        )
+    })
 }
 
 /// Backoff between failed startup discovery attempts: start at the daemon's own scan
@@ -245,6 +303,9 @@ impl Daemon {
         } else {
             None
         };
+        // First publication: from here the dashboard can tell a running daemon from a
+        // stopped one, and does so by this row's age.
+        self.publish_status(stream.as_ref(), true);
 
         let mut ticker =
             tokio::time::interval(Duration::from_secs(self.cfg.daemon.scan_interval_secs));
@@ -276,6 +337,8 @@ impl Daemon {
                         tracing::warn!("the market stream pool stopped — polling REST until a re-probe succeeds");
                         stream = None;
                         fallback_since = Some(Instant::now());
+                        self.status.stream_rest_only = true;
+                        self.publish_status(None, true);
                         continue;
                     }
                 },
@@ -283,6 +346,7 @@ impl Daemon {
             if *self.shutdown.borrow() {
                 break;
             }
+            self.publish_status(stream.as_ref(), false);
 
             if let Some(batch) = batch {
                 stream_passes += 1;
@@ -354,6 +418,8 @@ impl Daemon {
                 }
                 last_pulse = None;
                 fallback_since = Some(Instant::now());
+                self.status.stream_rest_only = true;
+                self.publish_status(None, true);
                 // Take over immediately rather than leaving one scan interval unscanned:
                 // from here on REST *is* the detector.
                 self.scan_cycle(&universe).await;
@@ -380,6 +446,8 @@ impl Daemon {
                                 stream = Some(manager);
                                 fallback_since = None;
                                 last_sweep = Instant::now();
+                                self.status.stream_rest_only = false;
+                                self.publish_status(stream.as_ref(), true);
                             }
                             Err(err) => tracing::info!(
                                 %err,
@@ -468,6 +536,10 @@ impl Daemon {
                 }
                 Err(err) => {
                     attempt += 1;
+                    // Publish before sleeping: a daemon stuck here has no universe at all,
+                    // and that is precisely the state the dashboard must take the page over
+                    // for rather than render as a quiet market.
+                    self.publish_status(None, true);
                     let wait = discovery_backoff(self.cfg.daemon.scan_interval_secs, attempt);
                     tracing::error!(
                         err = %error_chain(&err),
@@ -488,8 +560,78 @@ impl Daemon {
         }
     }
 
-    async fn fetch_universe(&self) -> Result<Universe> {
-        let (universe, stats) = GammaClient::with_state(&self.http, &self.cfg, self.gamma.clone())
+    /// Note the outcome of a REST call, for the "is this a fallback or an outage?" question
+    /// the dashboard has to answer (M7). Mirrors what [`crate::ws::StreamHealth`] already
+    /// records for the fallback decision; this side is only ever read, never acted on.
+    fn note_rest(&mut self, ok: bool) {
+        self.status.rest_ok = ok;
+        self.status.rest_failure_streak = if ok {
+            0
+        } else {
+            self.status.rest_failure_streak.saturating_add(1)
+        };
+    }
+
+    /// Republish [`RuntimeStatus`] if it is due (or `force`d by a state change).
+    ///
+    /// Best-effort by design: a failed status write is logged at debug and nothing else —
+    /// losing a dashboard refresh must never disturb the scan loop.
+    fn publish_status(&mut self, stream: Option<&StreamManager>, force: bool) {
+        let now = Instant::now();
+        let due = self
+            .last_status_publish
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(STATUS_PUBLISH_SECS));
+        if !force && !due {
+            return;
+        }
+        self.last_status_publish = Some(now);
+
+        let stats = stream.map(|m| m.books().stats.snapshot()).unwrap_or_default();
+        let alerts = self.alerter.stats();
+        let status = RuntimeStatus {
+            mode: self.cfg.mode.clone(),
+            started_at: crate::store::now_str(self.status.started_at),
+            universe_events: self.status.universe_events,
+            universe_markets: self.status.universe_markets,
+            universe_tokens: self.status.universe_tokens,
+            universe_refreshed_at: self.status.universe_refreshed_at.map(crate::store::now_str),
+            universe_refresh_secs: self.cfg.daemon.universe_refresh_secs,
+            scan_interval_secs: self.cfg.daemon.scan_interval_secs,
+            last_good_discovery_at: self.status.last_good_discovery_at.map(crate::store::now_str),
+            discovery_empty_streak: self.status.discovery_empty_streak,
+            discovery_error: self.status.discovery_error.clone(),
+            stream_enabled: self.cfg.stream.enabled,
+            stream_shards: stream.map(|m| m.shard_count() as i64).unwrap_or(0),
+            stream_shards_connected: stream
+                .map(|m| i64::from(m.health().live_connections()))
+                .unwrap_or(0),
+            stream_rest_only: self.status.stream_rest_only,
+            books_total: stream.map(|m| m.books().len() as i64).unwrap_or(0),
+            books_stale: stream.map(|m| m.books().stale_count() as i64).unwrap_or(0),
+            frames: stats.messages,
+            delta_entries_applied: stats.delta_entries_applied,
+            frames_unrecognized: stats.frames_unrecognized,
+            rest_ok: self.status.rest_ok,
+            rest_failure_streak: self.status.rest_failure_streak,
+            fee_fallback_markets: self.status.fee_fallback_markets,
+            fee_unsupported_formula: self.status.fee_unsupported_formula,
+            markets_with_api_fee: self.status.markets_with_api_fee,
+            telegram_circuit_open: alerts.circuit_open,
+            alerts_sent: alerts.sent,
+            alerts_failed: alerts.failed,
+            alerts_cooldown_held: alerts.cooldown_suppressed,
+            net_floor_default_taker: self
+                .cfg
+                .net_floor_taker(&crate::types::Category::new("default"))
+                .to_string(),
+        };
+        if let Err(err) = self.store.write_runtime_status(&status, Utc::now()) {
+            tracing::debug!(%err, "could not publish the runtime status row");
+        }
+    }
+
+    async fn fetch_universe(&mut self) -> Result<Universe> {
+        let result = GammaClient::with_state(&self.http, &self.cfg, self.gamma.clone())
             .fetch_universe()
             .await
             .with_context(|| {
@@ -497,7 +639,34 @@ impl Daemon {
                     "market discovery via the Gamma API at {} failed",
                     self.cfg.api.gamma_base_url
                 )
-            })?;
+            });
+        let (universe, stats) = match result {
+            Ok(pair) => pair,
+            Err(err) => {
+                // An empty-but-well-formed discovery pass is the failure the break state
+                // exists for, and it is the only one that gets a streak: everything else is
+                // an ordinary error the daemon retries with its previous universe intact.
+                if is_empty_discovery(&err) {
+                    self.status.discovery_empty_streak =
+                        self.status.discovery_empty_streak.saturating_add(1);
+                }
+                self.status.discovery_error = Some(error_chain(&err));
+                return Err(err);
+            }
+        };
+        self.status.discovery_empty_streak = 0;
+        self.status.discovery_error = None;
+        self.status.last_good_discovery_at = Some(Utc::now());
+        self.status.universe_refreshed_at = self.status.last_good_discovery_at;
+        self.status.universe_events = universe.events.len() as i64;
+        self.status.universe_markets = universe.market_count() as i64;
+        self.status.universe_tokens = universe.token_count() as i64;
+        self.status.markets_with_api_fee = stats.markets_with_api_fee as i64;
+        // "Fell back to the category table" is everything the API did not state a usable
+        // rate for — including the markets whose stated formula this build cannot price.
+        self.status.fee_fallback_markets =
+            (stats.markets_kept.saturating_sub(stats.markets_with_api_fee)) as i64;
+        self.status.fee_unsupported_formula = stats.markets_unsupported_fee_formula as i64;
         let partial_negrisk = universe
             .events
             .iter()
@@ -544,6 +713,7 @@ impl Daemon {
             Ok(books) => books,
             Err(err) => {
                 tracing::warn!(%err, "book fetch failed — skipping this cycle");
+                self.note_rest(false);
                 self.record_cycle(CycleStats {
                     events: universe.events.len() as i64,
                     markets: universe.market_count() as i64,
@@ -555,7 +725,8 @@ impl Daemon {
             }
         };
 
-        let opportunities = detect::scan(&self.cfg, universe, &books);
+        self.note_rest(true);
+        let (opportunities, counters) = detect::scan_counted(&self.cfg, universe, &books);
         // REST detection has no triggering frame, so it has no latency to report.
         let new_opportunities = self
             .process_opportunities(&opportunities, &books, None)
@@ -578,6 +749,8 @@ impl Daemon {
             new_opportunities,
             duration_ms,
             failed: false,
+            gaps_detected: counters.gaps_detected as i64,
+            fee_survivors: counters.fee_survivors as i64,
         });
     }
 
@@ -617,7 +790,7 @@ impl Daemon {
 
     /// Seed the stream's books from REST so detection works from the first tick, before
     /// any snapshot frame has arrived.
-    async fn seed_stream_books(&self, manager: &StreamManager, universe: &Universe) {
+    async fn seed_stream_books(&mut self, manager: &StreamManager, universe: &Universe) {
         let tokens = universe.token_ids();
         match ClobClient::new(&self.http, &self.cfg)
             .fetch_books(&tokens)
@@ -631,10 +804,12 @@ impl Daemon {
                 // Also the first evidence that this machine has a network: a socket that
                 // never connects while *this* worked is a socket problem.
                 manager.health().record_rest_success();
+                self.note_rest(true);
                 manager.books().apply_rest(&tokens, &books, Instant::now());
             }
             Err(err) => {
                 manager.health().record_rest_failure();
+                self.note_rest(false);
                 tracing::warn!(
                     %err,
                     "could not seed book state over REST — detection waits for stream snapshots"
@@ -671,7 +846,7 @@ impl Daemon {
         // Only the affected events' books are copied out of the shared state — the whole
         // point of the incremental path is not to touch the other ~2 000 books.
         let books = manager.books().snapshot_of(&subset.token_ids());
-        let opportunities = detect::scan(&self.cfg, &subset, &books);
+        let (opportunities, counters) = detect::scan_counted(&self.cfg, &subset, &books);
         let new_opportunities = self
             .process_opportunities(&opportunities, &books, Some(batch))
             .await;
@@ -694,6 +869,8 @@ impl Daemon {
             new_opportunities,
             duration_ms,
             failed: false,
+            gaps_detected: counters.gaps_detected as i64,
+            fee_survivors: counters.fee_survivors as i64,
         });
     }
 
@@ -726,6 +903,7 @@ impl Daemon {
                     "resynced stale books over REST"
                 );
                 manager.health().record_rest_success();
+                self.note_rest(true);
                 manager
                     .books()
                     .stats
@@ -735,6 +913,7 @@ impl Daemon {
             }
             Err(err) => {
                 manager.health().record_rest_failure();
+                self.note_rest(false);
                 tracing::warn!(%err, stale = stale.len(), "stale-book resync failed");
             }
         }
@@ -782,6 +961,7 @@ impl Daemon {
             Ok(books) => books,
             Err(err) => {
                 manager.health().record_rest_failure();
+                self.note_rest(false);
                 tracing::warn!(%err, "full REST resync sweep failed");
                 self.record_cycle(CycleStats {
                     events: universe.events.len() as i64,
@@ -794,6 +974,7 @@ impl Daemon {
             }
         };
         manager.health().record_rest_success();
+        self.note_rest(true);
 
         if diverged > 0 {
             tracing::warn!(
@@ -806,7 +987,7 @@ impl Daemon {
         self.log_stream_pulse(manager, last_pulse);
         manager.books().apply_rest(&tokens, &books, Instant::now());
 
-        let opportunities = detect::scan(&self.cfg, universe, &books);
+        let (opportunities, counters) = detect::scan_counted(&self.cfg, universe, &books);
         let new_opportunities = self
             .process_opportunities(&opportunities, &books, None)
             .await;
@@ -830,6 +1011,8 @@ impl Daemon {
             new_opportunities,
             duration_ms,
             failed: false,
+            gaps_detected: counters.gaps_detected as i64,
+            fee_survivors: counters.fee_survivors as i64,
         });
     }
 

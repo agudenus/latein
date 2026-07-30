@@ -19,8 +19,9 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::types::{BookMap, Opportunity};
@@ -119,11 +120,37 @@ const SCHEMA_V2: &str = r#"
 ALTER TABLE opportunities ADD COLUMN detection_latency_ms INTEGER;
 "#;
 
+/// M7 — what the dashboard needs that only the daemon knows.
+///
+/// Two additions, and both exist because a *reader* cannot see them otherwise:
+///
+/// * `runtime_status` — a single row of daemon-memory state (stream shards, REST role,
+///   discovery health, alerter breaker …) republished every few seconds. It is the only
+///   way a separate read-only process can tell "the market is quiet" from "the scanner is
+///   blind", which is the whole point of the break-state screen.
+/// * `scan_stats.gaps_detected` / `.fee_survivors` — the two funnel stages that happen
+///   *before* an opportunity row exists, so nothing downstream can reconstruct them. They
+///   default to 0, so hourly buckets written by an older build read as "not measured"
+///   rather than as a zero that means something.
+const SCHEMA_V3: &str = r#"
+CREATE TABLE runtime_status (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    updated_at TEXT    NOT NULL,
+    payload    TEXT    NOT NULL
+);
+ALTER TABLE scan_stats ADD COLUMN gaps_detected INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE scan_stats ADD COLUMN fee_survivors INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// `(version, name, ddl)`. Append-only: never edit a shipped migration.
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial schema", SCHEMA_V1),
     (2, "detection latency", SCHEMA_V2),
+    (3, "runtime status and funnel counters", SCHEMA_V3),
 ];
+
+/// The schema version the dashboard needs to read (`runtime_status` + funnel counters).
+pub const DASHBOARD_MIN_SCHEMA: i64 = 3;
 
 // ---------------------------------------------------------------------------------
 // Lifecycle
@@ -254,6 +281,111 @@ pub struct OpportunityRow {
     pub detection_latency_ms: Option<i64>,
 }
 
+/// The richer projection the dashboard renders. Separate from [`OpportunityRow`] on
+/// purpose: the daily summary aggregates a fixed set of fields and must not grow a
+/// dependency on what a screen happens to show this week.
+///
+/// Every money field stays a `Decimal` here and is serialised as a *string* at the JSON
+/// boundary (`src/dashboard`), never as a JSON number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardRow {
+    pub id: i64,
+    pub kind: String,
+    pub label: String,
+    pub category: String,
+    pub event_slug: String,
+    pub event_title: String,
+    pub fee_rate: Decimal,
+    pub payout: Decimal,
+    pub gross_gap: Decimal,
+    pub spread_cost: Option<Decimal>,
+    pub net_taker: Decimal,
+    pub net_maker: Option<Decimal>,
+    pub executable_size: Decimal,
+    pub capital_required: Decimal,
+    pub net_taker_total: Decimal,
+    pub net_maker_total: Option<Decimal>,
+    pub maker_only: bool,
+    pub status: String,
+    pub detected_at: String,
+    pub resolved_at: Option<String>,
+    pub persistence_ms: Option<i64>,
+    pub detection_latency_ms: Option<i64>,
+    pub simulated_pnl_taker: Option<Decimal>,
+    pub simulated_pnl_maker: Option<Decimal>,
+}
+
+/// Scan telemetry summed over an arbitrary window of hourly buckets (dashboard funnel).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowScanTotals {
+    pub cycles: i64,
+    pub errors: i64,
+    /// Buckets in the window that predate the M7 counters. While this is non-zero the
+    /// funnel's first stages cover only part of the window and must say so.
+    pub buckets: i64,
+    pub gaps_detected: i64,
+    pub fee_survivors: i64,
+    /// Opportunities emitted per detection pass, summed — *not* distinct rows.
+    pub opportunities: i64,
+    pub new_opportunities: i64,
+}
+
+/// Daemon state that lives only in the running process's memory, republished to SQLite so
+/// a read-only reader can see it. No money values: counts, flags and timestamps only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeStatus {
+    /// Always `dry-run` in Phase A; carried so the dashboard states it from the daemon's
+    /// own mouth rather than from its own config file.
+    pub mode: String,
+    pub started_at: String,
+    pub universe_events: i64,
+    pub universe_markets: i64,
+    pub universe_tokens: i64,
+    pub universe_refreshed_at: Option<String>,
+    pub universe_refresh_secs: u64,
+    pub scan_interval_secs: u64,
+    /// Last discovery pass that returned a usable universe.
+    pub last_good_discovery_at: Option<String>,
+    /// Consecutive discovery passes that parsed cleanly and yielded zero events
+    /// (`ApiError::EmptyDiscovery`). The break state's primary trigger.
+    pub discovery_empty_streak: i64,
+    pub discovery_error: Option<String>,
+    pub stream_enabled: bool,
+    pub stream_shards: i64,
+    pub stream_shards_connected: i64,
+    /// The stream was handed over to REST-only polling (and is being re-probed).
+    pub stream_rest_only: bool,
+    pub books_total: i64,
+    pub books_stale: i64,
+    pub frames: u64,
+    pub delta_entries_applied: u64,
+    pub frames_unrecognized: u64,
+    /// Did the most recent REST call succeed? With the socket down too, this is what
+    /// separates a fallback from a network outage.
+    pub rest_ok: bool,
+    pub rest_failure_streak: i64,
+    /// Markets costed from the category table because the API stated nothing usable.
+    pub fee_fallback_markets: i64,
+    pub fee_unsupported_formula: i64,
+    pub markets_with_api_fee: i64,
+    pub telegram_circuit_open: bool,
+    pub alerts_sent: u64,
+    pub alerts_failed: u64,
+    pub alerts_cooldown_held: u64,
+    /// `scan.floors.default.taker` as an exact decimal string — the "net floor" the
+    /// opportunity table's note quotes. A string, because it is money.
+    pub net_floor_default_taker: String,
+}
+
+/// A [`RuntimeStatus`] plus the moment the daemon wrote it. The age is load-bearing: a
+/// status from ten minutes ago describes a daemon that is no longer talking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeStatusRecord {
+    pub updated_at: DateTime<Utc>,
+    pub status: RuntimeStatus,
+}
+
 /// Scan-loop telemetry for a day, summed over the hourly buckets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanTotals {
@@ -275,6 +407,12 @@ pub struct CycleStats {
     pub new_opportunities: i64,
     pub duration_ms: i64,
     pub failed: bool,
+    /// M7 funnel stage 1: constructions whose executable ask sum was below the payout,
+    /// counted *before* any cost filtering. See [`crate::detect::ScanCounters`].
+    pub gaps_detected: i64,
+    /// M7 funnel stage 3: of those, the ones still net-positive as a taker once the fee
+    /// curve and slippage were charged — before the configured net floor.
+    pub fee_survivors: i64,
 }
 
 // ---------------------------------------------------------------------------------
@@ -313,6 +451,58 @@ impl Store {
             source,
         })?;
         Self::from_connection(conn, ":memory:".to_string())
+    }
+
+    /// Open an **existing** database for reading only (M7 dashboard).
+    ///
+    /// Read-only by construction, not by convention: `SQLITE_OPEN_READ_ONLY` plus
+    /// `PRAGMA query_only` means the dashboard process cannot write a byte even if a
+    /// future edit asked it to, and no migration runs from here — a reader must never
+    /// change a schema the writer owns. WAL lets it read while the daemon writes.
+    ///
+    /// The file must already exist and already be migrated; both failures are the
+    /// operator's answer ("start the daemon first"), not something to paper over by
+    /// creating an empty database that would render as a healthy, empty soak.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let label = path.display().to_string();
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|source| StoreError::Sqlite {
+            path: label.clone(),
+            source,
+        })?;
+        let store = Self {
+            conn: Mutex::new(conn),
+            path: label,
+        };
+        store.exec_batch(
+            "PRAGMA query_only=1;
+             PRAGMA busy_timeout=3000;",
+        )?;
+        Ok(store)
+    }
+
+    /// Highest applied migration version, or 0 for a database with no migration table.
+    pub fn schema_version(&self) -> Result<i64> {
+        let conn = self.lock();
+        let has_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migrations'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| self.err(e))?;
+        if has_table == 0 {
+            return Ok(0);
+        }
+        conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM migrations",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| self.err(e))
     }
 
     fn from_connection(conn: Connection, path: String) -> Result<Self> {
@@ -503,8 +693,8 @@ impl Store {
             "INSERT INTO scan_stats (
                  hour_utc, cycles, errors, events_scanned, markets_scanned, books_fetched,
                  duration_ms_total, duration_ms_max, opportunities, new_opportunities,
-                 updated_at
-             ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9)
+                 updated_at, gaps_detected, fee_survivors
+             ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(hour_utc) DO UPDATE SET
                  cycles            = scan_stats.cycles + 1,
                  errors            = scan_stats.errors + excluded.errors,
@@ -515,6 +705,8 @@ impl Store {
                  duration_ms_max   = MAX(scan_stats.duration_ms_max, excluded.duration_ms_max),
                  opportunities     = scan_stats.opportunities + excluded.opportunities,
                  new_opportunities = scan_stats.new_opportunities + excluded.new_opportunities,
+                 gaps_detected     = scan_stats.gaps_detected + excluded.gaps_detected,
+                 fee_survivors     = scan_stats.fee_survivors + excluded.fee_survivors,
                  updated_at        = excluded.updated_at",
             params![
                 hour,
@@ -526,6 +718,8 @@ impl Store {
                 stats.opportunities,
                 stats.new_opportunities,
                 now_str(now),
+                stats.gaps_detected,
+                stats.fee_survivors,
             ],
         )
         .map_err(|e| self.err(e))?;
@@ -602,6 +796,191 @@ impl Store {
             },
         )
         .map_err(|e| self.err(e))
+    }
+
+    /// Republish the daemon's in-memory runtime state (M7). One row, upserted — cheap
+    /// enough to call every few seconds, and it never grows.
+    pub fn write_runtime_status(&self, status: &RuntimeStatus, now: DateTime<Utc>) -> Result<()> {
+        let payload = serde_json::to_string(status).unwrap_or_else(|_| "{}".to_string());
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO runtime_status (id, updated_at, payload) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at,
+                                           payload    = excluded.payload",
+            params![now_str(now), payload],
+        )
+        .map_err(|e| self.err(e))?;
+        Ok(())
+    }
+
+    /// The daemon's last published runtime state, with the moment it was written.
+    ///
+    /// `None` means the row has never been written — a daemon that has not started, or
+    /// one older than this build. Never invent a default: "we do not know" is a state the
+    /// dashboard has to render as such.
+    pub fn read_runtime_status(&self) -> Result<Option<RuntimeStatusRecord>> {
+        let conn = self.lock();
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT updated_at, payload FROM runtime_status WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(self.err(other)),
+            })?;
+        let Some((updated_at, payload)) = row else {
+            return Ok(None);
+        };
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at)
+            .map(|t| t.with_timezone(&Utc))
+            .map_err(|_| StoreError::Value {
+                column: "runtime_status.updated_at",
+                value: updated_at.clone(),
+            })?;
+        let status: RuntimeStatus =
+            serde_json::from_str(&payload).map_err(|_| StoreError::Value {
+                column: "runtime_status.payload",
+                value: payload,
+            })?;
+        Ok(Some(RuntimeStatusRecord { updated_at, status }))
+    }
+
+    /// Every opportunity detected at or after `from`, **newest first**.
+    ///
+    /// Ordering is the server's job (the design forbids parsing Decimal strings into JS
+    /// floats to sort them), and `limit` is a memory guard, not a page size: the caller
+    /// aggregates over the whole window.
+    pub fn opportunities_since(
+        &self,
+        from: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<DashboardRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, label, category, event_slug, event_title, fee_rate, payout,
+                        gross_gap, spread_cost, net_taker, net_maker, executable_size,
+                        capital_required, net_taker_total, net_maker_total, maker_only, status,
+                        detected_at, resolved_at, persistence_ms, detection_latency_ms,
+                        simulated_pnl_taker, simulated_pnl_maker
+                 FROM opportunities
+                 WHERE detected_at >= ?1
+                 ORDER BY detected_at DESC, id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| self.err(e))?;
+        let raw = stmt
+            .query_map(params![now_str(from), limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, i64>(16)? != 0,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, String>(18)?,
+                    row.get::<_, Option<String>>(19)?,
+                    row.get::<_, Option<i64>>(20)?,
+                    row.get::<_, Option<i64>>(21)?,
+                    row.get::<_, Option<String>>(22)?,
+                    row.get::<_, Option<String>>(23)?,
+                ))
+            })
+            .map_err(|e| self.err(e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| self.err(e))?;
+
+        raw.into_iter()
+            .map(|r| {
+                Ok(DashboardRow {
+                    id: r.0,
+                    kind: r.1,
+                    label: r.2,
+                    category: r.3,
+                    event_slug: r.4,
+                    event_title: r.5,
+                    fee_rate: parse_dec("fee_rate", &r.6)?,
+                    payout: parse_dec("payout", &r.7)?,
+                    gross_gap: parse_dec("gross_gap", &r.8)?,
+                    spread_cost: parse_opt_dec("spread_cost", r.9.as_deref())?,
+                    net_taker: parse_dec("net_taker", &r.10)?,
+                    net_maker: parse_opt_dec("net_maker", r.11.as_deref())?,
+                    executable_size: parse_dec("executable_size", &r.12)?,
+                    capital_required: parse_dec("capital_required", &r.13)?,
+                    net_taker_total: parse_dec("net_taker_total", &r.14)?,
+                    net_maker_total: parse_opt_dec("net_maker_total", r.15.as_deref())?,
+                    maker_only: r.16,
+                    status: r.17,
+                    detected_at: r.18,
+                    resolved_at: r.19,
+                    persistence_ms: r.20,
+                    detection_latency_ms: r.21,
+                    simulated_pnl_taker: parse_opt_dec("simulated_pnl_taker", r.22.as_deref())?,
+                    simulated_pnl_maker: parse_opt_dec("simulated_pnl_maker", r.23.as_deref())?,
+                })
+            })
+            .collect()
+    }
+
+    /// Scan telemetry summed over the hourly buckets at or after `from`.
+    ///
+    /// The buckets are hour-granular, so the window is rounded *out* to the containing
+    /// hour: the funnel's denominator can only ever be too generous, never too flattering.
+    pub fn scan_totals_since(&self, from: DateTime<Utc>) -> Result<WindowScanTotals> {
+        let hour = from.format("%Y-%m-%dT%H").to_string();
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COALESCE(SUM(cycles), 0), COALESCE(SUM(errors), 0), COUNT(*),
+                    COALESCE(SUM(gaps_detected), 0), COALESCE(SUM(fee_survivors), 0),
+                    COALESCE(SUM(opportunities), 0), COALESCE(SUM(new_opportunities), 0)
+             FROM scan_stats WHERE hour_utc >= ?1",
+            params![hour],
+            |row| {
+                Ok(WindowScanTotals {
+                    cycles: row.get(0)?,
+                    errors: row.get(1)?,
+                    buckets: row.get(2)?,
+                    gaps_detected: row.get(3)?,
+                    fee_survivors: row.get(4)?,
+                    opportunities: row.get(5)?,
+                    new_opportunities: row.get(6)?,
+                })
+            },
+        )
+        .map_err(|e| self.err(e))
+    }
+
+    /// The earliest hourly telemetry bucket (`YYYY-MM-DDTHH`), i.e. when this database
+    /// first saw a scan cycle.
+    ///
+    /// This, not the process start time, is the soak's day 1: the evidence window survives
+    /// restarts, and a daemon restarted this morning has not reset a five-day soak.
+    pub fn first_scan_hour(&self) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row("SELECT MIN(hour_utc) FROM scan_stats", [], |r| r.get(0))
+            .map_err(|e| self.err(e))
+    }
+
+    /// Total opportunity rows on disk — the rail's "store" line.
+    pub fn opportunity_row_count(&self) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM opportunities", [], |r| r.get(0))
+            .map_err(|e| self.err(e))
     }
 
     pub fn save_daily_summary(&self, day: NaiveDate, markdown: &str) -> Result<()> {
@@ -1000,7 +1379,30 @@ pub(crate) mod tests {
         let latest: i64 = conn
             .query_row("SELECT MAX(version) FROM migrations", [], |r| r.get(0))
             .expect("max");
-        assert_eq!(latest, 2);
+        assert_eq!(latest, DASHBOARD_MIN_SCHEMA);
+        // v3's `runtime_status` is a single-row table by constraint, and the two funnel
+        // counters default to 0 so an older bucket reads as "not measured", not as a zero
+        // that means something.
+        let single_row: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'runtime_status'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("pragma");
+        assert_eq!(single_row, 1);
+        for column in ["gaps_detected", "fee_survivors"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('scan_stats')
+                     WHERE name = ?1 AND \"notnull\" = 1 AND dflt_value = '0'",
+                    params![column],
+                    |r| r.get(0),
+                )
+                .expect("pragma");
+            assert_eq!(n, 1, "{column} must be NOT NULL DEFAULT 0");
+        }
         // The v2 column exists exactly once and is nullable.
         let columns: i64 = conn
             .query_row(

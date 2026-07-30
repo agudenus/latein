@@ -901,6 +901,16 @@ impl BookStore {
         self.lock().len()
     }
 
+    /// How many held books are explicitly invalidated (M7 dashboard).
+    ///
+    /// Explicitly is the operative word: this counts books a reconnect, an out-of-order
+    /// delta or a contradictory hash marked unverified. A book nobody has pushed an update
+    /// for is *quiet*, not stale, and is deliberately not counted here — surfacing silence
+    /// as a fault is the exact mistake M6.1 removed.
+    pub fn stale_count(&self) -> usize {
+        self.lock().values().filter(|b| b.stale).count()
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -1463,6 +1473,13 @@ impl StreamManager {
 
     pub fn shard_tokens(&self) -> Vec<Vec<TokenId>> {
         self.shards.iter().map(|s| s.tokens.clone()).collect()
+    }
+
+    /// How many shards the universe is spread across — the denominator of the dashboard's
+    /// `n/m connected`. Cheap, unlike [`StreamManager::shard_tokens`], which clones every
+    /// token list.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
     }
 
     /// Next debounced batch of touched tokens, or `None` once the pool has stopped.

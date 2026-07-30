@@ -7,6 +7,7 @@ mod alert;
 mod clob;
 mod config;
 mod costs;
+mod dashboard;
 mod detect;
 mod dryrun;
 mod gamma;
@@ -83,6 +84,12 @@ enum Command {
         #[arg(long, value_name = "N")]
         max_cycles: Option<u64>,
     },
+    /// Serve the read-only soak dashboard over HTTP.
+    ///
+    /// A separate process from `run`: it opens the same SQLite read-only, has GET routes
+    /// only, and shares no state with the daemon. It cannot affect a running scan, and
+    /// there is nothing on the page to control — the binary has no execution path.
+    Dashboard,
     /// Generate the daily summary for a UTC date (default: today).
     Report {
         /// UTC date as YYYY-MM-DD.
@@ -120,6 +127,7 @@ async fn main() -> Result<()> {
             }
             dryrun::run(cfg, max_cycles).await
         }
+        Command::Dashboard => dashboard::serve(cfg).await,
         Command::Report { date, no_send } => {
             let day = match date {
                 Some(raw) => Some(
@@ -479,10 +487,14 @@ mod tests {
             }
         ));
 
+        let cli = Cli::try_parse_from(["polyarb", "dashboard"]).expect("dashboard");
+        assert!(matches!(cli.command, Command::Dashboard));
+
         let cli = Cli::try_parse_from(["polyarb", "report", "--date", "2026-07-26", "--no-send"])
             .expect("report");
         match cli.command {
-            Command::Report { date, no_send } => {
+            Command::Dashboard => dashboard::serve(cfg).await,
+        Command::Report { date, no_send } => {
                 assert_eq!(date.as_deref(), Some("2026-07-26"));
                 assert!(no_send);
             }

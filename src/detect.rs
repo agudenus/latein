@@ -50,6 +50,27 @@ pub struct Detector<'a> {
     risk: RiskLimits,
 }
 
+/// The two funnel stages that happen *inside* detection and leave no row behind (M7).
+///
+/// Deliberately two counters and no more. Everything after them is an `Opportunity` and is
+/// therefore already measured; everything before them (a mid-price "gap" that a naive
+/// scanner would report) this build never computes at all, so counting it here would mean
+/// inventing a number rather than reading one — see the dashboard's funnel notes.
+///
+/// Counts are per *construction evaluated*, per detection pass: a gap that persists across
+/// twelve passes is twelve here and one row in `opportunities`. The dashboard says so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanCounters {
+    /// Constructions whose executable ask sum was under the payout — the raw gap, on the
+    /// side we would actually lift, before any cost was charged.
+    pub gaps_detected: u64,
+    /// Of those, the ones whose depth-walked taker net was still above zero once slippage
+    /// and the fee curve were paid — *before* the configured net floor. This is the
+    /// "survived the fee curve" stage, and it is measured at the smallest tradeable size,
+    /// which is where a gap is at its most flattering.
+    pub fee_survivors: u64,
+}
+
 /// One prospective buy leg, resolved to a book.
 struct CandidateLeg<'a> {
     market: &'a TrackedMarket,
@@ -79,12 +100,22 @@ impl<'a> Detector<'a> {
     /// Run all three detectors across the universe. Results are sorted by dollar profit,
     /// best first.
     pub fn scan(&self, universe: &Universe, books: &BookMap) -> Vec<Opportunity> {
+        self.scan_counted(universe, books).0
+    }
+
+    /// [`Detector::scan`], plus the pre-row funnel counters (M7).
+    pub fn scan_counted(
+        &self,
+        universe: &Universe,
+        books: &BookMap,
+    ) -> (Vec<Opportunity>, ScanCounters) {
         let mut out = Vec::new();
+        let mut counters = ScanCounters::default();
         for event in &universe.events {
             if !self.cfg.category_included(&event.category) {
                 continue;
             }
-            self.scan_event(event, books, &mut out);
+            self.scan_event(event, books, &mut out, &mut counters);
         }
         out.sort_by(|a, b| {
             b.net_taker_total
@@ -96,10 +127,16 @@ impl<'a> Detector<'a> {
                 })
                 .then_with(|| a.event_slug.cmp(&b.event_slug))
         });
-        out
+        (out, counters)
     }
 
-    fn scan_event(&self, event: &TrackedEvent, books: &BookMap, out: &mut Vec<Opportunity>) {
+    fn scan_event(
+        &self,
+        event: &TrackedEvent,
+        books: &BookMap,
+        out: &mut Vec<Opportunity>,
+        counters: &mut ScanCounters,
+    ) {
         // Single-condition YES/NO applies to every binary market, including the
         // constituents of a NegRisk event — each is its own condition.
         for market in &event.markets {
@@ -129,6 +166,7 @@ impl<'a> Detector<'a> {
                 // A single condition is self-contained: YES + NO of the same market sum to
                 // $1 at resolution no matter what else the event lists.
                 Coverage::Complete,
+                counters,
             ) {
                 out.push(op);
             }
@@ -168,6 +206,7 @@ impl<'a> Detector<'a> {
                 Decimal::ONE,
                 &legs,
                 coverage,
+                counters,
             ) {
                 out.push(op);
             }
@@ -199,6 +238,7 @@ impl<'a> Detector<'a> {
                 payout,
                 &legs,
                 coverage,
+                counters,
             ) {
                 out.push(op);
             }
@@ -238,6 +278,7 @@ impl<'a> Detector<'a> {
         payout: Decimal,
         legs: &[CandidateLeg<'_>],
         coverage: Coverage,
+        counters: &mut ScanCounters,
     ) -> Option<Opportunity> {
         let books: Vec<&OrderBook> = legs.iter().map(|l| l.book).collect();
         let best_asks: Option<Vec<Decimal>> = books.iter().map(|b| b.best_ask()).collect();
@@ -248,6 +289,9 @@ impl<'a> Detector<'a> {
         if sum_ask >= payout {
             return None;
         }
+        // Funnel stage 1, counted here and only here: every construction that showed a gap
+        // on the executable side, before a single cost was charged against it.
+        counters.gaps_detected = counters.gaps_detected.saturating_add(1);
 
         let best_bids: Vec<Option<Decimal>> = books.iter().map(|b| b.best_bid()).collect();
         // One rate per leg, each preferring the market's own API-stated rate over the
@@ -270,6 +314,7 @@ impl<'a> Detector<'a> {
             payout,
             &fee_rates,
             floor.taker,
+            counters,
         ) {
             return Some(self.build(
                 event,
@@ -317,6 +362,7 @@ impl<'a> Detector<'a> {
         payout: Decimal,
         fee_rates: &[Decimal],
         floor: Decimal,
+        counters: &mut ScanCounters,
     ) -> Option<SizedTaker> {
         let min_size = self.cfg.scan.min_size_shares;
         let max_size = books
@@ -343,6 +389,13 @@ impl<'a> Detector<'a> {
             (sized.cost.net_taker > floor && self.risk.allows_capital(sized.cost.capital_required))
                 .then_some(sized)
         };
+
+        // Funnel stage 3, measured at the smallest tradeable size — where the fee curve is
+        // at its kindest, so this is the most generous honest reading of "survived fees".
+        // It is charged slippage and the taker fee but not yet the configured net floor.
+        if eval(min_size).is_some_and(|s| s.cost.net_taker > Decimal::ZERO) {
+            counters.fee_survivors = counters.fee_survivors.saturating_add(1);
+        }
 
         // Not viable even at the smallest size we would bother trading.
         feasible(min_size)?;
@@ -605,6 +658,16 @@ fn leg_prices(
 pub fn scan(cfg: &Config, universe: &Universe, books: &BookMap) -> Vec<Opportunity> {
     let fees = FeeModel::new(cfg.fees.clone());
     Detector::new(cfg, &fees).scan(universe, books)
+}
+
+/// [`scan`], plus the funnel counters the daemon folds into `scan_stats` (M7).
+pub fn scan_counted(
+    cfg: &Config,
+    universe: &Universe,
+    books: &BookMap,
+) -> (Vec<Opportunity>, ScanCounters) {
+    let fees = FeeModel::new(cfg.fees.clone());
+    Detector::new(cfg, &fees).scan_counted(universe, books)
 }
 
 #[cfg(test)]

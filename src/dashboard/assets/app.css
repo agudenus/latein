@@ -1,0 +1,743 @@
+/* polyarb soak monitor — the component layer on top of Nocturne.
+ *
+ * Every colour, radius and space here resolves through a Nocturne variable wherever
+ * Nocturne carries the role. The handful of values Nocturne has no token for are declared
+ * once below as `--pa-*` with the reason they exist, rather than being sprinkled as raw
+ * hex through the rules:
+ *
+ *   --pa-header / --pa-rail-hover  the header bar and table row hover, two ground steps
+ *                                  between --color-bg and --color-surface.
+ *   --pa-ok / --pa-bad             the two semantic colours. Nocturne is a mono palette
+ *                                  and ships no success/danger role; these were derived in
+ *                                  OKLCH at the accent's own lightness and chroma,
+ *                                  hue-rotated, so they sit at the same visual weight as
+ *                                  --color-accent. They are used ONLY for verdicts and
+ *                                  cost survival, and never as a large fill.
+ *   --pa-break-*                   the break state's ground, muted text and card edge.
+ *
+ * Nocturne rules kept: accent as a line/mark and never a flood, outlined buttons,
+ * flush-left asymmetric layout, headings never past weight 500, the 2px accent
+ * :focus-visible ring, no pure black or white.
+ */
+
+:root {
+  --pa-header: #1a1c2b;
+  --pa-row-hover: #1c1e2c;
+  --pa-hairline: rgba(233, 233, 237, 0.055);
+  --pa-hairline-soft: rgba(233, 233, 237, 0.05);
+  --pa-hairline-faint: rgba(233, 233, 237, 0.045);
+  --pa-rule: rgba(233, 233, 237, 0.1);
+  --pa-col-rule: rgba(233, 233, 237, 0.08);
+  --pa-ok: #63c99a;
+  --pa-bad: #e0706b;
+  --pa-ok-tint: rgba(99, 201, 154, 0.14);
+  --pa-bad-tint: rgba(224, 112, 107, 0.14);
+  --pa-accent-tint: rgba(145, 132, 217, 0.16);
+  --pa-break-bg: #2a1519;
+  --pa-break-muted: #c08e8b;
+  --pa-break-edge: #4d3a3d;
+  --pa-rail-w: 336px;
+}
+
+html,
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Columns must not jitter as values tick. This is not optional. */
+[data-key] {
+  font-variant-numeric: tabular-nums;
+}
+
+.kpil {
+  font: 500 10.5px/1 var(--font-heading);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--color-neutral-500);
+}
+
+.muted {
+  color: var(--color-neutral-500);
+}
+.dim {
+  color: var(--color-neutral-700);
+}
+.good {
+  color: var(--pa-ok);
+}
+.bad {
+  color: var(--pa-bad);
+}
+.spacer {
+  flex: 1;
+}
+.r {
+  text-align: right;
+}
+
+a {
+  color: var(--color-accent-400);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--color-accent-300);
+}
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* ── header bar ──────────────────────────────────────────────────────────────── */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 52px;
+  padding: 0 var(--space-8);
+  background: var(--pa-header);
+  box-shadow: inset 0 -1px 0 var(--pa-rule);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--color-accent);
+}
+.wordmark {
+  font: 500 13.5px/1 var(--font-heading);
+}
+.brand-sub {
+  font: 400 11px/1 var(--font-body);
+  color: var(--color-neutral-600);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border-radius: 99px;
+  font: 500 10.5px/1 var(--font-heading);
+  letter-spacing: 0.06em;
+}
+/* The standing assurance that no order path is live. Present on every screen state. */
+.pill-mode {
+  color: var(--color-accent-400);
+  box-shadow: inset 0 0 0 1px var(--color-accent-700);
+}
+.pill-stream {
+  font-size: 11px;
+  letter-spacing: 0;
+  color: var(--pa-ok);
+  box-shadow: inset 0 0 0 1px rgba(99, 201, 154, 0.35);
+}
+.pill-stream[data-state='rest_fallback'],
+.pill-stream[data-state='rest_only'] {
+  color: var(--color-accent-400);
+  box-shadow: inset 0 0 0 1px var(--color-accent-700);
+}
+.pill-stream[data-state='rest_fallback'] .dot,
+.pill-stream[data-state='rest_only'] .dot {
+  background: var(--color-accent-400);
+  animation: none;
+}
+.pill-blind {
+  background: var(--pa-bad);
+  color: var(--pa-break-bg);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 99px;
+  background: var(--pa-ok);
+  flex: none;
+}
+.pill-stream .dot {
+  animation: dot 2s infinite;
+}
+@keyframes dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+/* The only animation in the design, and it goes when asked. */
+@media (prefers-reduced-motion: reduce) {
+  .pill-stream .dot,
+  .flash {
+    animation: none !important;
+  }
+}
+
+.meta {
+  display: flex;
+  gap: 20px;
+  font: 400 11.5px/1 var(--font-body);
+  color: var(--color-neutral-500);
+}
+.meta b {
+  font-weight: 400;
+  color: var(--color-text);
+}
+.clock {
+  color: var(--color-text);
+}
+
+/* ── shell ───────────────────────────────────────────────────────────────────── */
+
+.shell {
+  display: grid;
+  grid-template-columns: 1fr var(--pa-rail-w);
+}
+.col-main {
+  min-width: 0;
+  padding: var(--space-8);
+  display: flex;
+  flex-direction: column;
+  gap: 17px;
+  /* The divider is drawn by the column, not as a border on the rail. */
+  box-shadow: inset -1px 0 0 var(--pa-col-rule);
+}
+.rail {
+  padding: var(--space-8) 20px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+  min-width: 0;
+}
+
+.panel {
+  background: var(--color-surface);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.panel-title {
+  font: 500 13px/1 var(--font-heading);
+  letter-spacing: 0;
+  margin: 0;
+}
+.panel-note {
+  font: 400 11.5px/1.4 var(--font-body);
+  color: var(--color-neutral-600);
+}
+
+/* ── hero ────────────────────────────────────────────────────────────────────── */
+
+.hero {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  padding: 18px 20px;
+  flex-wrap: wrap;
+}
+.hero-lead {
+  flex: 1;
+  min-width: 260px;
+}
+.hero-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  margin-top: 12px;
+}
+.hero-metric {
+  font: 500 42px/1 var(--font-heading);
+  color: var(--pa-ok);
+}
+.hero-qual {
+  font: 400 12.5px/1.4 var(--font-body);
+  color: var(--color-neutral-500);
+  padding-bottom: 4px;
+  max-width: 330px;
+  text-wrap: pretty;
+}
+.vrule {
+  width: 1px;
+  align-self: stretch;
+  background: var(--pa-rule);
+}
+.stat-v {
+  font: 500 26px/1 var(--font-heading);
+  margin-top: 9px;
+}
+.stat-v .unit {
+  font-size: 14px;
+  color: var(--color-neutral-500);
+}
+.stat-n {
+  font: 400 11px/1.3 var(--font-body);
+  color: var(--color-neutral-600);
+  margin-top: 7px;
+}
+
+/* ── funnel ──────────────────────────────────────────────────────────────────── */
+
+.funnel {
+  padding: 17px 20px 19px;
+}
+.funnel-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-top: 16px;
+}
+.frow {
+  display: grid;
+  grid-template-columns: 210px 1fr 88px 62px;
+  align-items: center;
+  gap: 14px;
+}
+.flabel {
+  font: 400 12px/1.3 var(--font-body);
+  color: var(--color-neutral-300);
+}
+.ftrack {
+  height: 18px;
+  border-radius: 3px;
+  background: var(--pa-hairline);
+  overflow: hidden;
+}
+.fbar {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--color-accent);
+}
+/* The first row is the 100% baseline, not an achievement. */
+.fbar-base {
+  opacity: 0.42;
+}
+.fbar-good {
+  background: var(--pa-ok);
+}
+.fnone {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding-left: 8px;
+  font: 400 10.5px/1 var(--font-body);
+  color: var(--color-neutral-700);
+  letter-spacing: 0.04em;
+}
+.frow-dark .flabel {
+  color: var(--color-neutral-600);
+}
+.fcount {
+  font: 500 12.5px/1 var(--font-heading);
+  text-align: right;
+}
+.fpct {
+  font: 400 11.5px/1 var(--font-body);
+  color: var(--color-neutral-600);
+  text-align: right;
+}
+.footnote {
+  font: 400 11.5px/1.5 var(--font-body);
+  color: var(--color-neutral-600);
+  margin: 15px 0 0;
+  max-width: 720px;
+  text-wrap: pretty;
+}
+.footnote b {
+  font-weight: 400;
+  color: var(--color-neutral-300);
+}
+.footnote.small {
+  font-size: 10.5px;
+  margin-top: 10px;
+}
+
+/* ── opportunity table ───────────────────────────────────────────────────────── */
+
+.opps .panel-head {
+  margin-bottom: 10px;
+}
+.thead,
+.trow {
+  display: grid;
+  grid-template-columns: 1fr 104px 74px 74px 78px 78px 84px 96px;
+  align-items: center;
+}
+.thead {
+  padding: 0 12px 7px;
+  box-shadow: inset 0 -1px 0 var(--pa-rule);
+  font: 500 10.5px/1 var(--font-heading);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--color-neutral-600);
+}
+.trow {
+  padding: 9px 12px;
+  box-shadow: inset 0 -1px 0 var(--pa-hairline);
+  font: 400 12.5px/1.25 var(--font-body);
+}
+.trow:hover {
+  background: var(--pa-row-hover);
+}
+.cell-event {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 14px;
+}
+.det {
+  font: 500 11px/1 var(--font-heading);
+  color: var(--color-neutral-500);
+}
+.det-negrisk-yes {
+  color: var(--color-accent-400);
+}
+.det-negrisk-no {
+  color: var(--color-accent-2-500);
+}
+/* Two prices disagreeing is not a locked profit; the label rides with the row. */
+.lbl {
+  font: 500 9.5px/1 var(--font-heading);
+  letter-spacing: 0.04em;
+  color: var(--color-neutral-600);
+}
+.lbl-relvalue {
+  color: var(--color-accent-2-500);
+}
+.mk {
+  font-weight: 500;
+  color: var(--pa-ok);
+}
+.tk {
+  font-weight: 500;
+}
+.tk.pos {
+  color: var(--color-neutral-300);
+}
+.tk.neg {
+  color: var(--pa-bad);
+}
+.size {
+  color: var(--color-neutral-300);
+}
+.verdict {
+  display: inline-block;
+  padding: 3px 7px;
+  border-radius: var(--radius-sm);
+  font: 500 10px/1 var(--font-heading);
+  letter-spacing: 0.03em;
+}
+.v-filled_simulated {
+  color: var(--pa-ok);
+  background: var(--pa-ok-tint);
+}
+.v-vanished,
+.v-unresolved,
+.v-untracked {
+  color: var(--pa-bad);
+  background: var(--pa-bad-tint);
+}
+.v-open {
+  color: var(--color-accent-400);
+  background: var(--pa-accent-tint);
+}
+.empty {
+  padding: 16px 12px;
+  font: 400 12px/1.5 var(--font-body);
+  color: var(--color-neutral-600);
+  max-width: 640px;
+}
+
+/* One-shot tint on a changed row: no opacity or transform on the row itself, so nothing
+   moves and nothing re-lays-out. */
+@keyframes flash {
+  from {
+    background: var(--pa-accent-tint);
+  }
+  to {
+    background: transparent;
+  }
+}
+.flash {
+  animation: flash 400ms ease-out;
+}
+
+/* ── rail ────────────────────────────────────────────────────────────────────── */
+
+.rail-rows {
+  margin-top: 12px;
+}
+.prow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 0;
+  box-shadow: inset 0 -1px 0 var(--pa-hairline-soft);
+  font: 400 11.5px/1.35 var(--font-body);
+}
+.dot-ok {
+  background: var(--pa-ok);
+}
+.dot-warn {
+  background: var(--color-accent-400);
+}
+.pname {
+  flex: 1;
+  color: var(--color-neutral-300);
+}
+.pval {
+  color: var(--color-neutral-500);
+  text-align: right;
+}
+
+.crow {
+  display: grid;
+  grid-template-columns: 1fr 46px 40px 60px;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 0;
+  box-shadow: inset 0 -1px 0 var(--pa-hairline-soft);
+  font: 400 11.5px/1.3 var(--font-body);
+}
+.cname {
+  color: var(--color-neutral-300);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.crate {
+  color: var(--color-neutral-600);
+  text-align: right;
+}
+.ccount {
+  text-align: right;
+}
+.cbps {
+  color: var(--color-neutral-500);
+  text-align: right;
+}
+
+.lrow {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0;
+  box-shadow: inset 0 -1px 0 var(--pa-hairline-faint);
+  font: 400 10.5px/1.4 var(--font-body);
+}
+.ltime {
+  color: var(--color-neutral-700);
+  flex: none;
+}
+.lbody {
+  min-width: 0;
+}
+.lkind {
+  font-weight: 500;
+}
+.lk-detect {
+  color: var(--color-text);
+}
+.lk-repoll {
+  color: var(--color-accent-400);
+}
+.lk-stream,
+.lk-fees {
+  color: var(--color-neutral-500);
+}
+.lk-discovery {
+  color: var(--pa-bad);
+}
+.lsubj {
+  color: var(--color-neutral-300);
+}
+.ldetail {
+  color: var(--color-neutral-600);
+}
+
+/* ── 2d break state ──────────────────────────────────────────────────────────── */
+
+.topbar-break {
+  background: var(--pa-break-bg);
+  box-shadow: inset 0 -1px 0 rgba(224, 112, 107, 0.45);
+}
+.topbar-break .mark {
+  background: var(--pa-bad);
+}
+.topbar-break .brand-sub,
+.topbar-break .meta {
+  color: var(--pa-break-muted);
+}
+
+.break {
+  padding: 40px 44px 44px;
+  background: radial-gradient(120% 100% at 50% 0%, var(--pa-break-bg) 0%, var(--color-bg) 70%);
+  min-height: calc(100vh - 52px);
+}
+.break-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  font: 500 11px/1 var(--font-heading);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--pa-bad);
+}
+.break-eyebrow .icon {
+  flex: none;
+}
+.break-head {
+  font: 500 40px/1.15 var(--font-heading);
+  letter-spacing: -0.015em;
+  margin: 16px 0 0;
+  max-width: 960px;
+  text-wrap: pretty;
+}
+.break-body {
+  font: 400 14px/1.6 var(--font-body);
+  color: var(--color-neutral-500);
+  margin: 14px 0 0;
+  max-width: 740px;
+  text-wrap: pretty;
+}
+.break-body code {
+  color: var(--color-neutral-300);
+  font-family: inherit;
+}
+.bcards {
+  display: flex;
+  gap: 12px;
+  margin-top: 26px;
+  flex-wrap: wrap;
+}
+.bcard {
+  background: var(--color-surface);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  min-width: 190px;
+  box-shadow: var(--shadow-sm);
+}
+.bcard-first {
+  box-shadow: 0 0 0 1px var(--pa-break-edge);
+}
+.bcard-v {
+  font: 500 24px/1 var(--font-heading);
+  margin-top: 9px;
+}
+.bcard-v.bad {
+  color: var(--pa-bad);
+}
+.bcard-sfx {
+  font-size: 13px;
+  color: var(--color-neutral-500);
+}
+.bcard-n {
+  font: 400 11px/1.3 var(--font-body);
+  color: var(--color-neutral-600);
+  margin-top: 6px;
+}
+.blog {
+  margin-top: 26px;
+  background: var(--pa-header);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-sm);
+  font: 400 11.5px/1.9 var(--font-body);
+  color: var(--color-neutral-500);
+  overflow-x: auto;
+}
+.break-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 24px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+/* Outlined, never filled — and both of these are navigation, not control. */
+.btn-outline {
+  padding: 9px 16px;
+  border-radius: var(--radius-md);
+  font: 500 12.5px/1 var(--font-heading);
+  color: var(--color-text);
+  box-shadow: inset 0 0 0 1px var(--color-accent);
+}
+.btn-outline:hover {
+  background: rgba(145, 132, 217, 0.14);
+  color: var(--color-text);
+}
+.btn-outline:active {
+  color: var(--color-accent-400);
+}
+.btn-ghost {
+  padding: 9px 16px;
+  border-radius: var(--radius-md);
+  font: 500 12.5px/1 var(--font-heading);
+  color: var(--color-neutral-500);
+}
+.btn-ghost:hover {
+  color: var(--color-text);
+}
+.break-note {
+  font: 400 11.5px/1.4 var(--font-body);
+  color: var(--color-neutral-600);
+}
+
+/* ── responsive ──────────────────────────────────────────────────────────────── */
+
+@media (max-width: 1279px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  .col-main {
+    box-shadow: none;
+  }
+  .rail {
+    box-shadow: inset 0 1px 0 var(--pa-col-rule);
+  }
+  .thead,
+  .trow {
+    grid-template-columns: 1fr 92px 68px 68px 72px 72px 78px 88px;
+  }
+}
+@media (max-width: 900px) {
+  .topbar {
+    height: auto;
+    flex-wrap: wrap;
+    padding: 10px var(--space-8);
+  }
+  .frow {
+    grid-template-columns: 150px 1fr 68px 54px;
+  }
+  .opps {
+    overflow-x: auto;
+  }
+  .thead,
+  .trow {
+    min-width: 860px;
+  }
+  .break {
+    padding: 26px 20px 32px;
+  }
+  .break-head {
+    font-size: 28px;
+  }
+}

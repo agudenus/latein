@@ -66,6 +66,10 @@ pub struct Config {
     /// M3 on-disk locations for the database, the JSONL event log and the reports.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// M7 read-only web dashboard (`polyarb dashboard`). A separate process from the
+    /// daemon, and one that opens the same SQLite read-only.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
     /// Category → taker fee rate. Verified against docs.polymarket.com 2026-07; kept in
     /// config because the protocol can change them.
     #[serde(default = "default_fee_rates")]
@@ -408,6 +412,55 @@ pub struct StorageConfig {
     pub report_dir: String,
 }
 
+/// M7 — the read-only soak dashboard.
+///
+/// There is nothing to configure about *what* it may do: the dashboard opens the database
+/// with `SQLITE_OPEN_READ_ONLY`, serves `GET` routes only, and shares no state with the
+/// daemon. These knobs are address, cadence and window — nothing here can widen it into a
+/// control surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardConfig {
+    /// Listen address. Loopback by default, deliberately: this page shows a soak's whole
+    /// evidence trail and has no authentication. Put it behind an SSH tunnel or a reverse
+    /// proxy before binding anything routable.
+    pub bind: String,
+    /// How often the page re-fetches `/api/state`. The design asks for 2–5 s.
+    pub poll_interval_ms: u64,
+    /// Width of the evidence window the funnel, the KPIs and the category table cover.
+    pub window_hours: u64,
+    /// Rows in the opportunity table. Not a page size — there is no paging; it is the cap
+    /// on how much of the newest-first feed is rendered.
+    pub max_rows: usize,
+    /// Planned soak length, for the "day n of m" eyebrow. Evidence-gathering runs for a
+    /// fixed window and the header says how far through it is.
+    pub soak_days: u32,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:8080".to_string(),
+            poll_interval_ms: 3_000,
+            window_hours: 24,
+            max_rows: 40,
+            soak_days: 7,
+        }
+    }
+}
+
+impl DashboardConfig {
+    /// The parsed listen address.
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, ConfigError> {
+        self.bind.trim().parse().map_err(|_| {
+            ConfigError::Invalid(format!(
+                "dashboard.bind must be an address:port (got {:?}); e.g. \"127.0.0.1:8080\"",
+                self.bind
+            ))
+        })
+    }
+}
+
 fn default_mode() -> String {
     "dry-run".to_string()
 }
@@ -604,6 +657,7 @@ impl Default for Config {
             stream: StreamConfig::default(),
             alerts: AlertConfig::default(),
             storage: StorageConfig::default(),
+            dashboard: DashboardConfig::default(),
             fees: default_fee_rates(),
         }
     }
@@ -869,6 +923,37 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "storage.database_path, storage.log_dir and storage.report_dir must be set".into(),
+            ));
+        }
+
+        // ---- M7 dashboard ------------------------------------------------------------
+        self.dashboard.socket_addr()?;
+        // A poll faster than this is a busy loop against SQLite for a page whose slowest
+        // input (the universe refresh) moves every ten minutes.
+        if self.dashboard.poll_interval_ms < 250 {
+            return Err(ConfigError::Invalid(format!(
+                "dashboard.poll_interval_ms must be >= 250 (got {}); the design asks for \
+                 2000–5000",
+                self.dashboard.poll_interval_ms
+            )));
+        }
+        if self.dashboard.window_hours == 0 {
+            return Err(ConfigError::Invalid(
+                "dashboard.window_hours must be > 0 (it is the evidence window the funnel \
+                 and the KPIs cover)"
+                    .into(),
+            ));
+        }
+        if self.dashboard.max_rows == 0 {
+            return Err(ConfigError::Invalid(
+                "dashboard.max_rows must be > 0".into(),
+            ));
+        }
+        if self.dashboard.soak_days == 0 {
+            return Err(ConfigError::Invalid(
+                "dashboard.soak_days must be > 0 (it is the denominator of \"soak day n of \
+                 m\")"
+                    .into(),
             ));
         }
         Ok(())
