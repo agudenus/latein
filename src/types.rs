@@ -49,9 +49,12 @@ impl Category {
 
     /// Map free-form Gamma tag/category text onto a canonical fee category.
     ///
-    /// TODO(verify-live): the alias table is inferred from Polymarket's public taxonomy;
-    /// confirm the exact tag vocabulary against live `/events` payloads before relying on
-    /// anything other than the `other` fallback.
+    /// TODO(verify-live): the alias table is inferred from Polymarket's public taxonomy.
+    /// The live `/events/keyset` capture (2026-07-30) confirms the *shape* — `tags[]` of
+    /// `{label, slug}`, e.g. `{"label":"Politics","slug":"politics"}` — but two events are
+    /// not the whole vocabulary, so anything beyond the `other` fallback is still a guess.
+    /// Since that capture the fee rate no longer depends on this mapping wherever Gamma
+    /// states one per market (see [`MarketFees::api_rate`]); the floors still do.
     pub fn from_text(text: &str) -> Option<Self> {
         let t = text.trim().to_ascii_lowercase();
         let canonical = match t.as_str() {
@@ -232,6 +235,74 @@ impl OrderBook {
     }
 }
 
+/// Per-market fee data exactly as Gamma reports it.
+///
+/// Verified against the live `GET /events/keyset` response (2026-07-30): every market
+/// object carries `feesEnabled` and `feeType`, plus a `feeSchedule`
+/// `{exponent, rate, takerOnly, rebateRate}` whenever fees are on. The legacy `/events`
+/// payload carries none of it, so every field is optional and "absent" means "the API said
+/// nothing — ask the category table".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketFees {
+    /// `feesEnabled`. `Some(false)` is an explicit "this market is fee-free".
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// `feeType`, e.g. `"politics_fees"`. Informational: the rate is what we cost with.
+    #[serde(default)]
+    pub fee_type: Option<String>,
+    /// `feeSchedule.rate` — the `rate` of `rate · p · (1 − p)`.
+    #[serde(default)]
+    pub rate: Option<Decimal>,
+    /// `feeSchedule.exponent`. `1` is the documented curve we implement; anything else is
+    /// a formula this build does not know, and is never guessed at.
+    #[serde(default)]
+    pub exponent: Option<Decimal>,
+    /// `feeSchedule.takerOnly`. Our cost model already charges takers only; a `false` here
+    /// would mean makers pay too, which is worth surfacing rather than assuming away.
+    #[serde(default)]
+    pub taker_only: Option<bool>,
+    /// `feeSchedule.rebateRate` — maker rebate share. Captured for Phase B; unused today.
+    #[serde(default)]
+    pub rebate_rate: Option<Decimal>,
+}
+
+impl MarketFees {
+    /// True when Gamma described a fee curve with an exponent other than the documented
+    /// `1`. The formula is then unknown to this build, so the API rate must NOT be used.
+    pub fn exponent_unsupported(&self) -> bool {
+        self.enabled == Some(true)
+            && self.rate.is_some()
+            && self.exponent.is_some_and(|e| e != Decimal::ONE)
+    }
+
+    /// The taker fee rate the API states for this market, or `None` when the category
+    /// table has to decide.
+    ///
+    /// Precedence, deliberately conservative — an API rate is only used when the API said
+    /// something we can price exactly:
+    ///
+    /// * `feesEnabled = false` → `Some(0)`. Gamma says this market charges no taker fee
+    ///   (observed on pre-deployment markets, and matching the documented fee-free tiers).
+    /// * `feesEnabled = true` with a `rate` and `exponent` 1 (or absent, which is the
+    ///   documented default curve) → `Some(rate)`.
+    /// * `feesEnabled = true` with an exponent we do not implement → `None`: the category
+    ///   table is used instead, and discovery counts it (never silently mispriced).
+    /// * `feesEnabled = true` with no `rate` → `None`.
+    /// * fields absent altogether (the legacy `/events` shape) → `None`.
+    pub fn api_rate(&self) -> Option<Decimal> {
+        match self.enabled {
+            Some(false) => Some(Decimal::ZERO),
+            Some(true) => {
+                if self.exponent_unsupported() {
+                    return None;
+                }
+                self.rate.filter(|r| *r >= Decimal::ZERO)
+            }
+            None => None,
+        }
+    }
+}
+
 /// A tracked market: one binary condition with exactly two outcome tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackedMarket {
@@ -240,6 +311,28 @@ pub struct TrackedMarket {
     /// Outcome labels, index-aligned with `token_ids` (Polymarket convention: `["Yes","No"]`).
     pub outcomes: [String; 2],
     pub token_ids: [TokenId; 2],
+    /// What Gamma says about this market's fees. Empty for the legacy endpoint.
+    #[serde(default)]
+    pub fees: MarketFees,
+    /// Order-book constraints Gamma publishes per market. Captured for Phase B execution
+    /// (tick-size rounding, minimum order size) and for the liquidity-reward qualification
+    /// parameters; nothing in Phase A reads them.
+    #[serde(default)]
+    pub trading: MarketTrading,
+}
+
+/// `orderPriceMinTickSize` / `orderMinSize` / `rewardsMinSize` / `rewardsMaxSpread`, as
+/// published on every market object of the live `/events/keyset` response (2026-07-30).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketTrading {
+    #[serde(default)]
+    pub min_tick_size: Option<Decimal>,
+    #[serde(default)]
+    pub min_order_size: Option<Decimal>,
+    #[serde(default)]
+    pub rewards_min_size: Option<Decimal>,
+    #[serde(default)]
+    pub rewards_max_spread: Option<Decimal>,
 }
 
 impl TrackedMarket {
@@ -419,6 +512,12 @@ pub struct Leg {
     pub size: Decimal,
     /// Total shares resting on the ask side.
     pub ask_depth: Decimal,
+    /// The taker fee rate this leg was costed at. Legs of one event normally share it
+    /// (they share the event's `feeType`), but it is resolved and recorded per leg so a
+    /// mixed event can never be costed at one leg's rate. `#[serde(default)]` so rows
+    /// written before this field existed still deserialise.
+    #[serde(default)]
+    pub fee_rate: Decimal,
 }
 
 /// A detected, costed, depth-sized opportunity.
@@ -429,6 +528,8 @@ pub struct Opportunity {
     pub event_slug: String,
     pub event_title: String,
     pub category: Category,
+    /// The highest taker fee rate applied to any leg — the headline number for the report
+    /// and the CLI. The exact per-leg rates live on [`Leg::fee_rate`].
     pub fee_rate: Decimal,
     /// Guaranteed payout per share-set at resolution: `$1` for binary / NegRisk YES,
     /// `$(N−1)` for the NegRisk NO-side construction.
@@ -487,6 +588,29 @@ where
         Raw::Str(s) => s.trim().parse::<Decimal>().map_err(de::Error::custom),
         Raw::Num(n) => n.to_string().parse::<Decimal>().map_err(de::Error::custom),
     }
+}
+
+/// Optional [`Decimal`], accepting `null`, `"0.04"` and `0.04`.
+///
+/// Anything unparseable becomes `None` rather than an error: these fields are advisory
+/// (an absent fee rate falls back to the category table), and one malformed number must
+/// not throw away a whole discovery page. It is never turned into a guessed value.
+pub fn de_opt_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Str(String),
+        Num(serde_json::Number),
+    }
+
+    Ok(match Option::<Raw>::deserialize(deserializer)? {
+        None => None,
+        Some(Raw::Str(s)) => s.trim().parse::<Decimal>().ok(),
+        Some(Raw::Num(n)) => n.to_string().parse::<Decimal>().ok(),
+    })
 }
 
 #[cfg(test)]
@@ -599,9 +723,79 @@ mod tests {
             question: "q".into(),
             outcomes: ["No".into(), "Yes".into()],
             token_ids: [TokenId::new("a"), TokenId::new("b")],
+            fees: MarketFees::default(),
+            trading: MarketTrading::default(),
         };
         assert_eq!(m.yes_token().as_str(), "b");
         assert_eq!(m.no_token().as_str(), "a");
+    }
+
+    /// The precedence rules for the API-provided fee data, one case each. These decide
+    /// real money: an over-stated rate hides opportunities, an under-stated one invents
+    /// them.
+    #[test]
+    fn api_fee_rate_precedence() {
+        // Fees explicitly off → zero, not the category table.
+        let off = MarketFees {
+            enabled: Some(false),
+            ..MarketFees::default()
+        };
+        assert_eq!(off.api_rate(), Some(Decimal::ZERO));
+        assert!(!off.exponent_unsupported());
+
+        // The live politics shape: enabled, standard curve, rate stated.
+        let politics = MarketFees {
+            enabled: Some(true),
+            fee_type: Some("politics_fees".into()),
+            rate: Some(dec!(0.04)),
+            exponent: Some(dec!(1)),
+            taker_only: Some(true),
+            rebate_rate: Some(dec!(0.25)),
+        };
+        assert_eq!(politics.api_rate(), Some(dec!(0.04)));
+        assert!(!politics.exponent_unsupported());
+
+        // An exponent we do not implement: fall back, never guess the formula.
+        let exotic = MarketFees {
+            exponent: Some(dec!(2)),
+            ..politics.clone()
+        };
+        assert_eq!(exotic.api_rate(), None);
+        assert!(exotic.exponent_unsupported());
+
+        // Enabled but no rate stated → the category table decides.
+        let no_rate = MarketFees {
+            rate: None,
+            ..politics.clone()
+        };
+        assert_eq!(no_rate.api_rate(), None);
+
+        // An absent exponent is the documented default curve, so the rate is usable.
+        let no_exponent = MarketFees {
+            exponent: None,
+            ..politics
+        };
+        assert_eq!(no_exponent.api_rate(), Some(dec!(0.04)));
+
+        // The legacy shape: the API said nothing at all.
+        assert_eq!(MarketFees::default().api_rate(), None);
+        assert!(!MarketFees::default().exponent_unsupported());
+    }
+
+    #[test]
+    fn optional_decimals_accept_strings_numbers_null_and_junk() {
+        #[derive(Deserialize)]
+        struct W {
+            #[serde(default, deserialize_with = "de_opt_decimal")]
+            v: Option<Decimal>,
+        }
+        let parse = |s: &str| serde_json::from_str::<W>(s).expect("parses").v;
+        assert_eq!(parse(r#"{"v":"0.04"}"#), Some(dec!(0.04)));
+        assert_eq!(parse(r#"{"v":0.04}"#), Some(dec!(0.04)));
+        assert_eq!(parse(r#"{"v":null}"#), None);
+        assert_eq!(parse("{}"), None);
+        // Junk is "unknown", never a guessed number.
+        assert_eq!(parse(r#"{"v":"soon"}"#), None);
     }
 
     /// The database and the dedupe key store `as_str()`; JSON stores the serde name.

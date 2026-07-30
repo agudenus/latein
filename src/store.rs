@@ -787,6 +787,7 @@ pub(crate) mod tests {
                     vwap: d!(0.40),
                     size: d!(100),
                     ask_depth: d!(500),
+                    fee_rate: d!(0.04),
                 },
                 Leg {
                     token_id: TokenId::new("1002"),
@@ -798,6 +799,7 @@ pub(crate) mod tests {
                     vwap: d!(0.55),
                     size: d!(100),
                     ask_depth: d!(500),
+                    fee_rate: d!(0.04),
                 },
             ],
             gross_gap: d!(0.05),

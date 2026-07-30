@@ -19,9 +19,34 @@
 //! it has. Market data is not allowed to kill the process.
 //!
 //! Parsing is deliberately permissive: unknown fields are ignored, every field we do not
-//! strictly need is optional, and prices/ids arrive as strings. The wire shapes marked
-//! `TODO(verify-live)` are inferred from the public docs and must be confirmed against a
-//! real response (this container cannot reach the API).
+//! strictly need is optional, and prices/ids arrive as strings. The few wire details still
+//! marked `TODO(verify-live)` are inferred from the public docs and must be confirmed
+//! against a real *request* (this container cannot reach the API); the response shape is no
+//! longer among them — see below.
+//!
+//! ## Verified against the live response, 2026-07-30
+//!
+//! The owner fetched `GET /events/keyset?active=true&closed=false&limit=2` in a browser and
+//! supplied the body. It settles the envelope, the cursor and the event shape:
+//!
+//! ```text
+//! {"$schema": "…/EventsKeysetListResponse.json",
+//!  "events": [ …event objects, same shape as the legacy /events… ],
+//!  "next_cursor": "<opaque>"}
+//! ```
+//!
+//! The array key is **`events`**, not `data` — and because this parser accepted only a bare
+//! array or `{"data": …}`, every keyset page failed to decode, discovery produced nothing,
+//! and the daemon retried forever. That is the bug this module's `events` arm fixes.
+//!
+//! The same response also carries per-market fee data (`feesEnabled`, `feeType`,
+//! `feeSchedule`), which is now preferred over our category fee table; see
+//! [`crate::types::MarketFees`].
+//!
+//! What that evidence does **not** settle, and so is still `TODO(verify-live)`: the name of
+//! the query parameter that carries the cursor *back* (the capture was a first page with no
+//! cursor — see [`DEFAULT_KEYSET_CURSOR_PARAM`]), and the full tag vocabulary behind
+//! [`Category::from_text`] (two events is not a taxonomy).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,7 +55,10 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::http::{ApiError, HttpClient};
-use crate::types::{Category, TokenId, TrackedEvent, TrackedMarket, Universe};
+use crate::types::{
+    de_opt_decimal, Category, MarketFees, MarketTrading, TokenId, TrackedEvent, TrackedMarket,
+    Universe,
+};
 
 /// What the discovery pass kept and dropped — printed by `polyarb markets` and logged on
 /// every universe refresh so the tracked universe is auditable rather than a black box.
@@ -51,6 +79,13 @@ pub struct DiscoveryStats {
     /// advancing. Discovery is incomplete and the numbers above are a lower bound; the log
     /// line at the point of truncation says which of the three it was.
     pub truncated: bool,
+    /// Kept markets whose taker fee rate came from Gamma's own `feeSchedule` /
+    /// `feesEnabled` rather than from our category table.
+    pub markets_with_api_fee: usize,
+    /// Kept markets whose `feeSchedule.exponent` is not the documented `1`. Their rate is
+    /// **not** used: the formula is unknown to this build, so the category table decides
+    /// and this count is warned about once per refresh.
+    pub markets_unsupported_fee_formula: usize,
 }
 
 impl DiscoveryStats {
@@ -147,7 +182,7 @@ pub struct RawEvent {
     pub slug: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
-    /// TODO(verify-live): confirm the exact casing (`negRisk`) on `/events`.
+    /// Verified live 2026-07-30: the key is `negRisk` on `/events/keyset` event objects.
     #[serde(default, rename = "negRisk")]
     pub neg_risk: Option<bool>,
     #[serde(default)]
@@ -160,7 +195,8 @@ pub struct RawEvent {
     pub closed: Option<bool>,
     /// Event close time. Only used to spot markets that live and die between universe
     /// refreshes (see `short_lived_crypto_events`).
-    /// TODO(verify-live): confirm the field name (`endDate`) and that it is RFC 3339.
+    /// Verified live 2026-07-30: the key is `endDate`. The *format* is still parsed
+    /// defensively (see `parse_end_date`) — RFC 3339 with and without a zone marker.
     #[serde(default, rename = "endDate")]
     pub end_date: Option<String>,
     #[serde(default)]
@@ -182,48 +218,105 @@ pub struct RawMarket {
     #[serde(default)]
     pub question: Option<String>,
     /// JSON-encoded array of the two CLOB token ids, e.g. `"[\"123\",\"456\"]"`.
-    /// TODO(verify-live): confirm Gamma still double-encodes this (it may send a real
-    /// array); `de_opt_string_array` accepts both shapes.
+    /// Verified live 2026-07-30: Gamma still double-encodes this. `de_opt_string_array`
+    /// keeps accepting a real array too.
     #[serde(
         default,
         rename = "clobTokenIds",
         deserialize_with = "de_opt_string_array"
     )]
     pub clob_token_ids: Option<Vec<String>>,
+    /// Also double-encoded on the live response, e.g. `"[\"Yes\",\"No\"]"`.
     #[serde(default, deserialize_with = "de_opt_string_array")]
     pub outcomes: Option<Vec<String>>,
     #[serde(default)]
     pub active: Option<bool>,
     #[serde(default)]
     pub closed: Option<bool>,
-    /// TODO(verify-live): markets without a CLOB book cannot be traded; confirm the field
-    /// name (`enableOrderBook`) before relying on it as a filter.
+    /// Verified live 2026-07-30: `enableOrderBook` is present on every market object.
+    /// Markets without a CLOB book cannot be a leg.
     #[serde(default, rename = "enableOrderBook")]
     pub enable_order_book: Option<bool>,
+
+    // ---- fee data (verified live 2026-07-30) -------------------------------------
+    /// `feesEnabled`. `false` (with `feeType: null`) is what a fee-free market looks like.
+    #[serde(default, rename = "feesEnabled")]
+    pub fees_enabled: Option<bool>,
+    /// `feeType`, e.g. `"politics_fees"` / `"finance_prices_fees"`, `null` when off.
+    #[serde(default, rename = "feeType")]
+    pub fee_type: Option<String>,
+    /// `feeSchedule`, absent (or null) when `feesEnabled` is false.
+    #[serde(default, rename = "feeSchedule")]
+    pub fee_schedule: Option<RawFeeSchedule>,
+
+    // ---- order/reward parameters (verified live 2026-07-30; captured, not yet used) ---
+    #[serde(
+        default,
+        rename = "orderPriceMinTickSize",
+        deserialize_with = "de_opt_decimal"
+    )]
+    pub order_price_min_tick_size: Option<rust_decimal::Decimal>,
+    #[serde(default, rename = "orderMinSize", deserialize_with = "de_opt_decimal")]
+    pub order_min_size: Option<rust_decimal::Decimal>,
+    #[serde(
+        default,
+        rename = "rewardsMinSize",
+        deserialize_with = "de_opt_decimal"
+    )]
+    pub rewards_min_size: Option<rust_decimal::Decimal>,
+    #[serde(
+        default,
+        rename = "rewardsMaxSpread",
+        deserialize_with = "de_opt_decimal"
+    )]
+    pub rewards_max_spread: Option<rust_decimal::Decimal>,
+}
+
+/// `{"exponent": 1, "rate": 0.04, "takerOnly": true, "rebateRate": 0.25}`.
+///
+/// Unknown fields are ignored and every known one is optional, so a schedule that grows a
+/// field cannot break discovery.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawFeeSchedule {
+    #[serde(default, deserialize_with = "de_opt_decimal")]
+    pub rate: Option<rust_decimal::Decimal>,
+    /// The `n` of `rate · pⁿ · (1 − p)ⁿ`. Only `1` is implemented.
+    #[serde(default, deserialize_with = "de_opt_decimal")]
+    pub exponent: Option<rust_decimal::Decimal>,
+    #[serde(default, rename = "takerOnly")]
+    pub taker_only: Option<bool>,
+    #[serde(default, rename = "rebateRate", deserialize_with = "de_opt_decimal")]
+    pub rebate_rate: Option<rust_decimal::Decimal>,
 }
 
 // ---------------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------------
 
-/// Parse one events page. Accepts either a bare array or `{"data": [...]}`.
+/// Parse one events page.
 ///
-/// TODO(verify-live): the keyset page is *assumed* to carry the same event shape as the
-/// legacy list endpoint, wrapped in `{data, next_cursor}`. If it nests the events under a
-/// different key, discovery will read zero events (and say so, loudly, as an empty page)
-/// rather than mis-parse — add the key here once a live response is in hand.
+/// Three shapes are accepted:
+///
+/// * `{"$schema": …, "events": [...], "next_cursor": "…"}` — **the live `/events/keyset`
+///   envelope**, confirmed against a real response on 2026-07-30. This arm is the fix for
+///   the discovery outage: without it every keyset page failed to decode, the daemon saw a
+///   hard error on every attempt, and it retried forever.
+/// * `{"data": [...]}` — the wrapper other Gamma endpoints use; kept, it costs nothing.
+/// * a bare array — the legacy `/events` list shape, still served by the fallback path.
 pub fn parse_events_page(url: &str, body: &str) -> Result<Vec<RawEvent>, ApiError> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Page {
         Bare(Vec<RawEvent>),
-        // Some Gamma endpoints wrap results in `{data, pagination}` — the keyset endpoint
-        // is documented as one of them.
+        // The live keyset envelope. First, so it is preferred over a `data` wrapper if a
+        // response ever carried both.
+        Keyset { events: Vec<RawEvent> },
+        // Some Gamma endpoints wrap results in `{data, pagination}`.
         Wrapped { data: Vec<RawEvent> },
     }
 
     match serde_json::from_str::<Page>(body) {
-        Ok(Page::Bare(v)) | Ok(Page::Wrapped { data: v }) => Ok(v),
+        Ok(Page::Bare(v)) | Ok(Page::Keyset { events: v }) | Ok(Page::Wrapped { data: v }) => Ok(v),
         Err(source) => Err(ApiError::Decode {
             url: url.to_string(),
             source,
@@ -233,14 +326,14 @@ pub fn parse_events_page(url: &str, body: &str) -> Result<Vec<RawEvent>, ApiErro
 
 /// The cursor that asks for the page *after* this one, or `None` when there is no next page.
 ///
-/// Written to accept every shape the endpoint has been reported to use, because we cannot
-/// check from here: a top-level `next_cursor` / `nextCursor` / `cursor`, or the same keys
-/// nested under `pagination`. A bare array (the legacy shape) carries no cursor and yields
-/// `None`, which ends pagination — the same as the legacy short-page rule.
+/// Verified live 2026-07-30: `/events/keyset` returns a **top-level `next_cursor`** holding
+/// an opaque base64-ish string — the first shape this function checks. The other spellings
+/// (`nextCursor`, `cursor`, and the same keys nested under `pagination`) are kept as cheap
+/// tolerance. A bare array (the legacy shape) carries no cursor and yields `None`, which
+/// ends pagination — the same as the legacy short-page rule.
 ///
-/// TODO(verify-live): confirm which of these the live `/events/keyset` actually returns, and
-/// whether an exhausted list signals the end by omitting the field or by returning an empty
-/// string (both are handled here).
+/// Still unverified: how an *exhausted* list signals the end — by omitting `next_cursor` or
+/// by returning an empty string. Both are handled here, so it does not matter.
 pub fn parse_next_cursor(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     // Cursors are opaque; a numeric one is still a cursor, so accept numbers as strings.
@@ -296,6 +389,12 @@ pub fn build_universe(raw: &[RawEvent]) -> (Universe, DiscoveryStats) {
             match classify_market(m) {
                 Ok(tm) => {
                     stats.markets_kept += 1;
+                    if tm.fees.api_rate().is_some() {
+                        stats.markets_with_api_fee += 1;
+                    }
+                    if tm.fees.exponent_unsupported() {
+                        stats.markets_unsupported_fee_formula += 1;
+                    }
                     markets.push(tm);
                 }
                 Err(reason) => stats.drops.record(reason),
@@ -381,7 +480,32 @@ fn classify_market(m: &RawMarket) -> Result<TrackedMarket, DropReason> {
         condition_id,
         outcomes,
         token_ids: [TokenId::new(&tokens[0]), TokenId::new(&tokens[1])],
+        fees: market_fees(m),
+        trading: MarketTrading {
+            min_tick_size: m.order_price_min_tick_size,
+            min_order_size: m.order_min_size,
+            rewards_min_size: m.rewards_min_size,
+            rewards_max_spread: m.rewards_max_spread,
+        },
     })
+}
+
+/// Fold the three fee fields into the domain type. A missing `feeSchedule` leaves the rate
+/// unknown; it is [`MarketFees::api_rate`] that decides what "unknown" costs.
+fn market_fees(m: &RawMarket) -> MarketFees {
+    let schedule = m.fee_schedule.as_ref();
+    MarketFees {
+        enabled: m.fees_enabled,
+        fee_type: m
+            .fee_type
+            .clone()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
+        rate: schedule.and_then(|s| s.rate),
+        exponent: schedule.and_then(|s| s.exponent),
+        taker_only: schedule.and_then(|s| s.taker_only),
+        rebate_rate: schedule.and_then(|s| s.rebate_rate),
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -409,11 +533,14 @@ pub struct PaginationState {
     keyset_unavailable: AtomicBool,
 }
 
-/// One pagination pass: the events collected, and whether we stopped before the end of the
-/// list (cap reached, API refused to go deeper, or the cursor stopped advancing).
+/// One pagination pass: the events collected, whether we stopped before the end of the
+/// list (cap reached, API refused to go deeper, or the cursor stopped advancing), and the
+/// endpoint that served them — an empty universe is meaningless without knowing which URL
+/// produced it.
 struct Fetched {
     events: Vec<RawEvent>,
     truncated: bool,
+    endpoint: String,
 }
 
 pub struct GammaClient<'a> {
@@ -480,8 +607,45 @@ impl<'a> GammaClient<'a> {
             markets_kept = stats.markets_kept,
             markets_dropped = stats.markets_dropped(),
             drop_reasons = %stats.drops.summary(),
+            markets_with_api_fee = stats.markets_with_api_fee,
             "market discovery drop breakdown"
         );
+        // Once per refresh, with the count — an unknown fee curve is priced from the
+        // category table, and that substitution must never be silent.
+        if stats.markets_unsupported_fee_formula > 0 {
+            tracing::warn!(
+                markets = stats.markets_unsupported_fee_formula,
+                "Gamma reported a feeSchedule exponent other than 1 on some markets; this \
+                 build only implements rate·p·(1−p), so those markets are costed from the \
+                 category fee table instead of their stated rate"
+            );
+        }
+
+        // Nothing came back. Polymarket always has active events, so the overwhelmingly
+        // likely cause is that the response shape moved under us again — say so here, in
+        // the one line the daemon prints on every retry, instead of leaving an operator to
+        // infer it from an endlessly repeating stack of context.
+        if universe.events.is_empty() {
+            return Err(ApiError::EmptyDiscovery {
+                url: fetched.endpoint,
+                events: 0,
+                detail: if stats.events_seen == 0 {
+                    "no event object was found in the response body; the live keyset \
+                     envelope is {\"events\": [...], \"next_cursor\": \"…\"} — check \
+                     parse_events_page against a fresh response"
+                        .to_string()
+                } else {
+                    format!(
+                        "{} event(s) parsed but every one was filtered out ({} inactive or \
+                         closed, {} with no priceable market; market drops: {})",
+                        stats.events_seen,
+                        stats.events_inactive,
+                        stats.events_no_usable_market,
+                        stats.drops.summary()
+                    )
+                },
+            });
+        }
         Ok((universe, stats))
     }
 
@@ -587,7 +751,11 @@ impl<'a> GammaClient<'a> {
             }
         }
 
-        Ok(Some(Fetched { events, truncated }))
+        Ok(Some(Fetched {
+            events,
+            truncated,
+            endpoint: url,
+        }))
     }
 
     /// Offset pagination over the legacy `/events` list endpoint — the fallback.
@@ -648,7 +816,11 @@ impl<'a> GammaClient<'a> {
             offset += got;
         }
 
-        Ok(Fetched { events, truncated })
+        Ok(Fetched {
+            events,
+            truncated,
+            endpoint: url,
+        })
     }
 
     fn warn_max_events(&self, pages: usize, events: usize) {
@@ -708,6 +880,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -843,6 +1018,100 @@ mod tests {
             !universe.events[4].ends_by(expected + chrono::Duration::days(3_650)),
             "an unknown end time is never treated as short-lived"
         );
+    }
+
+    // --- the live keyset envelope ------------------------------------------------------
+
+    /// Trimmed copy of the real `GET /events/keyset?active=true&closed=false&limit=2`
+    /// response the owner captured on 2026-07-30 (two events; the envelope keys are
+    /// verbatim).
+    const KEYSET: &str = include_str!("../tests/fixtures/gamma_events_keyset.json");
+
+    /// **The bug.** The live envelope nests the array under `events`, and this parser
+    /// accepted only a bare array or `{"data": …}` — so every keyset page failed to decode,
+    /// discovery never produced an event, and the daemon retried discovery forever.
+    #[test]
+    fn the_live_keyset_envelope_parses_its_events_array() {
+        let page = parse_events_page("test", KEYSET).expect("the live envelope must parse");
+        assert_eq!(page.len(), 2, "both events must come out of the envelope");
+        assert_eq!(
+            page[0].slug.as_deref(),
+            Some("which-party-wins-the-2028-presidential-election")
+        );
+        assert_eq!(page[0].neg_risk, Some(true));
+        assert_eq!(page[0].markets.len(), 2);
+        assert_eq!(page[1].slug.as_deref(), Some("kraken-june-listing"));
+
+        // The cursor is top-level and opaque; it must survive verbatim.
+        assert_eq!(
+            parse_next_cursor(KEYSET).as_deref(),
+            Some("eyJpZCI6NDI5ODQsInMiOiJrcmFrZW4tanVuZS1saXN0aW5nIn0=")
+        );
+
+        // And the whole page must survive the trip into the tracked universe.
+        let (universe, stats) = build_universe(&page);
+        assert_eq!(stats.events_seen, 2);
+        assert_eq!(stats.events_kept, 2);
+        assert_eq!(stats.markets_kept, 3);
+        assert_eq!(stats.drops.total(), 0);
+        assert_eq!(universe.events[0].category.as_str(), "politics");
+        assert!(universe.events[0].coverage_complete());
+        assert_eq!(universe.events[0].markets[0].yes_token().as_str(), "7001");
+    }
+
+    /// The per-market fee data on the live response, and every case the resolver has to
+    /// tell apart.
+    #[test]
+    fn per_market_fee_data_is_parsed_including_the_disabled_and_absent_cases() {
+        let (universe, stats) =
+            build_universe(&parse_events_page("test", KEYSET).expect("fixture"));
+
+        // Fees on, standard curve, rate stated.
+        let politics = &universe.events[0].markets[0].fees;
+        assert_eq!(politics.enabled, Some(true));
+        assert_eq!(politics.fee_type.as_deref(), Some("politics_fees"));
+        assert_eq!(politics.rate, Some(dec!(0.04)));
+        assert_eq!(politics.exponent, Some(dec!(1)));
+        assert_eq!(politics.taker_only, Some(true));
+        assert_eq!(politics.rebate_rate, Some(dec!(0.25)));
+        assert_eq!(politics.api_rate(), Some(dec!(0.04)));
+
+        // `feesEnabled: false` with `feeType: null` and no schedule at all → a stated zero.
+        let disabled = &universe.events[1].markets[0].fees;
+        assert_eq!(disabled.enabled, Some(false));
+        assert_eq!(disabled.fee_type, None);
+        assert_eq!(disabled.rate, None);
+        assert_eq!(disabled.api_rate(), Some(Decimal::ZERO));
+        assert!(!disabled.exponent_unsupported());
+
+        // The order/reward parameters ride along for Phase B.
+        let trading = &universe.events[0].markets[0].trading;
+        assert_eq!(trading.min_tick_size, Some(dec!(0.01)));
+        assert_eq!(trading.min_order_size, Some(dec!(5)));
+        assert_eq!(trading.rewards_min_size, Some(dec!(50)));
+        assert_eq!(trading.rewards_max_spread, Some(dec!(3.5)));
+
+        // All three kept markets state their own rate, and none needs a fallback.
+        assert_eq!(stats.markets_with_api_fee, 3);
+        assert_eq!(stats.markets_unsupported_fee_formula, 0);
+
+        // The legacy fixture carries none of these fields: everything stays unknown, and
+        // the category table keeps deciding (that path must not regress).
+        let (legacy, legacy_stats) = build_universe(&parsed());
+        assert_eq!(legacy.events[0].markets[0].fees, MarketFees::default());
+        assert_eq!(legacy.events[0].markets[0].fees.api_rate(), None);
+        assert_eq!(legacy_stats.markets_with_api_fee, 0);
+
+        // An exponent we do not implement is counted, and its rate is not offered.
+        let exotic = r#"{"events":[{"id":"1","slug":"x","active":true,"closed":false,"markets":[
+            {"conditionId":"0x1","clobTokenIds":"[\"1\",\"2\"]","feesEnabled":true,
+             "feeType":"crypto_fees","feeSchedule":{"exponent":2,"rate":"0.07"}}]}]}"#;
+        let (u, s) = build_universe(&parse_events_page("test", exotic).expect("parses"));
+        assert_eq!(u.events[0].markets[0].fees.rate, Some(dec!(0.07)));
+        assert_eq!(u.events[0].markets[0].fees.api_rate(), None);
+        assert!(u.events[0].markets[0].fees.exponent_unsupported());
+        assert_eq!(s.markets_unsupported_fee_formula, 1);
+        assert_eq!(s.markets_with_api_fee, 0);
     }
 
     #[test]
@@ -1310,6 +1579,76 @@ mod tests {
         assert_eq!(universe.events.len(), 3);
         assert!(!stats.truncated);
         assert_eq!(requests(&log).len(), 1);
+    }
+
+    /// An empty universe is never a normal outcome, and the daemon's only symptom of it is
+    /// an endlessly repeating discovery retry. The one ERROR line it prints therefore has
+    /// to name the count *and* the endpoint, so this class of bug (a moved response shape)
+    /// is identifiable without a debugger.
+    #[tokio::test]
+    async fn a_discovery_that_finds_no_events_says_so_with_the_count_and_the_endpoint() {
+        // A well-formed but empty keyset page: parses fine, yields nothing.
+        let (base, _log) = gamma_stub(|_| {
+            (
+                200,
+                r#"{"$schema":"https://gamma-api.polymarket.com/schemas/EventsKeysetListResponse.json","events":[],"next_cursor":""}"#.to_string(),
+            )
+        })
+        .await;
+        let cfg = paging_config(&base, 10, 6_000);
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let err = GammaClient::new(&http, &cfg)
+            .fetch_universe()
+            .await
+            .expect_err("an empty universe must not be reported as a successful discovery");
+        let msg = err.to_string();
+        assert!(msg.contains("discovery parsed 0 events"), "got: {msg}");
+        assert!(msg.contains("/events/keyset"), "got: {msg}");
+        assert!(msg.contains("shape mismatch"), "got: {msg}");
+        assert!(msg.contains("no event object was found"), "got: {msg}");
+
+        // A page full of events that are *all* filtered out is a different diagnosis, and
+        // must not be blamed on the response shape.
+        let (base, _log) = gamma_stub(|_| {
+            (
+                200,
+                r#"{"events":[{"id":"1","slug":"dead","active":false,"closed":true,
+                    "markets":[{"conditionId":"0x1","clobTokenIds":"[\"1\",\"2\"]"}]}]}"#
+                    .to_string(),
+            )
+        })
+        .await;
+        let cfg = paging_config(&base, 10, 6_000);
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let msg = GammaClient::new(&http, &cfg)
+            .fetch_universe()
+            .await
+            .expect_err("nothing to scan is still an error")
+            .to_string();
+        assert!(msg.contains("discovery parsed 0 events"), "got: {msg}");
+        assert!(msg.contains("every one was filtered out"), "got: {msg}");
+        assert!(msg.contains("1 inactive or closed"), "got: {msg}");
+    }
+
+    /// The same diagnostic over the legacy path names the legacy endpoint, so the log line
+    /// says which URL actually served the nothing.
+    #[tokio::test]
+    async fn the_empty_discovery_error_names_the_legacy_endpoint_when_that_is_what_was_used() {
+        let (base, _log) = legacy_gamma(0, 2_000).await;
+        let cfg = paging_config(&base, 10, 6_000);
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let msg = GammaClient::new(&http, &cfg)
+            .fetch_universe()
+            .await
+            .expect_err("empty is an error on the fallback path too")
+            .to_string();
+        assert!(msg.contains("discovery parsed 0 events"), "got: {msg}");
+        assert!(msg.ends_with(')'), "got: {msg}");
+        assert!(
+            msg.contains("/events —") || msg.contains("/events "),
+            "the legacy endpoint must be named, got: {msg}"
+        );
+        assert!(!msg.contains("/events/keyset"), "got: {msg}");
     }
 
     /// The cursor may arrive under any of the reported names, at the top level or nested,

@@ -1,0 +1,91 @@
+{
+  "$schema": "https://gamma-api.polymarket.com/schemas/EventsKeysetListResponse.json",
+  "events": [
+    {
+      "id": "42711",
+      "slug": "which-party-wins-the-2028-presidential-election",
+      "title": "Which party wins the 2028 presidential election?",
+      "negRisk": true,
+      "active": true,
+      "closed": false,
+      "endDate": "2028-11-07T12:00:00Z",
+      "tags": [
+        { "id": "2", "label": "Politics", "slug": "politics" },
+        { "id": "9", "label": "Elections", "slug": "elections" }
+      ],
+      "markets": [
+        {
+          "id": "588101",
+          "conditionId": "0xa11ce0000000000000000000000000000000000000000000000000000000d001",
+          "question": "Will the Democratic Party win the 2028 presidential election?",
+          "clobTokenIds": "[\"7001\",\"7002\"]",
+          "outcomes": "[\"Yes\",\"No\"]",
+          "active": true,
+          "closed": false,
+          "enableOrderBook": true,
+          "orderPriceMinTickSize": 0.01,
+          "orderMinSize": 5,
+          "rewardsMinSize": 50,
+          "rewardsMaxSpread": 3.5,
+          "feesEnabled": true,
+          "feeType": "politics_fees",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": 0.04,
+            "takerOnly": true,
+            "rebateRate": 0.25
+          }
+        },
+        {
+          "id": "588102",
+          "conditionId": "0xa11ce0000000000000000000000000000000000000000000000000000000d002",
+          "question": "Will the Republican Party win the 2028 presidential election?",
+          "clobTokenIds": "[\"7003\",\"7004\"]",
+          "outcomes": "[\"Yes\",\"No\"]",
+          "active": true,
+          "closed": false,
+          "enableOrderBook": true,
+          "orderPriceMinTickSize": 0.01,
+          "orderMinSize": 5,
+          "rewardsMinSize": 50,
+          "rewardsMaxSpread": 3.5,
+          "feesEnabled": true,
+          "feeType": "politics_fees",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": 0.04,
+            "takerOnly": true,
+            "rebateRate": 0.25
+          }
+        }
+      ]
+    },
+    {
+      "id": "42984",
+      "slug": "kraken-june-listing",
+      "title": "Will Kraken list a new asset in June?",
+      "negRisk": false,
+      "active": true,
+      "closed": false,
+      "endDate": "2026-06-30T23:59:00Z",
+      "tags": [{ "id": "21", "label": "Crypto", "slug": "crypto" }],
+      "markets": [
+        {
+          "id": "588400",
+          "conditionId": "0xbeef00000000000000000000000000000000000000000000000000000000e001",
+          "question": "Will Kraken list a new asset in June?",
+          "clobTokenIds": "[\"7101\",\"7102\"]",
+          "outcomes": "[\"Yes\",\"No\"]",
+          "active": true,
+          "closed": false,
+          "enableOrderBook": true,
+          "orderPriceMinTickSize": 0.001,
+          "orderMinSize": 5,
+          "feesEnabled": false,
+          "feeType": null
+        }
+      ]
+    }
+  ],
+  "next_cursor": "eyJpZCI6NDI5ODQsInMiOiJrcmFrZW4tanVuZS1saXN0aW5nIn0="
+}

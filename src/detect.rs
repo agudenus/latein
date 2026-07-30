@@ -36,7 +36,7 @@
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::config::Config;
-use crate::costs::{breakdown, CostBreakdown, FeeModel, LegPrices};
+use crate::costs::{breakdown, CostBreakdown, FeeModel, FeeRateSource, LegPrices};
 use crate::risk::RiskLimits;
 use crate::types::{
     BookMap, Label, Leg, Opportunity, OpportunityKind, OrderBook, Side, TrackedEvent,
@@ -250,7 +250,14 @@ impl<'a> Detector<'a> {
         }
 
         let best_bids: Vec<Option<Decimal>> = books.iter().map(|b| b.best_bid()).collect();
-        let fee_rate = self.fees.rate_for(&event.category);
+        // One rate per leg, each preferring the market's own API-stated rate over the
+        // category table. Legs of one event normally agree (they share the event's
+        // `feeType`), but nothing guarantees it, so the rates are never collapsed.
+        let fees: Vec<_> = legs
+            .iter()
+            .map(|l| self.fees.resolve(&event.category, &l.market.fees))
+            .collect();
+        let fee_rates: Vec<Decimal> = fees.iter().map(|f| f.rate).collect();
         // The two sides are floored separately: a taker pays the fee curve, a maker does
         // not, so in a high-fee category the same gap can be noise as a taker and worth
         // resting for as a maker.
@@ -261,7 +268,7 @@ impl<'a> Detector<'a> {
             &best_asks,
             &best_bids,
             payout,
-            fee_rate,
+            &fee_rates,
             floor.taker,
         ) {
             return Some(self.build(
@@ -273,7 +280,7 @@ impl<'a> Detector<'a> {
                 &best_bids,
                 &sized.vwaps,
                 sized.cost,
-                fee_rate,
+                &fees,
                 false,
                 coverage,
             ));
@@ -286,13 +293,13 @@ impl<'a> Detector<'a> {
             &best_asks,
             &best_bids,
             payout,
-            fee_rate,
+            &fee_rates,
             floor.maker_floor(),
         )?;
         Some(self.build(
             event, kind, payout, legs, &best_asks, &best_bids,
             &best_asks, // a maker never walks the ask book; taker fields are top-of-book
-            maker, fee_rate, true, coverage,
+            maker, &fees, true, coverage,
         ))
     }
 
@@ -308,7 +315,7 @@ impl<'a> Detector<'a> {
         best_asks: &[Decimal],
         best_bids: &[Option<Decimal>],
         payout: Decimal,
-        fee_rate: Decimal,
+        fee_rates: &[Decimal],
         floor: Decimal,
     ) -> Option<SizedTaker> {
         let min_size = self.cfg.scan.min_size_shares;
@@ -328,7 +335,7 @@ impl<'a> Detector<'a> {
                 .collect();
             let vwaps = vwaps?;
             let leg_prices = leg_prices(best_asks, best_bids, &vwaps);
-            let cost = breakdown(payout, &leg_prices, fee_rate, size);
+            let cost = breakdown(payout, &leg_prices, fee_rates, size);
             Some(SizedTaker { vwaps, cost })
         };
         let feasible = |size: Decimal| -> Option<SizedTaker> {
@@ -370,7 +377,7 @@ impl<'a> Detector<'a> {
         best_asks: &[Decimal],
         best_bids: &[Option<Decimal>],
         payout: Decimal,
-        fee_rate: Decimal,
+        fee_rates: &[Decimal],
         floor: Decimal,
     ) -> Option<CostBreakdown> {
         let bids: Option<Vec<Decimal>> = best_bids.iter().copied().collect();
@@ -387,7 +394,7 @@ impl<'a> Detector<'a> {
             return None;
         }
         let leg_prices = leg_prices(best_asks, best_bids, best_asks);
-        let mut cost = breakdown(payout, &leg_prices, fee_rate, size);
+        let mut cost = breakdown(payout, &leg_prices, fee_rates, size);
         // A maker posts at the bid, so the capital actually committed is bid-based.
         cost.capital_required = sum_bid * size;
         Some(cost)
@@ -404,10 +411,17 @@ impl<'a> Detector<'a> {
         best_bids: &[Option<Decimal>],
         vwaps: &[Decimal],
         cost: CostBreakdown,
-        fee_rate: Decimal,
+        fees: &[crate::costs::ResolvedFee],
         maker_only: bool,
         coverage: Coverage,
     ) -> Opportunity {
+        // The headline rate is the worst any leg pays; the exact per-leg rates ride on the
+        // legs themselves. For the ordinary event (one `feeType`, one rate) they agree.
+        let fee_rate = fees
+            .iter()
+            .map(|f| f.rate)
+            .max()
+            .unwrap_or_else(|| self.fees.rate_for(&event.category));
         let conversion_required = matches!(kind, OpportunityKind::NegRiskNoSide);
         let mut flags = Vec::new();
 
@@ -469,6 +483,46 @@ impl<'a> Detector<'a> {
                     .to_string(),
             );
         }
+        // Where the money numbers' fee rates came from. Cheap, one line, and it is the
+        // difference between "we costed this at Polymarket's own rate" and "we costed it
+        // at our guess from a tag".
+        if fees.iter().any(|f| f.source.is_api()) {
+            let rates: Vec<String> = {
+                let mut seen: Vec<Decimal> = fees
+                    .iter()
+                    .filter(|f| f.source.is_api())
+                    .map(|f| f.rate)
+                    .collect();
+                seen.sort();
+                seen.dedup();
+                seen.iter().map(|r| format!("{r}")).collect()
+            };
+            flags.push(format!(
+                "api_fee_rate: taker rate(s) {} taken from Gamma's per-market fee data \
+                 (feesEnabled/feeSchedule), not the category table",
+                rates.join(", ")
+            ));
+        }
+        if fees
+            .iter()
+            .any(|f| f.source == FeeRateSource::CategoryUnsupportedFormula)
+        {
+            flags.push(
+                "fee_formula_unsupported: Gamma states a feeSchedule exponent this build \
+                 does not implement, so the category fee rate was used instead — the true \
+                 fee may differ"
+                    .to_string(),
+            );
+        }
+        // Our cost model gives makers a zero fee. Gamma saying otherwise for this market
+        // invalidates the maker column, so it must not pass unremarked.
+        if legs.iter().any(|l| l.market.fees.taker_only == Some(false)) {
+            flags.push(
+                "fee_taker_only=false: Gamma says this market charges makers too, which the \
+                 fee-free maker column above does not model"
+                    .to_string(),
+            );
+        }
         if event.category.as_str() == "crypto" {
             flags.push(
                 "crypto is the 0.07 taker tier: at mid prices the fee is ~0.035 per \
@@ -491,6 +545,7 @@ impl<'a> Detector<'a> {
                 vwap: vwaps[i],
                 size: cost.size,
                 ask_depth: l.book.depth(Side::Ask),
+                fee_rate: fees.get(i).map(|f| f.rate).unwrap_or(fee_rate),
             })
             .collect();
 
@@ -555,7 +610,7 @@ pub fn scan(cfg: &Config, universe: &Universe, books: &BookMap) -> Vec<Opportuni
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Category, PriceLevel, TokenId};
+    use crate::types::{Category, MarketFees, MarketTrading, PriceLevel, TokenId};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
@@ -590,6 +645,8 @@ mod tests {
                 TokenId::new(format!("{idx}-yes")),
                 TokenId::new(format!("{idx}-no")),
             ],
+            fees: MarketFees::default(),
+            trading: MarketTrading::default(),
         }
     }
 
@@ -927,6 +984,188 @@ mod tests {
             .is_empty(),
             "a 0.006 maker net must not survive a 0.008 maker floor"
         );
+    }
+
+    // --- API-provided fee rates ------------------------------------------------------
+
+    /// A market carrying Gamma's own fee data, on top of the standard test market.
+    fn market_with_fees(idx: usize, fees: MarketFees) -> TrackedMarket {
+        TrackedMarket {
+            fees,
+            ..market(idx, "Q?")
+        }
+    }
+
+    /// Books with a gap wide enough to survive either fee tier, so the *only* thing the
+    /// assertions below measure is which rate was applied.
+    ///
+    ///   YES ask 0.10 (bid 0.09), NO ask 0.85 (bid 0.84) → Σask 0.95, gross_gap 0.05
+    ///   Σ p(1−p) = 0.10·0.90 + 0.85·0.15 = 0.09 + 0.1275 = 0.2175
+    ///     rate 0.05 (the sports category table) → fee 0.010875 → net 0.039125
+    ///     rate 0.04 (Gamma's politics_fees)     → fee 0.008700 → net 0.041300
+    fn fee_probe_books() -> Vec<OrderBook> {
+        vec![
+            book(
+                "0-yes",
+                &[(dec!(0.09), dec!(1000))],
+                &[(dec!(0.10), dec!(1000))],
+            ),
+            book(
+                "0-no",
+                &[(dec!(0.84), dec!(1000))],
+                &[(dec!(0.85), dec!(1000))],
+            ),
+        ]
+    }
+
+    /// The whole point of reading the API's fee data: a sports-tagged event whose market
+    /// Polymarket actually charges 0.04 on must be costed at 0.04, not at the 0.05 our tag
+    /// table would have guessed.
+    #[test]
+    fn an_api_fee_rate_overrides_the_category_table() {
+        let api = MarketFees {
+            enabled: Some(true),
+            fee_type: Some("politics_fees".into()),
+            rate: Some(dec!(0.04)),
+            exponent: Some(dec!(1)),
+            taker_only: Some(true),
+            rebate_rate: Some(dec!(0.25)),
+        };
+        let ops = run(
+            &cfg(),
+            event(false, "sports", vec![market_with_fees(0, api)]),
+            fee_probe_books(),
+        );
+        assert_eq!(ops.len(), 1, "unexpected: {ops:#?}");
+        let op = &ops[0];
+        assert_eq!(op.category.as_str(), "sports");
+        assert_eq!(op.fee_rate, dec!(0.04), "the API rate, not the 0.05 tier");
+        assert_eq!(op.fee_taker, dec!(0.008700));
+        assert_eq!(op.net_taker, dec!(0.041300));
+        // Every leg records the rate it was costed at.
+        assert!(op.legs.iter().all(|l| l.fee_rate == dec!(0.04)));
+        // …and the row says where the number came from.
+        assert!(
+            op.resolution_flags
+                .iter()
+                .any(|f| f.starts_with("api_fee_rate:") && f.contains("0.04")),
+            "got: {:?}",
+            op.resolution_flags
+        );
+
+        // Same books, same category, no fee data at all → the category table, 0.05.
+        let fallback = run(
+            &cfg(),
+            event(false, "sports", vec![market(0, "Q?")]),
+            fee_probe_books(),
+        );
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].fee_rate, dec!(0.05));
+        assert_eq!(fallback[0].fee_taker, dec!(0.010875));
+        assert_eq!(fallback[0].net_taker, dec!(0.039125));
+        assert!(!fallback[0]
+            .resolution_flags
+            .iter()
+            .any(|f| f.starts_with("api_fee_rate:")));
+    }
+
+    /// `feesEnabled: false` is a stated zero — the market is fee-free even in a category
+    /// our table charges 0.05 for.
+    #[test]
+    fn feesenabled_false_costs_the_leg_at_zero() {
+        let off = MarketFees {
+            enabled: Some(false),
+            ..MarketFees::default()
+        };
+        let ops = run(
+            &cfg(),
+            event(false, "sports", vec![market_with_fees(0, off)]),
+            fee_probe_books(),
+        );
+        assert_eq!(ops.len(), 1, "unexpected: {ops:#?}");
+        assert_eq!(ops[0].fee_rate, dec!(0));
+        assert_eq!(ops[0].fee_taker, dec!(0));
+        assert_eq!(ops[0].net_taker, dec!(0.05), "the whole gross gap survives");
+        assert!(ops[0]
+            .resolution_flags
+            .iter()
+            .any(|f| f.starts_with("api_fee_rate:")));
+    }
+
+    /// An exponent we do not implement must fall back to the category table and say so —
+    /// an unknown formula priced at its stated rate would be a silent mispricing.
+    #[test]
+    fn an_unsupported_fee_exponent_falls_back_to_the_category_rate_and_flags_it() {
+        let exotic = MarketFees {
+            enabled: Some(true),
+            fee_type: Some("sports_fees".into()),
+            rate: Some(dec!(0.04)),
+            exponent: Some(dec!(2)),
+            taker_only: Some(true),
+            rebate_rate: None,
+        };
+        let ops = run(
+            &cfg(),
+            event(false, "sports", vec![market_with_fees(0, exotic)]),
+            fee_probe_books(),
+        );
+        assert_eq!(ops.len(), 1, "unexpected: {ops:#?}");
+        assert_eq!(ops[0].fee_rate, dec!(0.05), "the category table, not 0.04");
+        assert_eq!(ops[0].fee_taker, dec!(0.010875));
+        assert!(!ops[0]
+            .resolution_flags
+            .iter()
+            .any(|f| f.starts_with("api_fee_rate:")));
+        assert!(
+            ops[0]
+                .resolution_flags
+                .iter()
+                .any(|f| f.starts_with("fee_formula_unsupported:")),
+            "got: {:?}",
+            ops[0].resolution_flags
+        );
+    }
+
+    /// Legs are costed one by one, so an event whose markets disagree about their fees is
+    /// not costed at whichever rate happened to be first.
+    #[test]
+    fn legs_of_one_event_can_carry_different_rates() {
+        // YES leg: fees off (rate 0). NO leg: nothing stated → sports 0.05.
+        // The two legs are the two sides of ONE market, so this is deliberately synthetic:
+        // it proves the plumbing is per leg, which is what protects a mixed event.
+        let mut markets = vec![market_with_fees(
+            0,
+            MarketFees {
+                enabled: Some(false),
+                ..MarketFees::default()
+            },
+        )];
+        markets[0].question = "mixed".into();
+        let mixed = TrackedEvent {
+            ..event(false, "sports", markets)
+        };
+        let ops = run(&cfg(), mixed, fee_probe_books());
+        assert_eq!(ops.len(), 1);
+        // Both legs belong to the same market here, so both are zero — the interesting
+        // assertion is that the per-leg rate is recorded rather than an event-wide one.
+        assert!(ops[0].legs.iter().all(|l| l.fee_rate == dec!(0)));
+
+        // And the cost model itself really does apply the rates leg by leg.
+        let legs = [
+            LegPrices {
+                best_ask: dec!(0.10),
+                best_bid: Some(dec!(0.09)),
+                vwap: dec!(0.10),
+            },
+            LegPrices {
+                best_ask: dec!(0.85),
+                best_bid: Some(dec!(0.84)),
+                vwap: dec!(0.85),
+            },
+        ];
+        // 0·0.10·0.90 + 0.05·0.85·0.15 = 0.006375
+        let split = crate::costs::breakdown(dec!(1), &legs, &[dec!(0), dec!(0.05)], dec!(10));
+        assert_eq!(split.fee_taker, dec!(0.006375));
     }
 
     // --- NegRisk -------------------------------------------------------------------

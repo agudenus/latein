@@ -194,6 +194,16 @@ struct Daemon {
     gamma: Arc<PaginationState>,
 }
 
+/// An error rendered with its whole cause chain.
+///
+/// `anyhow`'s plain `Display` prints only the outermost context, so the discovery retry
+/// line read `market discovery via the Gamma API at … failed` on every attempt and never
+/// said *why*. The alternate form (`{:#}`) appends each `Caused by` link inline, which is
+/// what turns "discovery is broken" into "discovery parsed 0 events from /events/keyset".
+fn error_chain(err: &anyhow::Error) -> String {
+    format!("{err:#}")
+}
+
 /// Backoff between failed startup discovery attempts: start at the daemon's own scan
 /// cadence, double, cap at a minute. With the shipped 5 s interval that is 5→10→20→40→60 s.
 fn discovery_backoff(scan_interval_secs: u64, attempt: u32) -> Duration {
@@ -296,7 +306,7 @@ impl Daemon {
                         // Keep scanning the last known universe rather than going blind — and
                         // never propagate: a discovery hiccup mid-run must not end the run.
                         tracing::error!(
-                            %err,
+                            err = %error_chain(&err),
                             events = universe.events.len(),
                             markets = universe.market_count(),
                             universe_refresh_secs = self.cfg.daemon.universe_refresh_secs,
@@ -460,7 +470,7 @@ impl Daemon {
                     attempt += 1;
                     let wait = discovery_backoff(self.cfg.daemon.scan_interval_secs, attempt);
                     tracing::error!(
-                        %err,
+                        err = %error_chain(&err),
                         attempt,
                         retry_in_secs = wait.as_secs(),
                         "market discovery failed at startup — retrying; the daemon stays up \
@@ -2291,6 +2301,104 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Somewhere to collect what the daemon logged.
+    #[derive(Clone)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The retry line is the *only* thing an operator sees while discovery is failing, so
+    /// it has to carry the whole cause chain. It used to log `anyhow`'s plain `Display`,
+    /// which prints the outermost context and nothing else — every attempt read "market
+    /// discovery … failed" and the actual reason (the HTTP status, the decode error, the
+    /// empty-page diagnostic) was invisible.
+    #[tokio::test]
+    async fn the_discovery_retry_line_carries_the_whole_cause_chain() {
+        let (base, _attempts) =
+            mock_api_flaky_events(MOCK_EVENTS, MOCK_BOOKS, EventsFailure::FirstAttempt).await;
+        let tmp = std::env::temp_dir().join(format!("polyarb-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mut cfg = Config::default();
+        cfg.api.gamma_base_url = base.clone();
+        cfg.api.clob_base_url = base;
+        cfg.api.min_request_interval_ms = 0;
+        cfg.api.max_retries = 0;
+        cfg.daemon.scan_interval_secs = 1;
+        cfg.lifecycle.repoll_interval_secs = 1;
+        cfg.lifecycle.repoll_window_secs = 1;
+        cfg.alerts.telegram_api_base = "http://127.0.0.1:1".into();
+        cfg.storage.database_path = tmp.join("polyarb.sqlite").display().to_string();
+        cfg.storage.log_dir = tmp.join("logs").display().to_string();
+        cfg.storage.report_dir = tmp.join("reports").display().to_string();
+        cfg.stream.enabled = false;
+        cfg.validate().expect("config must validate");
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(LogCapture(buffer.clone()))
+                .with_ansi(false)
+                .with_max_level(tracing::Level::ERROR)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            run(cfg, Some(1)).await.expect("daemon run");
+        }
+
+        let log = String::from_utf8_lossy(&buffer.lock().expect("log buffer")).to_string();
+        assert!(
+            log.contains("market discovery failed at startup"),
+            "the retry line is missing entirely:\n{log}"
+        );
+        // The outer context…
+        assert!(
+            log.contains("market discovery via the Gamma API"),
+            "got:\n{log}"
+        );
+        // …and the nested cause, which plain `Display` would have dropped on the floor.
+        assert!(
+            log.contains("HTTP 500"),
+            "the cause chain is missing from the retry line:\n{log}"
+        );
+        assert!(log.contains("upstream is having a moment"), "got:\n{log}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The renderer itself, over a hand-built chain.
+    #[test]
+    fn error_chain_renders_every_link() {
+        let err = anyhow::anyhow!("the root cause")
+            .context("the middle")
+            .context("the outermost thing that failed");
+        let rendered = error_chain(&err);
+        assert!(rendered.contains("the outermost thing that failed"));
+        assert!(rendered.contains("the middle"));
+        assert!(rendered.contains("the root cause"));
+        // Plain Display is exactly what the bug was: only the outermost link.
+        assert!(!format!("{err}").contains("the root cause"));
     }
 
     /// A refresh that fails mid-run is a hiccup, not the end: the previous universe stays,

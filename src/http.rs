@@ -47,6 +47,17 @@ pub enum ApiError {
         #[source]
         source: serde_json::Error,
     },
+    /// The endpoint answered and the body was valid JSON, but nothing usable came out of
+    /// it. Polymarket always has active events, so this is a response-shape mismatch until
+    /// proven otherwise — and it must say so in one line, because the daemon's only visible
+    /// symptom is an endless discovery retry. (2026-07-30: the live `/events/keyset`
+    /// envelope key turned out to be `events`, which this parser did not accept.)
+    #[error("discovery parsed {events} events from {url} — response shape mismatch? ({detail})")]
+    EmptyDiscovery {
+        url: String,
+        events: usize,
+        detail: String,
+    },
 }
 
 pub struct HttpClient {

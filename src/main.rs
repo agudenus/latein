@@ -249,6 +249,16 @@ async fn run_markets(cfg: &Config, show: usize) -> Result<()> {
         entry.1 += event.markets.len();
     }
     println!("\n  category        fee     floor taker  floor maker   events  markets");
+    // The table below is the *fallback* tier per category. Since 2026-07-30 the detectors
+    // prefer whatever rate Gamma states on the market itself, so say how many markets that
+    // covers rather than letting the table read as the whole truth.
+    if stats.markets_with_api_fee > 0 {
+        println!(
+            "  (fee column = category fallback; {} of {} tracked markets state their own rate \
+             via the API and are costed at that instead)",
+            stats.markets_with_api_fee, stats.markets_kept
+        );
+    }
     for (name, (events, markets)) in &by_category {
         let category = Category::new(name.clone());
         println!(

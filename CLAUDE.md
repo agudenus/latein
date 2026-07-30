@@ -49,9 +49,9 @@ Key concepts Claude should know when working here:
 Rust binary crate `polyarb` (Phase A: scanner + dry-run only; no wallet/key code exists).
 
 - `src/main.rs` — CLI: `markets` (universe discovery), `scan` (one-shot detection), `run` (dry-run daemon; refuses any mode other than `dry-run`), `report [--date]` (daily summary).
-- `src/gamma.rs` / `src/clob.rs` / `src/http.rs` — Gamma `/events` discovery, CLOB batch book fetch, shared throttled/retrying transport.
-- `src/types.rs` — Decimal-only domain types (**no f64 in any money path — enforced convention**).
-- `src/costs.rs` — verified fee curve + cost decomposition (`net_maker = gross_gap + spread_cost` identity).
+- `src/gamma.rs` / `src/clob.rs` / `src/http.rs` — Gamma `/events` discovery, CLOB batch book fetch, shared throttled/retrying transport. The live `/events/keyset` envelope (`{$schema, events[], next_cursor}`, verified 2026-07-30) is parsed alongside the legacy bare-array and `{data}` shapes; a discovery pass that yields zero events is an `ApiError::EmptyDiscovery` naming the count and the endpoint, never a silent empty universe.
+- `src/types.rs` — Decimal-only domain types (**no f64 in any money path — enforced convention**), including `MarketFees` (Gamma's per-market `feesEnabled`/`feeType`/`feeSchedule`).
+- `src/costs.rs` — verified fee curve + cost decomposition (`net_maker = gross_gap + spread_cost` identity). `breakdown` takes **one taker rate per leg**; `FeeModel::resolve` prefers the market's API-stated rate (`feesEnabled=false` ⇒ 0; `feeSchedule.rate` with exponent 1 ⇒ that rate) and falls back to the category table when the API says nothing or states a formula this build does not implement (counted, and warned once per refresh).
 - `src/detect.rs` — binary, NegRisk YES-side, NegRisk NO-side detectors; depth-walked joint sizing.
 - `src/risk.rs` — per-trade cap (Phase A scope).
 - `src/store.rs` — SQLite persistence; money stored as TEXT Decimal strings, never REAL.
