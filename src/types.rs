@@ -303,6 +303,49 @@ impl MarketFees {
     }
 }
 
+/// Gamma's own per-market activity figures — a **pruning input only**.
+///
+/// M6.4. A live discovery pass tracks ~44 000 markets, and most of them cannot fill a $50
+/// order; they still cost a WebSocket subscription, a slot in every REST sweep and a share
+/// of the rate-limit budget. These numbers are how the universe is cut down to the markets
+/// worth watching (see `scan.activity_floor`).
+///
+/// They are **never** used for sizing, profit or slippage math. CLAUDE.md is explicit on
+/// why: reported volume is double-counted and was up to ~60% wash trading, and liquidity
+/// must be measured from order book depth. A reported figure is good enough to answer "is
+/// this market alive at all?" and nothing more.
+///
+/// Every field is optional: the legacy `/events` payload carries none of them, and absence
+/// means "the API said nothing", which the floor treats as a keep — never as a zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketActivity {
+    /// `liquidityClob`, else `liquidityNum`, else `liquidity` (see `gamma::market_activity`).
+    #[serde(default)]
+    pub liquidity: Option<Decimal>,
+    /// `volume24hrClob`, else `volume24hr`.
+    #[serde(default)]
+    pub volume_24h: Option<Decimal>,
+    /// `spread`. Captured for diagnostics; the floor does not read it (the executable
+    /// spread comes from the book, not from a reported aggregate).
+    #[serde(default)]
+    pub spread: Option<Decimal>,
+    #[serde(default)]
+    pub best_bid: Option<Decimal>,
+    #[serde(default)]
+    pub best_ask: Option<Decimal>,
+}
+
+impl MarketActivity {
+    /// True when Gamma reported none of these figures for this market.
+    pub fn is_empty(&self) -> bool {
+        self.liquidity.is_none()
+            && self.volume_24h.is_none()
+            && self.spread.is_none()
+            && self.best_bid.is_none()
+            && self.best_ask.is_none()
+    }
+}
+
 /// A tracked market: one binary condition with exactly two outcome tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackedMarket {
@@ -314,6 +357,10 @@ pub struct TrackedMarket {
     /// What Gamma says about this market's fees. Empty for the legacy endpoint.
     #[serde(default)]
     pub fees: MarketFees,
+    /// What Gamma says about this market's activity. Used only to decide whether the
+    /// market is worth tracking at all — never in any money path.
+    #[serde(default)]
+    pub activity: MarketActivity,
     /// Order-book constraints Gamma publishes per market. Captured for Phase B execution
     /// (tick-size rounding, minimum order size) and for the liquidity-reward qualification
     /// parameters; nothing in Phase A reads them.
@@ -426,6 +473,21 @@ impl Universe {
 
     pub fn neg_risk_event_count(&self) -> usize {
         self.events.iter().filter(|e| e.neg_risk).count()
+    }
+
+    /// How many distinct token ids the universe holds — one WebSocket subscription and one
+    /// `/books` slot each, so it is the number that actually drives the scan's cost.
+    ///
+    /// Counts without cloning: at live scale [`token_ids`](Self::token_ids) allocates tens
+    /// of thousands of strings, which is far too much for a log line.
+    pub fn token_count(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        self.events
+            .iter()
+            .flat_map(|e| &e.markets)
+            .flat_map(|m| &m.token_ids)
+            .filter(|token| seen.insert(*token))
+            .count()
     }
 
     /// Every token id in the universe, de-duplicated, in stable order.
@@ -725,6 +787,7 @@ mod tests {
             token_ids: [TokenId::new("a"), TokenId::new("b")],
             fees: MarketFees::default(),
             trading: MarketTrading::default(),
+            activity: MarketActivity::default(),
         };
         assert_eq!(m.yes_token().as_str(), "b");
         assert_eq!(m.no_token().as_str(), "a");

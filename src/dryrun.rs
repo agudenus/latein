@@ -506,10 +506,15 @@ impl Daemon {
         tracing::info!(
             events = universe.events.len(),
             markets = universe.market_count(),
+            // The number that actually drives cost: one subscription and one `/books` slot
+            // each, so this is what the activity floor is there to hold down.
+            tokens = universe.token_count(),
             negrisk_events = universe.neg_risk_event_count(),
             partial_negrisk_events = partial_negrisk,
             markets_seen = stats.markets_seen,
             dropped_markets = stats.markets_dropped(),
+            markets_below_activity_floor = stats.drops.below_activity_floor,
+            events_below_activity_floor = stats.events_below_activity_floor,
             drop_reasons = %stats.drops.summary(),
             truncated = stats.truncated,
             "market universe refreshed"

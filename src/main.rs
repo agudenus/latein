@@ -205,6 +205,26 @@ async fn run_markets(cfg: &Config, show: usize) -> Result<()> {
         universe.neg_risk_event_count(),
         universe.events.len()
     );
+    if cfg.scan.activity_floor.enabled {
+        // Markets Gamma told us nothing about are kept unjudged, by design — but if that
+        // is most of them the floor is not doing what the operator thinks it is.
+        let unjudged = universe
+            .events
+            .iter()
+            .flat_map(|e| &e.markets)
+            .filter(|m| m.activity.is_empty())
+            .count();
+        println!(
+            "  activity floor: {} market(s) pruned as untradeable dust ({} whole NegRisk \
+             event(s) among them); min_liquidity_usd = {}, min_volume24h_usd = {}. \
+             {unjudged} tracked market(s) report no activity figures at all and are kept \
+             unjudged. Reported figures prune only — sizing stays book-depth-based.",
+            stats.drops.below_activity_floor,
+            stats.events_below_activity_floor,
+            cfg.scan.activity_floor.min_liquidity_usd,
+            cfg.scan.activity_floor.min_volume24h_usd,
+        );
+    }
     // Partial coverage is why a "3.2¢ two-outcome election arb" is not one; say so up
     // front rather than leaving it to be discovered in the opportunity flags.
     let partial: Vec<&crate::types::TrackedEvent> = universe

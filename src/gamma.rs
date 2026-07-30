@@ -53,11 +53,11 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::config::Config;
+use crate::config::{ActivityFloor, Config};
 use crate::http::{ApiError, HttpClient};
 use crate::types::{
-    de_opt_decimal, Category, MarketFees, MarketTrading, TokenId, TrackedEvent, TrackedMarket,
-    Universe,
+    de_opt_decimal, Category, MarketActivity, MarketFees, MarketTrading, TokenId, TrackedEvent,
+    TrackedMarket, Universe,
 };
 
 /// What the discovery pass kept and dropped — printed by `polyarb markets` and logged on
@@ -69,6 +69,10 @@ pub struct DiscoveryStats {
     pub events_inactive: usize,
     /// Events that survived the active/closed filter but had no priceable market left.
     pub events_no_usable_market: usize,
+    /// NegRisk events dropped whole by `scan.activity_floor` — no constituent outcome was
+    /// active enough to be worth tracking (M6.4). Their markets are counted in
+    /// [`DropCounts::below_activity_floor`].
+    pub events_below_activity_floor: usize,
     /// Every market Gamma listed, across every event, before any filtering.
     pub markets_seen: usize,
     pub markets_kept: usize,
@@ -111,6 +115,9 @@ pub struct DropCounts {
     /// Belonged to an event that was dropped whole (closed/inactive event, or an event
     /// left with no priceable market). Counted here so `markets_seen` balances.
     pub event_dropped: usize,
+    /// Priceable, but below `scan.activity_floor` — untradeable dust (M6.4). For a NegRisk
+    /// event that failed the floor as a whole, *all* of its priceable outcomes land here.
+    pub below_activity_floor: usize,
     /// Any drop path that does not fit the buckets above.
     pub other: usize,
 }
@@ -123,6 +130,7 @@ impl DropCounts {
             + self.not_binary
             + self.no_condition_id
             + self.event_dropped
+            + self.below_activity_floor
             + self.other
     }
 
@@ -145,6 +153,7 @@ impl DropCounts {
             ("not_binary", self.not_binary),
             ("no_condition_id", self.no_condition_id),
             ("event_dropped", self.event_dropped),
+            ("below_activity_floor", self.below_activity_floor),
             ("other", self.other),
         ];
         let parts: Vec<String> = buckets
@@ -270,6 +279,35 @@ pub struct RawMarket {
         deserialize_with = "de_opt_decimal"
     )]
     pub rewards_max_spread: Option<rust_decimal::Decimal>,
+
+    // ---- activity figures (M6.4) -------------------------------------------------
+    // Present on live Gamma market objects in several spellings, and *all* optional: the
+    // legacy `/events` payload carries none of them. They feed the activity floor only —
+    // never sizing or profit math (see `crate::types::MarketActivity`).
+    /// `liquidityClob` — CLOB-book liquidity, the variant we prefer.
+    #[serde(default, rename = "liquidityClob", deserialize_with = "de_opt_decimal")]
+    pub liquidity_clob: Option<rust_decimal::Decimal>,
+    /// `liquidityNum` — the numeric all-venue variant.
+    #[serde(default, rename = "liquidityNum", deserialize_with = "de_opt_decimal")]
+    pub liquidity_num: Option<rust_decimal::Decimal>,
+    /// `liquidity` — the string variant, last resort.
+    #[serde(default, deserialize_with = "de_opt_decimal")]
+    pub liquidity: Option<rust_decimal::Decimal>,
+    /// `volume24hrClob`, preferred over the all-venue `volume24hr`.
+    #[serde(
+        default,
+        rename = "volume24hrClob",
+        deserialize_with = "de_opt_decimal"
+    )]
+    pub volume_24hr_clob: Option<rust_decimal::Decimal>,
+    #[serde(default, rename = "volume24hr", deserialize_with = "de_opt_decimal")]
+    pub volume_24hr: Option<rust_decimal::Decimal>,
+    #[serde(default, deserialize_with = "de_opt_decimal")]
+    pub spread: Option<rust_decimal::Decimal>,
+    #[serde(default, rename = "bestBid", deserialize_with = "de_opt_decimal")]
+    pub best_bid: Option<rust_decimal::Decimal>,
+    #[serde(default, rename = "bestAsk", deserialize_with = "de_opt_decimal")]
+    pub best_ask: Option<rust_decimal::Decimal>,
 }
 
 /// `{"exponent": 1, "rate": 0.04, "takerOnly": true, "rebateRate": 0.25}`.
@@ -356,8 +394,33 @@ pub fn parse_next_cursor(body: &str) -> Option<String> {
         .filter(|c| !c.is_empty())
 }
 
-/// Turn raw events into the tracked universe, dropping anything we cannot price.
-pub fn build_universe(raw: &[RawEvent]) -> (Universe, DiscoveryStats) {
+/// Turn raw events into the tracked universe, dropping anything we cannot price and
+/// anything `floor` says is not worth tracking.
+///
+/// Two filters run, in this order, and the order is the point:
+///
+/// 1. **Structural** ([`classify_market`]) — closed, order-book-disabled, unparseable. A
+///    market that fails here is dropped for *that* reason and never reaches the floor, so
+///    the drop breakdown keeps saying what actually happened.
+/// 2. **The activity floor** — untradeable dust, by Gamma's own reported figures.
+///
+/// The floor's granularity depends on the event:
+///
+/// * **NegRisk events are judged as a whole.** The event is kept if *any* constituent
+///   market passes (or cannot be judged), and when it is kept **every** priceable outcome
+///   is tracked regardless of its own activity. Pruning individual legs of a
+///   mutually-exclusive event would be actively harmful: a sweep only pays $1 (YES) or
+///   $(N−1) (NO) when it spans every outcome, so a filter-induced hole would either
+///   suppress the event through the full-coverage guard or, worse, look like a lock that
+///   is not one. An event where nothing passes is dropped whole, and all of its priceable
+///   markets are counted in [`DropCounts::below_activity_floor`].
+/// * **Binary (non-NegRisk) events filter market by market.** Their markets are
+///   independent conditions; a dead one next to a live one costs coverage nothing.
+///
+/// In both cases a market carrying none of the fields an enabled criterion reads is
+/// **kept** — see [`ActivityFloor::judge`]. Absence of data must never silently drop a
+/// tradable market. A disabled floor tracks everything priceable, exactly as before M6.4.
+pub fn build_universe(raw: &[RawEvent], floor: &ActivityFloor) -> (Universe, DiscoveryStats) {
     let mut stats = DiscoveryStats::default();
     let mut events = Vec::new();
 
@@ -384,20 +447,42 @@ pub fn build_universe(raw: &[RawEvent]) -> (Universe, DiscoveryStats) {
             .collect();
         let category = Category::resolve(ev.category.as_deref(), &tags);
 
+        // Filter 1: structural. Every market that cannot be priced is dropped here, under
+        // its own reason, before liquidity is ever looked at.
         let mut markets = Vec::new();
         for m in &ev.markets {
             match classify_market(m) {
-                Ok(tm) => {
-                    stats.markets_kept += 1;
-                    if tm.fees.api_rate().is_some() {
-                        stats.markets_with_api_fee += 1;
-                    }
-                    if tm.fees.exponent_unsupported() {
-                        stats.markets_unsupported_fee_formula += 1;
-                    }
-                    markets.push(tm);
-                }
+                Ok(tm) => markets.push(tm),
                 Err(reason) => stats.drops.record(reason),
+            }
+        }
+
+        // Filter 2: the activity floor (M6.4).
+        let neg_risk = ev.neg_risk.unwrap_or(false);
+        if neg_risk {
+            // Judged in aggregate: one live outcome carries the whole event, and the whole
+            // event is then tracked. An event with nothing priceable left falls through to
+            // the `events_no_usable_market` arm below instead — its markets already carry
+            // their own structural drop reason.
+            let passes = markets.is_empty() || markets.iter().any(|m| floor.keeps(&m.activity));
+            if !passes {
+                stats.events_below_activity_floor += 1;
+                stats.drops.below_activity_floor += markets.len();
+                continue;
+            }
+        } else {
+            let before = markets.len();
+            markets.retain(|m| floor.keeps(&m.activity));
+            stats.drops.below_activity_floor += before - markets.len();
+        }
+
+        for tm in &markets {
+            stats.markets_kept += 1;
+            if tm.fees.api_rate().is_some() {
+                stats.markets_with_api_fee += 1;
+            }
+            if tm.fees.exponent_unsupported() {
+                stats.markets_unsupported_fee_formula += 1;
             }
         }
 
@@ -418,7 +503,7 @@ pub fn build_universe(raw: &[RawEvent]) -> (Universe, DiscoveryStats) {
             id: ev.id.clone().unwrap_or_else(|| slug.clone()),
             title: ev.title.clone().unwrap_or_else(|| slug.clone()),
             slug,
-            neg_risk: ev.neg_risk.unwrap_or(false),
+            neg_risk,
             category,
             // The *pre-filter* count: this is what the full-coverage guard compares
             // `markets.len()` against, so it must include everything we just dropped.
@@ -481,6 +566,7 @@ fn classify_market(m: &RawMarket) -> Result<TrackedMarket, DropReason> {
         outcomes,
         token_ids: [TokenId::new(&tokens[0]), TokenId::new(&tokens[1])],
         fees: market_fees(m),
+        activity: market_activity(m),
         trading: MarketTrading {
             min_tick_size: m.order_price_min_tick_size,
             min_order_size: m.order_min_size,
@@ -505,6 +591,22 @@ fn market_fees(m: &RawMarket) -> MarketFees {
         exponent: schedule.and_then(|s| s.exponent),
         taker_only: schedule.and_then(|s| s.taker_only),
         rebate_rate: schedule.and_then(|s| s.rebate_rate),
+    }
+}
+
+/// Fold Gamma's several spellings of the activity figures into the domain type.
+///
+/// The CLOB-specific variants win where they exist: the scanner trades the CLOB book, so
+/// `liquidityClob` describes the venue we care about, while `liquidity`/`liquidityNum` can
+/// include activity we can never touch. Nothing here is a fallback to zero — an absent
+/// figure stays `None`, which the floor reads as "unknown", not "dead".
+fn market_activity(m: &RawMarket) -> MarketActivity {
+    MarketActivity {
+        liquidity: m.liquidity_clob.or(m.liquidity_num).or(m.liquidity),
+        volume_24h: m.volume_24hr_clob.or(m.volume_24hr),
+        spread: m.spread,
+        best_bid: m.best_bid,
+        best_ask: m.best_ask,
     }
 }
 
@@ -549,6 +651,7 @@ pub struct GammaClient<'a> {
     page_size: usize,
     max_events: usize,
     cursor_param: String,
+    activity_floor: ActivityFloor,
     state: Arc<PaginationState>,
 }
 
@@ -567,6 +670,7 @@ impl<'a> GammaClient<'a> {
             page_size: cfg.scan.page_size,
             max_events: cfg.scan.max_events,
             cursor_param: cfg.scan.keyset_cursor_param.trim().to_string(),
+            activity_floor: cfg.scan.activity_floor,
             state,
         }
     }
@@ -598,7 +702,7 @@ impl<'a> GammaClient<'a> {
             }
         };
 
-        let (universe, mut stats) = build_universe(&fetched.events);
+        let (universe, mut stats) = build_universe(&fetched.events, &self.activity_floor);
         stats.truncated = fetched.truncated;
         tracing::info!(
             events_seen = stats.events_seen,
@@ -608,6 +712,9 @@ impl<'a> GammaClient<'a> {
             markets_dropped = stats.markets_dropped(),
             drop_reasons = %stats.drops.summary(),
             markets_with_api_fee = stats.markets_with_api_fee,
+            markets_below_activity_floor = stats.drops.below_activity_floor,
+            events_below_activity_floor = stats.events_below_activity_floor,
+            tracked_tokens = universe.token_count(),
             "market discovery drop breakdown"
         );
         // Once per refresh, with the count — an unknown fee curve is priced from the
@@ -635,13 +742,31 @@ impl<'a> GammaClient<'a> {
                      parse_events_page against a fresh response"
                         .to_string()
                 } else {
+                    // Name the activity floor explicitly when it is what emptied the
+                    // universe: a floor set too high looks exactly like a shape mismatch
+                    // from the daemon's endlessly repeating retry line.
+                    let floor = if self.activity_floor.enabled
+                        && (stats.events_below_activity_floor > 0
+                            || stats.drops.below_activity_floor > 0)
+                    {
+                        format!(
+                            "; scan.activity_floor pruned {} event(s) and {} market(s) — \
+                             lower min_liquidity_usd ({}) or disable it",
+                            stats.events_below_activity_floor,
+                            stats.drops.below_activity_floor,
+                            self.activity_floor.min_liquidity_usd,
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
                         "{} event(s) parsed but every one was filtered out ({} inactive or \
-                         closed, {} with no priceable market; market drops: {})",
+                         closed, {} with no priceable market; market drops: {}{})",
                         stats.events_seen,
                         stats.events_inactive,
                         stats.events_no_usable_market,
-                        stats.drops.summary()
+                        stats.drops.summary(),
+                        floor,
                     )
                 },
             });
@@ -892,6 +1017,16 @@ mod tests {
         parse_events_page("test", EVENTS).expect("fixture must parse")
     }
 
+    /// The pre-M6.4 behaviour: track everything priceable. Everything that is not
+    /// specifically an activity-floor test is asserted against this, so the floor cannot
+    /// quietly change what the rest of discovery does.
+    fn no_floor() -> ActivityFloor {
+        ActivityFloor {
+            enabled: false,
+            ..ActivityFloor::default()
+        }
+    }
+
     #[test]
     fn parses_a_realistic_events_page() {
         let raw = parsed();
@@ -914,7 +1049,7 @@ mod tests {
 
     #[test]
     fn universe_keeps_negrisk_and_binary_and_drops_the_rest() {
-        let (universe, stats) = build_universe(&parsed());
+        let (universe, stats) = build_universe(&parsed(), &no_floor());
 
         assert_eq!(stats.events_seen, 4);
         // event 0: negrisk politics (3 markets, one closed) ; event 1: binary sports ;
@@ -968,7 +1103,7 @@ mod tests {
             {"conditionId":"0xabc","clobTokenIds":"[\"1\",\"2\"]","somethingElse":42}
         ]}]"#;
         let raw = parse_events_page("test", body).expect("must tolerate unknown fields");
-        let (u, _) = build_universe(&raw);
+        let (u, _) = build_universe(&raw, &no_floor());
         assert_eq!(u.market_count(), 1);
         // Missing `outcomes` falls back to the Yes/No convention.
         assert_eq!(u.events[0].markets[0].outcomes, ["Yes", "No"]);
@@ -994,7 +1129,10 @@ mod tests {
           {"id":"5","slug":"absent","markets":[
             {"conditionId":"0x5","clobTokenIds":"[\"9\",\"10\"]"}]}
         ]"#;
-        let (universe, _) = build_universe(&parse_events_page("test", body).expect("parses"));
+        let (universe, _) = build_universe(
+            &parse_events_page("test", body).expect("parses"),
+            &no_floor(),
+        );
         let expected = chrono::DateTime::parse_from_rfc3339("2026-07-29T12:05:00Z")
             .expect("literal")
             .with_timezone(&chrono::Utc);
@@ -1049,7 +1187,7 @@ mod tests {
         );
 
         // And the whole page must survive the trip into the tracked universe.
-        let (universe, stats) = build_universe(&page);
+        let (universe, stats) = build_universe(&page, &no_floor());
         assert_eq!(stats.events_seen, 2);
         assert_eq!(stats.events_kept, 2);
         assert_eq!(stats.markets_kept, 3);
@@ -1063,8 +1201,10 @@ mod tests {
     /// tell apart.
     #[test]
     fn per_market_fee_data_is_parsed_including_the_disabled_and_absent_cases() {
-        let (universe, stats) =
-            build_universe(&parse_events_page("test", KEYSET).expect("fixture"));
+        let (universe, stats) = build_universe(
+            &parse_events_page("test", KEYSET).expect("fixture"),
+            &no_floor(),
+        );
 
         // Fees on, standard curve, rate stated.
         let politics = &universe.events[0].markets[0].fees;
@@ -1097,7 +1237,7 @@ mod tests {
 
         // The legacy fixture carries none of these fields: everything stays unknown, and
         // the category table keeps deciding (that path must not regress).
-        let (legacy, legacy_stats) = build_universe(&parsed());
+        let (legacy, legacy_stats) = build_universe(&parsed(), &no_floor());
         assert_eq!(legacy.events[0].markets[0].fees, MarketFees::default());
         assert_eq!(legacy.events[0].markets[0].fees.api_rate(), None);
         assert_eq!(legacy_stats.markets_with_api_fee, 0);
@@ -1106,7 +1246,10 @@ mod tests {
         let exotic = r#"{"events":[{"id":"1","slug":"x","active":true,"closed":false,"markets":[
             {"conditionId":"0x1","clobTokenIds":"[\"1\",\"2\"]","feesEnabled":true,
              "feeType":"crypto_fees","feeSchedule":{"exponent":2,"rate":"0.07"}}]}]}"#;
-        let (u, s) = build_universe(&parse_events_page("test", exotic).expect("parses"));
+        let (u, s) = build_universe(
+            &parse_events_page("test", exotic).expect("parses"),
+            &no_floor(),
+        );
         assert_eq!(u.events[0].markets[0].fees.rate, Some(dec!(0.07)));
         assert_eq!(u.events[0].markets[0].fees.api_rate(), None);
         assert!(u.events[0].markets[0].fees.exponent_unsupported());
@@ -1154,7 +1297,7 @@ mod tests {
           ]}
         ]"#;
         let raw = parse_events_page("test", body).expect("parses");
-        let (universe, stats) = build_universe(&raw);
+        let (universe, stats) = build_universe(&raw, &no_floor());
 
         assert_eq!(stats.events_seen, 2);
         assert_eq!(stats.events_kept, 1);
@@ -1167,6 +1310,7 @@ mod tests {
         assert_eq!(stats.drops.not_binary, 1); // three token ids
         assert_eq!(stats.drops.no_condition_id, 1);
         assert_eq!(stats.drops.event_dropped, 2); // both markets of the closed event
+        assert_eq!(stats.drops.below_activity_floor, 0, "the floor is off here");
         assert_eq!(stats.drops.other, 0);
         assert_eq!(stats.drops.total(), 10);
         assert_eq!(stats.markets_kept + stats.drops.total(), stats.markets_seen);
@@ -1193,6 +1337,311 @@ mod tests {
         }
         // Zero buckets are omitted so the log line stays short.
         assert!(!line.contains("other="), "got: {line}");
+        assert!(!line.contains("below_activity_floor="), "got: {line}");
+    }
+
+    // --- the activity floor (M6.4) -----------------------------------------------------
+
+    /// Four events covering every shape the floor has to get right: a binary event mixing
+    /// liquid, dust, silent and oddly-spelled markets; a NegRisk event with one liquid
+    /// outcome and two dead ones; a NegRisk event that is dead throughout; and a binary
+    /// event whose only market is dust.
+    const ACTIVITY: &str = include_str!("../tests/fixtures/gamma_events_activity.json");
+
+    fn activity_events() -> Vec<RawEvent> {
+        parse_events_page("test", ACTIVITY).expect("activity fixture must parse")
+    }
+
+    /// The shipped floor: $100 of reported CLOB liquidity, volume criterion off.
+    fn shipped_floor() -> ActivityFloor {
+        ActivityFloor::default()
+    }
+
+    fn slugs(universe: &Universe) -> Vec<&str> {
+        universe.events.iter().map(|e| e.slug.as_str()).collect()
+    }
+
+    fn questions(event: &TrackedEvent) -> Vec<&str> {
+        event.markets.iter().map(|m| m.question.as_str()).collect()
+    }
+
+    /// (a) + (b): a binary event is filtered market by market — dust goes, and a market
+    /// Gamma said *nothing* about stays. The second half is the one that matters: the
+    /// legacy `/events` payload carries no activity fields at all, and treating a missing
+    /// figure as a zero would silently delete the entire tracked universe.
+    #[test]
+    fn a_binary_event_drops_dust_and_keeps_markets_with_no_activity_data() {
+        let (universe, stats) = build_universe(&activity_events(), &shipped_floor());
+        let binary = universe
+            .events
+            .iter()
+            .find(|e| e.slug == "binary-mixed-liquidity")
+            .expect("the binary event survives — it has liquid markets");
+
+        assert_eq!(
+            questions(binary),
+            vec![
+                "Liquid: comfortably above the floor",
+                "Silent: Gamma reports no activity figures at all (legacy shape)",
+                "String spelling: only the `liquidity` string variant is present",
+            ],
+            "kept: above the floor, unjudgeable, and above the floor via the string spelling"
+        );
+        // The three that went: $12.50 of book, the CLOB-dead one whose other spellings are
+        // inflated, and the bursty one (its volume cannot save it while that floor is 0).
+        assert_eq!(binary.total_outcomes, 6, "the denominator is pre-filter");
+        assert_eq!(binary.missing_outcomes(), 3);
+
+        // The silent market really is silent, and the string-spelled one really was read.
+        let silent = &binary.markets[1];
+        assert!(silent.activity.is_empty());
+        assert_eq!(silent.activity.liquidity, None);
+        assert_eq!(binary.markets[2].activity.liquidity, Some(dec!(250.75)));
+        // …and the live spellings round-trip, CLOB variant preferred.
+        assert_eq!(binary.markets[0].activity.liquidity, Some(dec!(5000)));
+        assert_eq!(binary.markets[0].activity.volume_24h, Some(dec!(1200)));
+        assert_eq!(binary.markets[0].activity.spread, Some(dec!(0.01)));
+        assert_eq!(binary.markets[0].activity.best_bid, Some(dec!(0.33)));
+        assert_eq!(binary.markets[0].activity.best_ask, Some(dec!(0.34)));
+
+        // (e) The books balance with the new bucket in play.
+        assert_eq!(stats.markets_seen, 12);
+        assert_eq!(stats.markets_kept, 6);
+        assert_eq!(stats.drops.below_activity_floor, 6);
+        assert_eq!(
+            stats.drops.total(),
+            6,
+            "nothing was dropped for any other reason"
+        );
+        assert_eq!(
+            stats.markets_kept + stats.markets_dropped(),
+            stats.markets_seen
+        );
+        assert!(
+            stats.drops.summary().contains("below_activity_floor=6"),
+            "got: {}",
+            stats.drops.summary()
+        );
+    }
+
+    /// (c) **The NegRisk rule.** One liquid outcome keeps the whole event, and every leg
+    /// comes with it — including the two nobody is trading. Pruning those legs would leave
+    /// a sweep that no longer spans the outcome set, which is not a lock at all: the
+    /// dropped outcome can win and pay every remaining leg nothing. `coverage_complete`
+    /// must therefore still be true.
+    #[test]
+    fn a_negrisk_event_is_kept_whole_when_any_one_outcome_passes() {
+        let (universe, _) = build_universe(&activity_events(), &shipped_floor());
+        let event = universe
+            .events
+            .iter()
+            .find(|e| e.slug == "negrisk-one-liquid-outcome")
+            .expect("one liquid outcome carries the event");
+
+        assert!(event.neg_risk);
+        assert_eq!(event.markets.len(), 3, "all three legs are tracked");
+        assert_eq!(event.total_outcomes, 3);
+        assert!(
+            event.coverage_complete(),
+            "the floor must never manufacture partial coverage"
+        );
+        assert_eq!(event.missing_outcomes(), 0);
+
+        // The two illiquid legs are tracked *despite* individually failing the floor.
+        let floor = shipped_floor();
+        assert_eq!(event.markets[1].activity.liquidity, Some(dec!(8)));
+        assert!(!floor.keeps(&event.markets[1].activity));
+        assert_eq!(event.markets[2].activity.liquidity, Some(dec!(0))); // exactly zero
+        assert!(!floor.keeps(&event.markets[2].activity));
+        assert!(
+            floor.keeps(&event.markets[0].activity),
+            "the one that saved it"
+        );
+    }
+
+    /// (d) A NegRisk event where nothing passes is dropped whole, and its priceable markets
+    /// are accounted for in the new bucket rather than vanishing. A binary event that ends
+    /// up empty keeps its existing `events_no_usable_market` diagnosis.
+    #[test]
+    fn a_negrisk_event_below_the_floor_throughout_is_dropped_whole_and_counted() {
+        let (universe, stats) = build_universe(&activity_events(), &shipped_floor());
+
+        assert_eq!(
+            slugs(&universe),
+            vec!["binary-mixed-liquidity", "negrisk-one-liquid-outcome"]
+        );
+        assert_eq!(stats.events_seen, 4);
+        assert_eq!(stats.events_kept, 2);
+        assert_eq!(
+            stats.events_below_activity_floor, 1,
+            "only the all-dust NegRisk event is dropped *as an event*"
+        );
+        assert_eq!(
+            stats.events_no_usable_market, 1,
+            "the all-dust binary event emptied out market by market, as before"
+        );
+        assert_eq!(stats.events_inactive, 0);
+
+        // 2 markets from the dropped NegRisk event + 1 from the emptied binary event, on
+        // top of the 3 pruned inside the surviving binary event.
+        assert_eq!(stats.drops.below_activity_floor, 6);
+        assert_eq!(stats.drops.event_dropped, 0, "not a closed/inactive event");
+        assert_eq!(
+            stats.markets_kept + stats.markets_dropped(),
+            stats.markets_seen
+        );
+    }
+
+    /// (f) `enabled = false` tracks exactly what the scanner tracked before M6.4 — every
+    /// priceable market, dust included, and not one entry in the new bucket.
+    #[test]
+    fn a_disabled_floor_tracks_everything_exactly_as_before() {
+        let (universe, stats) = build_universe(&activity_events(), &no_floor());
+
+        assert_eq!(
+            slugs(&universe),
+            vec![
+                "binary-mixed-liquidity",
+                "negrisk-one-liquid-outcome",
+                "negrisk-all-dust",
+                "binary-all-dust"
+            ]
+        );
+        assert_eq!(stats.events_kept, 4);
+        assert_eq!(stats.events_below_activity_floor, 0);
+        assert_eq!(stats.events_no_usable_market, 0);
+        assert_eq!(stats.markets_seen, 12);
+        assert_eq!(stats.markets_kept, 12);
+        assert_eq!(stats.drops.below_activity_floor, 0);
+        assert_eq!(stats.drops.total(), 0);
+        assert_eq!(universe.token_count(), 24);
+
+        // Every event is fully covered, so nothing about coverage changes when the floor
+        // is switched on for the NegRisk event above.
+        assert!(universe.events.iter().all(TrackedEvent::coverage_complete));
+    }
+
+    /// Either criterion is enough. With the volume floor switched on, a market with no
+    /// resting depth but real turnover is rescued — and the criteria that are switched off
+    /// (`0`) never judge, so they can never drop anything on their own.
+    #[test]
+    fn the_two_criteria_are_independent_and_a_zero_switches_one_off() {
+        let with_volume = ActivityFloor {
+            enabled: true,
+            min_liquidity_usd: dec!(100),
+            min_volume24h_usd: dec!(1000),
+        };
+        let (universe, stats) = build_universe(&activity_events(), &with_volume);
+        let binary = &universe.events[0];
+        assert!(
+            questions(binary)
+                .contains(&"Bursty: no resting depth, but real volume in the last 24h"),
+            "volume alone must be able to keep a market: {:?}",
+            questions(binary)
+        );
+        assert_eq!(stats.markets_kept, 7);
+        assert_eq!(stats.drops.below_activity_floor, 5);
+        assert_eq!(
+            stats.markets_kept + stats.markets_dropped(),
+            stats.markets_seen
+        );
+
+        // Both criteria at zero judges nothing at all, even while "enabled".
+        let vacuous = ActivityFloor {
+            enabled: true,
+            min_liquidity_usd: Decimal::ZERO,
+            min_volume24h_usd: Decimal::ZERO,
+        };
+        let (all, stats) = build_universe(&activity_events(), &vacuous);
+        assert_eq!(all.market_count(), 12);
+        assert_eq!(stats.drops.below_activity_floor, 0);
+    }
+
+    /// The verdict table itself, case by case — this is what decides whether a tradable
+    /// market is thrown away, so each branch is asserted directly rather than inferred from
+    /// a universe count.
+    #[test]
+    fn the_floor_verdict_is_pass_fail_or_unjudgeable() {
+        let floor = shipped_floor();
+        let with = |liquidity: Option<Decimal>, volume: Option<Decimal>| MarketActivity {
+            liquidity,
+            volume_24h: volume,
+            ..MarketActivity::default()
+        };
+
+        assert_eq!(floor.judge(&with(Some(dec!(100)), None)), Some(true));
+        assert_eq!(
+            floor.judge(&with(Some(dec!(99.99)), None)),
+            Some(false),
+            "the floor is inclusive at the boundary and nowhere below it"
+        );
+        assert_eq!(floor.judge(&with(Some(Decimal::ZERO), None)), Some(false));
+        // No liquidity figure, and the volume criterion is off → nothing to judge by.
+        assert_eq!(floor.judge(&with(None, Some(dec!(1_000_000)))), None);
+        assert_eq!(floor.judge(&MarketActivity::default()), None);
+        // …and "cannot judge" is always a keep.
+        assert!(floor.keeps(&MarketActivity::default()));
+        assert!(floor.keeps(&with(None, Some(dec!(1)))));
+        assert!(!floor.keeps(&with(Some(dec!(1)), None)));
+
+        // Disabled never judges anything.
+        assert_eq!(no_floor().judge(&with(Some(Decimal::ZERO), None)), None);
+        assert!(no_floor().keeps(&with(Some(Decimal::ZERO), None)));
+    }
+
+    /// The live `/events/keyset` capture carries these fields too, so the shipped floor
+    /// must not touch a genuinely liquid universe.
+    #[test]
+    fn the_live_keyset_shape_carries_activity_data_and_survives_the_shipped_floor() {
+        let page = parse_events_page("test", KEYSET).expect("fixture");
+        let (universe, stats) = build_universe(&page, &shipped_floor());
+        assert_eq!(stats.markets_kept, 3, "nothing real is pruned");
+        assert_eq!(stats.drops.below_activity_floor, 0);
+        assert_eq!(
+            universe.events[0].markets[0].activity.liquidity,
+            Some(dec!(152340.22)),
+            "liquidityClob wins over liquidityNum and the string variant"
+        );
+        assert_eq!(
+            universe.events[0].markets[0].activity.volume_24h,
+            Some(dec!(48211.5))
+        );
+        assert_eq!(
+            universe.events[1].markets[0].activity.best_ask,
+            Some(dec!(0.12))
+        );
+    }
+
+    /// A floor set so high that it empties the universe must say so in the one line the
+    /// daemon repeats on every retry — otherwise it is indistinguishable from the response
+    /// shape moving again, which is the bug that error message exists for.
+    #[tokio::test]
+    async fn an_empty_universe_caused_by_the_floor_names_the_floor() {
+        // Every market here carries a liquidity figure, so the floor really can judge (and
+        // fail) all of them — an unjudgeable market would be kept, as it should be.
+        let body = r#"{"events":[
+          {"id":"1","slug":"a","active":true,"closed":false,"negRisk":true,"markets":[
+            {"conditionId":"0x1","clobTokenIds":"[\"1\",\"2\"]","liquidityClob":4.0},
+            {"conditionId":"0x2","clobTokenIds":"[\"3\",\"4\"]","liquidityClob":9.0}]},
+          {"id":"2","slug":"b","active":true,"closed":false,"markets":[
+            {"conditionId":"0x3","clobTokenIds":"[\"5\",\"6\"]","liquidityClob":1.0}]}
+        ]}"#;
+        let (base, _log) = gamma_stub(move |_| (200, body.to_string())).await;
+        let mut cfg = paging_config(&base, 10, 6_000);
+        cfg.scan.activity_floor = ActivityFloor {
+            enabled: true,
+            min_liquidity_usd: dec!(1_000_000),
+            min_volume24h_usd: Decimal::ZERO,
+        };
+        let http = HttpClient::new(&cfg.api).expect("client");
+        let msg = GammaClient::new(&http, &cfg)
+            .fetch_universe()
+            .await
+            .expect_err("an empty universe is still an error")
+            .to_string();
+        assert!(msg.contains("scan.activity_floor"), "got: {msg}");
+        assert!(msg.contains("min_liquidity_usd"), "got: {msg}");
+        assert!(msg.contains("below_activity_floor="), "got: {msg}");
     }
 
     // --- pagination --------------------------------------------------------------------
@@ -1725,14 +2174,16 @@ mod tests {
     }
 
     /// The shipped default must be high enough that the live universe is not silently
-    /// clipped. 500 was the original guess, 2 000 was raised to after that clipped, and a
-    /// live overnight run then filled all 20 pages of *that* — 8.3k markets / 16.6k tokens —
-    /// so the real event count is above 2 000 too.
+    /// clipped. 500 was the original guess; 2 000 replaced it after that clipped; a live
+    /// overnight run filled all 20 pages of *that*; and the 6 000 that replaced it then
+    /// filled all 60 of its own pages (5 940 events kept / 44 222 markets), so the real
+    /// active-event count is above 6 000 too. 20 000 is a runaway backstop — the activity
+    /// floor, not this number, is what decides how much gets tracked.
     #[test]
     fn shipped_max_events_default_covers_the_observed_live_universe() {
         assert_eq!(
             Config::default().scan.max_events,
-            6_000,
+            20_000,
             "scan.max_events must be a rate-limit backstop, not the usual stopping point"
         );
     }

@@ -52,13 +52,16 @@ keyset_cursor_param = "after_cursor"
 # what stops us the universe is incomplete and a NegRisk event can be split across the
 # boundary, so the scanner logs "WARN universe truncated at max_events".
 #
-# Raised from 2000 after a live run filled all 20 pages and still hit the cap: the real
-# active-event count is above 2000 (that run saw 8.3k markets / 16.6k tokens). Watch the
-# WARN — if it comes back, this number is again below the live event count.
-max_events = 6000
+# Raised 2000 -> 6000 -> 20000. Each raise followed a live run that filled every page and
+# still hit the cap: 6000 events came back as 5940 kept / 44222 markets and the WARN fired
+# again, so the real active-event count is above 6000 too. This is now purely a runaway
+# backstop — the [scan.activity_floor] below is what actually decides how much is tracked.
+# Watch the WARN: if it still fires, this number is again below the live event count.
+max_events = 20000
 # NegRisk events with more outcomes than this are skipped: every extra outcome is
 # another leg of capital and another leg of fill risk.
 max_negrisk_outcomes = 30
+
 # Report NegRisk sweeps that cover only part of an event's outcome set.
 #
 # Discovery drops markets that are closed, inactive, order-book-disabled or unparseable,
@@ -99,6 +102,47 @@ include_categories = []
 default = { taker = 0.005 }
 geopolitics = { taker = 0.003 }
 crypto = { taker = 0.008, maker = 0.005 }
+
+# Activity floor — which markets are worth tracking at all.
+#
+# WHY: a live discovery pass kept 5940 events / 44222 markets, i.e. 88444 token
+# subscriptions across ~177 WebSocket connections, with a full REST sweep of every book
+# taking minutes. Most of those markets have near-zero liquidity and cannot fill a $50
+# order. They are pure overhead, and the overhead is precisely what delays detection on the
+# markets that can actually be traded. This filter prunes that dust.
+#
+# WHAT IT IS NOT: the reported figures below are used for pruning and nothing else. No
+# sizing, profit, slippage or fee number is ever derived from them — that all stays
+# book-depth-based (CLAUDE.md: reported volume is double-counted and was up to ~60% wash
+# trading; executable liquidity comes from the order book). A reported figure is good
+# enough to answer "is this market alive at all?" and for nothing beyond that.
+#
+# RULES:
+#   * A market is kept if it passes EITHER enabled criterion (liquidity OR 24h volume).
+#     Setting a criterion to 0 switches it off, so it never judges and never drops.
+#   * A market carrying NONE of the fields an enabled criterion reads is KEPT. Absence of
+#     data must never look like a zero — the legacy /events payload has no activity fields
+#     at all.
+#   * NegRisk events are judged as a WHOLE: the event is kept if any constituent outcome
+#     passes, and when kept, EVERY priceable outcome is tracked regardless of its own
+#     activity. Pruning individual legs of a mutually-exclusive event would manufacture the
+#     partial coverage the full-coverage guard exists to catch (a sweep only pays $1 / $(N-1)
+#     when it spans every outcome). An event where nothing passes is dropped whole.
+#   * Binary (non-NegRisk) events filter market by market — their markets are independent.
+#
+# Dropped markets are counted in the discovery breakdown as `below_activity_floor=`, so the
+# books still balance: markets_kept + drops == markets_seen.
+[scan.activity_floor]
+enabled = true
+# $100 of reported CLOB liquidity. Deliberately low: this is a dust cutoff, not a
+# tradability test — that is the depth walker's job, on the real book. With
+# risk.per_trade_cap_usd = 50, a market reporting under $100 will not fill both legs of
+# anything worth reporting.
+min_liquidity_usd = 100
+# Off by default: liquidity is the cleaner signal and volume is the figure the research says
+# is inflated. Raise it (e.g. 500) to rescue markets that trade in bursts without leaving
+# resting depth behind.
+min_volume24h_usd = 0
 
 [risk]
 # Hard per-opportunity capital cap in USDC, applied inside the depth walker.

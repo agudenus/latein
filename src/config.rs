@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::types::Category;
+use crate::types::{Category, MarketActivity};
 
 pub const DEFAULT_CONFIG_PATH: &str = "config/default.toml";
 
@@ -106,6 +106,12 @@ pub struct ScanConfig {
     /// `WARN universe truncated at max_events`. Keep it comfortably above the live event
     /// count (~500 and growing).
     pub max_events: usize,
+    /// M6.4 — prune untradeable dust from the tracked universe. See [`ActivityFloor`].
+    ///
+    /// `#[serde(default)]` so an operator's older `config/default.toml` keeps loading; it
+    /// simply gets the shipped floor.
+    #[serde(default)]
+    pub activity_floor: ActivityFloor,
     /// Skip NegRisk events with more outcomes than this (leg count blows up capital).
     pub max_negrisk_outcomes: usize,
     /// Report NegRisk sweeps that cover only part of an event's outcome set.
@@ -134,6 +140,92 @@ pub struct ScanConfig {
     pub report_maker_only: bool,
     /// If non-empty, only scan these categories.
     pub include_categories: Vec<String>,
+}
+
+/// The activity floor: which markets are worth tracking at all (M6.4).
+///
+/// A live discovery pass keeps ~44 000 markets across ~5 900 events, which is 88 000 token
+/// subscriptions, ~180 WebSocket connections and several minutes per REST sweep. Most of
+/// those markets have near-zero liquidity and could not fill a $50 order — they are pure
+/// overhead, and the overhead is what delays detection on the markets that matter.
+///
+/// This filter reads Gamma's own reported figures (`liquidityClob`, `volume24hr`). Those
+/// numbers are **only ever** used to prune: nothing downstream sizes, costs or profits from
+/// them. CLAUDE.md forbids it — reported volume is double-counted and heavily wash-inflated,
+/// and executable liquidity comes from order book depth. A reported figure is trustworthy
+/// enough for "is this market alive?" and for nothing else.
+///
+/// Two rules keep the filter from doing damage:
+///
+/// * **Absence of data is never a drop.** A market carrying none of the fields an enabled
+///   criterion reads is kept. The legacy `/events` payload has no activity fields at all,
+///   and a missing field must not look like a zero.
+/// * **NegRisk events are judged whole.** See [`crate::gamma::build_universe`]:
+///   pruning individual outcomes of a mutually-exclusive event would manufacture exactly
+///   the partial coverage the full-coverage guard exists to catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivityFloor {
+    /// Master switch. `false` tracks every market Gamma lists, as before M6.4.
+    pub enabled: bool,
+    /// Keep a market whose reported CLOB liquidity is at least this many USD. `0` disables
+    /// the liquidity criterion (it never judges, and so never drops).
+    pub min_liquidity_usd: Decimal,
+    /// Keep a market whose reported 24 h volume is at least this many USD. `0` disables the
+    /// volume criterion. A market passing *either* enabled criterion is kept.
+    pub min_volume24h_usd: Decimal,
+}
+
+impl ActivityFloor {
+    /// Verdict for one market: `Some(true)` passes, `Some(false)` fails, `None` means no
+    /// *enabled* criterion had data to judge it by.
+    ///
+    /// `None` is always a keep (see [`keeps`](Self::keeps)); it is a distinct answer only so
+    /// the reason stays visible at the call site.
+    pub fn judge(&self, activity: &MarketActivity) -> Option<bool> {
+        if !self.enabled {
+            return None;
+        }
+        let mut judged = false;
+        let mut passed = false;
+        // Either criterion passing is enough: a market can be thin on resting depth and
+        // still trade, or quiet today and still be deep.
+        for (floor, reported) in [
+            (self.min_liquidity_usd, activity.liquidity),
+            (self.min_volume24h_usd, activity.volume_24h),
+        ] {
+            if floor <= Decimal::ZERO {
+                continue; // criterion switched off — it neither passes nor judges
+            }
+            if let Some(value) = reported {
+                judged = true;
+                passed |= value >= floor;
+            }
+        }
+        judged.then_some(passed)
+    }
+
+    /// Whether this market survives the floor. Unjudgeable markets survive.
+    pub fn keeps(&self, activity: &MarketActivity) -> bool {
+        self.judge(activity).unwrap_or(true)
+    }
+}
+
+impl Default for ActivityFloor {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // $100 of reported CLOB liquidity. Deliberately low: it is a dust cutoff, not a
+            // tradability test (that is the depth walker's job, on the real book). The
+            // per-trade cap is $50, so a market under $100 reported liquidity is not going
+            // to fill both legs of anything.
+            min_liquidity_usd: Decimal::new(100, 0),
+            // Off by default: liquidity alone is the cleaner signal, and volume is the
+            // figure the research says is inflated. Raise it to rescue markets that trade
+            // in bursts without resting depth.
+            min_volume24h_usd: Decimal::ZERO,
+        }
+    }
 }
 
 /// Net-per-share floors for one category.
@@ -394,9 +486,12 @@ impl Default for ScanConfig {
         Self {
             page_size: 100,
             keyset_cursor_param: default_keyset_cursor_param(),
-            // Raised from 2 000 after a live run filled all 20 pages: the active-event
-            // count is past that, and a truncated universe can split a NegRisk event.
-            max_events: 6_000,
+            // Raised 2 000 → 6 000 → 20 000: a live run filled all 60 pages of the 6 000
+            // cap too, so the active-event count is past that as well. It is a rate-limit
+            // backstop, and a truncated universe can split a NegRisk event; with the
+            // activity floor doing the actual pruning, this only has to be out of the way.
+            max_events: 20_000,
+            activity_floor: ActivityFloor::default(),
             max_negrisk_outcomes: 30,
             report_partial_negrisk: false,
             min_size_shares: Decimal::new(5, 0),
@@ -634,6 +729,15 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "scan.keyset_cursor_param must not be empty (it is the query parameter that \
                  carries the keyset cursor; the default is \"after_cursor\")"
+                    .into(),
+            ));
+        }
+        if self.scan.activity_floor.min_liquidity_usd < Decimal::ZERO
+            || self.scan.activity_floor.min_volume24h_usd < Decimal::ZERO
+        {
+            return Err(ConfigError::Invalid(
+                "scan.activity_floor.min_liquidity_usd and min_volume24h_usd must be >= 0 \
+                 (0 switches that criterion off)"
                     .into(),
             ));
         }
@@ -1098,8 +1202,9 @@ mod tests {
         let cfg = Config::from_toml_str(SHIPPED).expect("parse");
         cfg.validate().expect("validate");
 
-        // Issue 3: 2 000 was not enough — all 20 pages came back full.
-        assert_eq!(cfg.scan.max_events, 6_000);
+        // Issue 3: 2 000 was not enough — all 20 pages came back full. Nor was the 6 000
+        // that replaced it (all 60 pages full); see the M6.4 test below.
+        assert_eq!(cfg.scan.max_events, 20_000);
         // Issue 2: silence is not staleness; this is now only the re-request rate limit.
         assert_eq!(cfg.stream.stale_after_secs, 900);
         // Issue 1: a fallback lasts until the endpoint proves itself again.
@@ -1112,6 +1217,64 @@ mod tests {
         assert_eq!(cfg.stream, StreamConfig::default());
         assert_eq!(cfg.alerts, AlertConfig::default());
         assert_eq!(cfg.scan.max_events, ScanConfig::default().max_events);
+    }
+
+    /// (g) M6.4: the shipped file carries the activity floor and the raised backstop, and
+    /// both agree with the compiled defaults.
+    #[test]
+    fn shipped_config_carries_the_m6_4_scale_settings() {
+        let cfg = Config::from_toml_str(SHIPPED).expect("parse");
+        cfg.validate().expect("validate");
+
+        assert_eq!(
+            cfg.scan.max_events, 20_000,
+            "6 000 filled all 60 of its pages on a live run — the backstop had to move again"
+        );
+        assert_eq!(cfg.scan.max_events, ScanConfig::default().max_events);
+
+        assert_eq!(cfg.scan.activity_floor, ActivityFloor::default());
+        assert!(cfg.scan.activity_floor.enabled, "the floor ships on");
+        assert_eq!(cfg.scan.activity_floor.min_liquidity_usd, dec!(100));
+        assert_eq!(
+            cfg.scan.activity_floor.min_volume24h_usd,
+            dec!(0),
+            "the volume criterion ships switched off"
+        );
+
+        // The file must say out loud that these figures never reach the money path.
+        assert!(
+            SHIPPED.contains("book-depth-based"),
+            "the activity floor section must keep its 'pruning only' warning"
+        );
+
+        // An older copy of the file, with no [scan.activity_floor] section at all, must
+        // still start up — and get the shipped floor.
+        const HEADER: &str = "\n[scan.activity_floor]\n";
+        let older: String = {
+            let start = SHIPPED.find(HEADER).expect("section present") + 1;
+            let end = SHIPPED[start..]
+                .find("\n[")
+                .map(|i| start + i + 1)
+                .expect("a section follows");
+            format!("{}{}", &SHIPPED[..start], &SHIPPED[end..])
+        };
+        assert!(!older.contains(HEADER), "the section must really be gone");
+        let cfg = Config::from_toml_str(&older).expect("a config without the section must load");
+        cfg.validate().expect("validate");
+        assert_eq!(cfg.scan.activity_floor, ActivityFloor::default());
+
+        // A typo inside the section is not silently ignored, and a negative floor (which
+        // would judge nothing while pretending to) is rejected.
+        assert!(
+            Config::from_toml_str("[scan.activity_floor]\nenabledd = true\n").is_err(),
+            "a typo in the activity floor must not be swallowed"
+        );
+        let mut negative = Config::default();
+        negative.scan.activity_floor.min_liquidity_usd = dec!(-1);
+        assert!(negative.validate().is_err());
+        negative.scan.activity_floor.min_liquidity_usd = dec!(100);
+        negative.scan.activity_floor.min_volume24h_usd = dec!(-1);
+        assert!(negative.validate().is_err());
     }
 
     /// The new keys are optional so an operator's older `config/default.toml` copy keeps

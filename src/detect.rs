@@ -610,7 +610,8 @@ pub fn scan(cfg: &Config, universe: &Universe, books: &BookMap) -> Vec<Opportuni
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Category, MarketFees, MarketTrading, PriceLevel, TokenId};
+    use crate::config::ActivityFloor;
+    use crate::types::{Category, MarketActivity, MarketFees, MarketTrading, PriceLevel, TokenId};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
@@ -647,6 +648,7 @@ mod tests {
             ],
             fees: MarketFees::default(),
             trading: MarketTrading::default(),
+            activity: MarketActivity::default(),
         }
     }
 
@@ -1592,7 +1594,7 @@ mod tests {
             include_str!("../tests/fixtures/gamma_events.json"),
         )
         .expect("gamma fixture");
-        let (universe, _) = crate::gamma::build_universe(&raw);
+        let (universe, _) = crate::gamma::build_universe(&raw, &ActivityFloor::default());
         let books: BookMap =
             crate::clob::parse_books("fixture", include_str!("../tests/fixtures/clob_books.json"))
                 .expect("clob fixture")
