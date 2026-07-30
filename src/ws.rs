@@ -8,13 +8,13 @@
 //!
 //! ## What is verified and what is guessed
 //!
-//! This container cannot reach any Polymarket host, so **every wire detail below is an
-//! assumption** and is marked `TODO(verify-live)` at its definition:
+//! The `price_change` delta shape is **verified** (official docs + community clients,
+//! 2026-07-30) and is documented at [`RawFrame::price_changes`]. Everything else is still
+//! an assumption marked `TODO(verify-live)` at its definition:
 //!
 //! * the endpoint (`stream.url`), the subscribe frame shape, and whether one connection
 //!   has a subscription limit at all;
-//! * the `book` / `price_change` event names and their field names (`asset_id`,
-//!   `changes[].side`, `timestamp`, `hash`);
+//! * the `book` snapshot field names (`asset_id`, `bids`/`asks`, `hash`);
 //! * whether `timestamp` is a millisecond or second epoch (both are accepted);
 //! * what `hash` is over — we store it and use it only as a *change* signal, never as a
 //!   checksum we claim to verify.
@@ -24,6 +24,28 @@
 //! stays authoritative — [`BookStore::apply_rest`] overwrites whatever the stream built,
 //! and the daemon re-fetches on a slow sweep specifically so a silently wrong local book
 //! cannot survive.
+//!
+//! ## M6.5 — the delta shape, and why "defensive" was not enough
+//!
+//! The first live soak read 4 807 541 frames and applied **zero** deltas: every book moved
+//! only when a periodic `book` snapshot arrived, and the 5-minute integrity sweep found
+//! ~29 % of sampled books diverged from REST. The cause was pure wire format — the channel
+//! sends `price_changes[]` with a *per-entry* `asset_id`, and this parser only understood
+//! `changes[]` or a single top-level change. Every one of those frames was classified
+//! `Malformed`, counted, and dropped: correct behaviour, invisible outcome, because the
+//! data-plane health line reported only `frames`, `price_changes_applied` and
+//! `snapshots_applied` — a *zero* that looked exactly like a quiet market.
+//!
+//! Two things changed, and the second matters more than the first:
+//!
+//! 1. `price_changes[]` is now the primary shape (the older ones stay as fallbacks — they
+//!    cost nothing), and one frame may touch several assets of one market, so it fans out
+//!    to one [`MarketFrame::PriceChange`] per asset carrying the parent's timestamp.
+//! 2. Silence in the log is no longer possible for this class of bug: `frames_unrecognized`
+//!    and `delta_entries_applied`/`delta_entries_skipped` are counted and printed, and the
+//!    first [`UNRECOGNIZED_SAMPLE_LIMIT`] unrecognized payloads are logged **raw** at WARN
+//!    (truncated; this is public market data). The next shape drift announces itself with
+//!    the bytes needed to fix it instead of requiring a debugging session.
 //!
 //! ## Integrity, staleness and resync
 //!
@@ -97,6 +119,13 @@ pub const DIVERGENCE_SAMPLE: usize = 64;
 const TARGETED_RESYNC_COOLDOWN_SECS: u64 = 15;
 const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 30_000;
+/// How many unrecognized payloads get their raw bytes logged before the sampler goes quiet.
+/// Budgeted per [`BookStore`] — i.e. per stream pool, which the daemon rebuilds only when a
+/// fallen-back stream is restored, so in practice this is per process.
+pub const UNRECOGNIZED_SAMPLE_LIMIT: u64 = 3;
+/// How much of such a payload is logged. Market data is public, so the only reason to trim
+/// is log volume.
+const UNRECOGNIZED_SAMPLE_CHARS: usize = 500;
 /// Keepalive cadence. TODO(verify-live): the public docs mention a client keepalive on the
 /// market channel; we send a WebSocket ping, which any compliant server answers.
 const PING_INTERVAL_SECS: u64 = 10;
@@ -131,6 +160,26 @@ pub struct LevelChange {
     pub side: Side,
     pub price: Decimal,
     pub size: Decimal,
+    /// The venue's own claim about the top of book at this entry (verified: `best_bid` /
+    /// `best_ask` on each `price_changes[]` entry). Informational **only** — it is a free
+    /// cross-check on our locally applied book, never a source of levels. Overwriting book
+    /// levels from it would invent liquidity at a price with no size attached to it.
+    pub best_bid: Option<Decimal>,
+    pub best_ask: Option<Decimal>,
+}
+
+impl LevelChange {
+    /// Test/constructor shorthand for the common case with no top-of-book claim.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(side: Side, price: Decimal, size: Decimal) -> Self {
+        Self {
+            side,
+            price,
+            size,
+            best_bid: None,
+            best_ask: None,
+        }
+    }
 }
 
 /// A parsed market-channel frame.
@@ -143,7 +192,9 @@ pub enum MarketFrame {
         asks: Vec<PriceLevel>,
         meta: FrameMeta,
     },
-    /// Level-wise delta — applied on top of the current copy.
+    /// Level-wise delta for **one** asset — applied on top of the current copy. A wire
+    /// frame that touches several assets of the same market fans out to one of these per
+    /// asset, all carrying the parent frame's `meta`.
     PriceChange {
         asset_id: TokenId,
         changes: Vec<LevelChange>,
@@ -180,6 +231,21 @@ struct RawFrame {
     buys: Option<Vec<PriceLevel>>,
     #[serde(default)]
     sells: Option<Vec<PriceLevel>>,
+    /// **VERIFIED 2026-07-30** (official docs + community clients) — the real delta array:
+    ///
+    /// ```json
+    /// {"market":"0x5f65…","event_type":"price_change","timestamp":"1757908892351",
+    ///  "price_changes":[{"asset_id":"7132…","price":"0.5","size":"200","side":"BUY",
+    ///                    "hash":"56621a…","best_bid":"0.5","best_ask":"1"}]}
+    /// ```
+    ///
+    /// Note the two facts that broke the previous parser: the key is `price_changes`, not
+    /// `changes`, and the `asset_id` lives on the **entry**, not the frame, so one frame
+    /// can touch several assets of the same market.
+    #[serde(default)]
+    price_changes: Option<Vec<RawChange>>,
+    /// Legacy/fallback delta array. Kept because it costs nothing and a parser that only
+    /// understands one spelling is exactly how M6.5 happened.
     #[serde(default)]
     changes: Option<Vec<RawChange>>,
     /// TODO(verify-live): the single-change form of `price_change` (price/size/side at the
@@ -198,12 +264,23 @@ struct RawFrame {
 
 #[derive(Debug, Deserialize)]
 struct RawChange {
+    /// VERIFIED: present on every `price_changes[]` entry. Absent on the legacy `changes[]`
+    /// shape, where the frame-level `asset_id` applies to all entries.
+    #[serde(default, alias = "assetId")]
+    asset_id: Option<String>,
     #[serde(deserialize_with = "crate::types::de_decimal")]
     price: Decimal,
     #[serde(deserialize_with = "crate::types::de_decimal")]
     size: Decimal,
     #[serde(default)]
     side: Option<String>,
+    /// Informational top-of-book claims (see [`LevelChange::best_bid`]). Read through
+    /// [`as_decimal`] so a number or a string both work, and a junk value is simply absent
+    /// rather than fatal.
+    #[serde(default)]
+    best_bid: Option<Value>,
+    #[serde(default)]
+    best_ask: Option<Value>,
 }
 
 /// TODO(verify-live): the market channel labels the *taker* side of a level: `BUY` is the
@@ -262,18 +339,27 @@ pub fn parse_frames(text: &str) -> Result<Vec<MarketFrame>, FrameError> {
         Value::Array(items) => items,
         other => vec![other],
     };
-    Ok(items.into_iter().map(classify).collect())
+    let mut frames = Vec::with_capacity(items.len());
+    for item in items {
+        classify(item, &mut frames);
+    }
+    Ok(frames)
 }
 
-fn classify(item: Value) -> MarketFrame {
+/// Classify one JSON element, pushing the frame(s) it describes onto `out`.
+///
+/// One element usually yields one frame; a `price_change` touching several assets yields
+/// one per asset (see [`MarketFrame::PriceChange`]).
+fn classify(item: Value, out: &mut Vec<MarketFrame>) {
     let raw: RawFrame = match serde_json::from_value(item) {
         Ok(raw) => raw,
         // The element is JSON, but not a shape we can read at all.
         Err(_) => {
-            return MarketFrame::Malformed {
+            out.push(MarketFrame::Malformed {
                 event_type: "?".to_string(),
                 reason: "frame fields have unexpected types",
-            }
+            });
+            return;
         }
     };
     let event_type = raw.event_type.clone().unwrap_or_default();
@@ -291,74 +377,139 @@ fn classify(item: Value) -> MarketFrame {
     match event_type.as_str() {
         "book" => {
             let Some(asset_id) = asset_id else {
-                return MarketFrame::Malformed {
+                out.push(MarketFrame::Malformed {
                     event_type,
                     reason: "book snapshot without an asset id",
-                };
+                });
+                return;
             };
-            MarketFrame::Book {
+            out.push(MarketFrame::Book {
                 asset_id,
                 bids: raw.bids.or(raw.buys).unwrap_or_default(),
                 asks: raw.asks.or(raw.sells).unwrap_or_default(),
                 meta,
-            }
+            });
         }
-        "price_change" => {
-            let Some(asset_id) = asset_id else {
-                return MarketFrame::Malformed {
-                    event_type,
-                    reason: "price change without an asset id",
-                };
-            };
-            let mut changes = Vec::new();
-            for change in raw.changes.into_iter().flatten() {
-                match change.side.as_deref().and_then(parse_side) {
-                    Some(side) => changes.push(LevelChange {
-                        side,
-                        price: change.price,
-                        size: change.size,
-                    }),
-                    // A level we cannot place on a side is worse than useless: applying it
-                    // to a guessed side would corrupt the book.
-                    None => {
-                        return MarketFrame::Malformed {
-                            event_type,
-                            reason: "price change level with an unreadable side",
-                        }
-                    }
-                }
-            }
-            if changes.is_empty() {
-                // Single-change form.
-                match (
-                    raw.price.as_ref().and_then(as_decimal),
-                    raw.size.as_ref().and_then(as_decimal),
-                    raw.side.as_deref().and_then(parse_side),
-                ) {
-                    (Some(price), Some(size), Some(side)) => {
-                        changes.push(LevelChange { side, price, size })
-                    }
-                    _ => {
-                        return MarketFrame::Malformed {
-                            event_type,
-                            reason: "price change carried no readable level",
-                        }
-                    }
-                }
-            }
-            MarketFrame::PriceChange {
-                asset_id,
-                changes,
-                meta,
-            }
-        }
-        _ => MarketFrame::Unknown {
+        "price_change" => classify_price_change(&raw, event_type, asset_id, meta, out),
+        _ => out.push(MarketFrame::Unknown {
             event_type: if event_type.is_empty() {
                 "(none)".to_string()
             } else {
                 event_type
             },
-        },
+        }),
+    }
+}
+
+/// The delta path, in shape precedence order:
+///
+/// 1. `price_changes[]` — the verified live shape, `asset_id` per entry;
+/// 2. `changes[]` — the legacy array, `asset_id` on the frame;
+/// 3. one level at the top level of the frame (`price`/`size`/`side`).
+///
+/// Entries are grouped by asset in first-seen order (not a `HashMap`: the order entries
+/// arrive in is the order they must be applied in, and a stable order also keeps the frames
+/// this produces reproducible for tests).
+///
+/// An entry we cannot place — unreadable side, no resolvable asset — fails the **whole**
+/// frame as `Malformed` rather than applying its siblings. Guessing a side would corrupt a
+/// book, and a partially applied frame is a book that is wrong in a way nothing downstream
+/// can detect; a frame counted as malformed (and now raw-sampled) is one we can fix.
+fn classify_price_change(
+    raw: &RawFrame,
+    event_type: String,
+    frame_asset: Option<TokenId>,
+    meta: FrameMeta,
+    out: &mut Vec<MarketFrame>,
+) {
+    let entries = raw.price_changes.as_ref().or(raw.changes.as_ref());
+    let mut grouped: Vec<(TokenId, Vec<LevelChange>)> = Vec::new();
+
+    for entry in entries.into_iter().flatten() {
+        let Some(side) = entry.side.as_deref().and_then(parse_side) else {
+            out.push(MarketFrame::Malformed {
+                event_type,
+                reason: "price change level with an unreadable side",
+            });
+            return;
+        };
+        let asset = entry
+            .asset_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(TokenId::new)
+            .or_else(|| frame_asset.clone());
+        let Some(asset) = asset else {
+            out.push(MarketFrame::Malformed {
+                event_type,
+                reason: "price change level without an asset id",
+            });
+            return;
+        };
+        let change = LevelChange {
+            side,
+            price: entry.price,
+            size: entry.size,
+            best_bid: entry.best_bid.as_ref().and_then(as_decimal),
+            best_ask: entry.best_ask.as_ref().and_then(as_decimal),
+        };
+        match grouped.iter_mut().find(|(token, _)| *token == asset) {
+            Some((_, changes)) => changes.push(change),
+            None => grouped.push((asset, vec![change])),
+        }
+    }
+
+    if grouped.is_empty() {
+        // Single-change form: the level is spread across the frame's own fields.
+        let Some(asset_id) = frame_asset else {
+            out.push(MarketFrame::Malformed {
+                event_type,
+                reason: "price change without an asset id",
+            });
+            return;
+        };
+        match (
+            raw.price.as_ref().and_then(as_decimal),
+            raw.size.as_ref().and_then(as_decimal),
+            raw.side.as_deref().and_then(parse_side),
+        ) {
+            (Some(price), Some(size), Some(side)) => {
+                grouped.push((asset_id, vec![LevelChange::new(side, price, size)]));
+            }
+            _ => {
+                out.push(MarketFrame::Malformed {
+                    event_type,
+                    reason: "price change carried no readable level",
+                });
+                return;
+            }
+        }
+    }
+
+    // The parent timestamp dates every entry in the frame, whichever asset it belongs to.
+    for (asset_id, changes) in grouped {
+        out.push(MarketFrame::PriceChange {
+            asset_id,
+            changes,
+            meta: meta.clone(),
+        });
+    }
+}
+
+/// Whether our top of book contradicts a `best_bid`/`best_ask` claim carried by a delta
+/// entry. Only a claim we can actually check counts: an absent claim, or a side of our book
+/// that is empty, disagrees for reasons that say nothing about drift.
+fn disagrees(ours: Option<Decimal>, theirs: Option<Decimal>) -> bool {
+    matches!((ours, theirs), (Some(o), Some(t)) if o != t)
+}
+
+/// A raw payload, trimmed for the log. Cuts on a character boundary and says how much was
+/// dropped, so a truncated sample is never mistaken for a complete one.
+fn truncate_payload(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}… (+{} more bytes)", &text[..cut], text.len() - cut),
+        None => text.to_string(),
     }
 }
 
@@ -426,6 +577,22 @@ pub struct StreamStats {
     pub deltas: AtomicU64,
     pub unknown_frames: AtomicU64,
     pub malformed_frames: AtomicU64,
+    /// Every frame that parsed as JSON but matched no shape we can use — the sum of
+    /// `unknown_frames` and `malformed_frames`, surfaced as one number because *this* is
+    /// the number that was silently 4.8 M during the first soak (see the module docs). It
+    /// belongs on the health line next to `frames`; the split stays for detail.
+    pub frames_unrecognized: AtomicU64,
+    /// Individual `price_changes[]` entries that reached a book …
+    pub delta_entries_applied: AtomicU64,
+    /// … and those that did not (unknown asset, out-of-order frame). A healthy stream has
+    /// `delta_entries_applied` climbing and this flat.
+    pub delta_entries_skipped: AtomicU64,
+    /// Applied deltas whose entry claimed a `best_bid`/`best_ask` our book disagreed with.
+    /// A cross-check only: it never triggers a resync (the periodic REST sweep is the
+    /// authority), it just says whether the local book is drifting between sweeps.
+    pub delta_top_mismatch: AtomicU64,
+    /// How much of the raw-sample budget ([`UNRECOGNIZED_SAMPLE_LIMIT`]) has been spent.
+    unrecognized_samples: AtomicU64,
     /// Deltas for a token we have never snapshotted — cannot be applied.
     pub orphan_deltas: AtomicU64,
     pub out_of_order: AtomicU64,
@@ -450,6 +617,10 @@ impl StreamStats {
             deltas: self.deltas.load(Ordering::Relaxed),
             unknown_frames: self.unknown_frames.load(Ordering::Relaxed),
             malformed_frames: self.malformed_frames.load(Ordering::Relaxed),
+            frames_unrecognized: self.frames_unrecognized.load(Ordering::Relaxed),
+            delta_entries_applied: self.delta_entries_applied.load(Ordering::Relaxed),
+            delta_entries_skipped: self.delta_entries_skipped.load(Ordering::Relaxed),
+            delta_top_mismatch: self.delta_top_mismatch.load(Ordering::Relaxed),
             orphan_deltas: self.orphan_deltas.load(Ordering::Relaxed),
             out_of_order: self.out_of_order.load(Ordering::Relaxed),
             hash_contradictions: self.hash_contradictions.load(Ordering::Relaxed),
@@ -469,6 +640,10 @@ pub struct StreamStatsSnapshot {
     pub deltas: u64,
     pub unknown_frames: u64,
     pub malformed_frames: u64,
+    pub frames_unrecognized: u64,
+    pub delta_entries_applied: u64,
+    pub delta_entries_skipped: u64,
+    pub delta_top_mismatch: u64,
     pub orphan_deltas: u64,
     pub out_of_order: u64,
     pub hash_contradictions: u64,
@@ -578,6 +753,7 @@ impl BookStore {
                 changes,
                 meta,
             } => {
+                let skipped = changes.len() as u64;
                 let mut books = self.lock();
                 let Some(entry) = books.get_mut(asset_id) else {
                     // No snapshot yet: a delta on an unknown book cannot be applied, and
@@ -588,6 +764,9 @@ impl BookStore {
                         LiveBook::placeholder(asset_id.clone(), received),
                     );
                     StreamStats::bump(&self.stats.orphan_deltas);
+                    self.stats
+                        .delta_entries_skipped
+                        .fetch_add(skipped, Ordering::Relaxed);
                     return None;
                 };
                 // Out of order: applying a level from before the last frame would
@@ -596,6 +775,9 @@ impl BookStore {
                     if frame_ts < last {
                         entry.stale = true;
                         StreamStats::bump(&self.stats.out_of_order);
+                        self.stats
+                            .delta_entries_skipped
+                            .fetch_add(skipped, Ordering::Relaxed);
                         return None;
                     }
                 }
@@ -604,6 +786,22 @@ impl BookStore {
                         .book
                         .apply_level(change.side, change.price, change.size);
                 }
+                self.stats
+                    .delta_entries_applied
+                    .fetch_add(changes.len() as u64, Ordering::Relaxed);
+                // Free integrity signal: the last entry's own claim about the top of book,
+                // against what we just built. Only compared where both sides exist and the
+                // book is trusted — an empty side or a stale book disagrees for reasons
+                // that say nothing about drift. Counted, never acted on.
+                if !entry.stale {
+                    if let Some(last) = changes.last() {
+                        if disagrees(entry.book.best_bid(), last.best_bid)
+                            || disagrees(entry.book.best_ask(), last.best_ask)
+                        {
+                            StreamStats::bump(&self.stats.delta_top_mismatch);
+                        }
+                    }
+                }
                 entry.last_hash = meta.hash.clone();
                 entry.bump(received, meta.server_ts);
                 StreamStats::bump(&self.stats.deltas);
@@ -611,13 +809,42 @@ impl BookStore {
             }
             MarketFrame::Unknown { .. } => {
                 StreamStats::bump(&self.stats.unknown_frames);
+                StreamStats::bump(&self.stats.frames_unrecognized);
                 None
             }
             MarketFrame::Malformed { .. } => {
                 StreamStats::bump(&self.stats.malformed_frames);
+                StreamStats::bump(&self.stats.frames_unrecognized);
                 None
             }
         }
+    }
+
+    /// Log the raw bytes of a payload we could not use, up to
+    /// [`UNRECOGNIZED_SAMPLE_LIMIT`] times.
+    ///
+    /// M6.5 exists because a counter can only tell you *that* something is wrong. This
+    /// tells you *what*: the next time the channel changes shape, the first few offending
+    /// payloads are in the log at WARN, truncated, and the fix is a diff rather than an
+    /// investigation. Market data is public — there is nothing here to redact.
+    ///
+    /// The budget is claimed atomically, so a burst across every shard at once still logs
+    /// exactly the limit.
+    pub fn sample_unrecognized(&self, shard: usize, payload: &str) {
+        let claimed = self.stats.unrecognized_samples.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |spent| (spent < UNRECOGNIZED_SAMPLE_LIMIT).then_some(spent + 1),
+        );
+        let Ok(spent) = claimed else { return };
+        tracing::warn!(
+            shard,
+            sample = spent + 1,
+            of = UNRECOGNIZED_SAMPLE_LIMIT,
+            payload = %truncate_payload(payload, UNRECOGNIZED_SAMPLE_CHARS),
+            "unrecognized market-data payload — raw sample; if frames_unrecognized keeps \
+             climbing, the wire format has drifted and books are not being updated"
+        );
     }
 
     /// Adopt a REST fetch. REST is authoritative: a returned book replaces ours and clears
@@ -1476,10 +1703,22 @@ async fn handle_payload(
         Ok(frames) => frames,
         Err(err) => {
             StreamStats::bump(&books.stats.malformed_frames);
+            StreamStats::bump(&books.stats.frames_unrecognized);
             tracing::debug!(shard = id, %err, "unparseable market frame ignored");
+            books.sample_unrecognized(id, text);
             return true;
         }
     };
+    // One sample per *payload*, not per frame: the payload is the thing whose shape we got
+    // wrong, and it is what a reader needs to see.
+    if frames.iter().any(|f| {
+        matches!(
+            f,
+            MarketFrame::Unknown { .. } | MarketFrame::Malformed { .. }
+        )
+    }) {
+        books.sample_unrecognized(id, text);
+    }
     for frame in &frames {
         if let MarketFrame::Unknown { event_type } = frame {
             tracing::debug!(shard = id, event_type, "unknown market frame type ignored");
@@ -1582,14 +1821,7 @@ mod tests {
                 asset_id, changes, ..
             } => {
                 assert_eq!(asset_id.as_str(), "1001");
-                assert_eq!(
-                    changes[0],
-                    LevelChange {
-                        side: Side::Ask,
-                        price: dec!(0.41),
-                        size: dec!(0)
-                    }
-                );
+                assert_eq!(changes[0], LevelChange::new(Side::Ask, dec!(0.41), dec!(0)));
                 assert_eq!(changes[1].side, Side::Bid);
                 assert_eq!(changes[1].size, dec!(250));
             }
@@ -1608,6 +1840,372 @@ mod tests {
             }
             other => panic!("expected a price change, got {other:?}"),
         }
+    }
+
+    /// The verified live delta frame, **verbatim** from the official docs (2026-07-30) —
+    /// the shape whose `price_changes` key this parser used to miss entirely. Kept byte-for
+    /// byte so a future edit that "tidies" it has to notice it is copying a wire capture.
+    const LIVE_DELTA: &str = r#"{
+  "market": "0x5f65...f8f1",
+  "price_changes": [
+    {
+      "asset_id": "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+      "price": "0.5",
+      "size": "200",
+      "side": "BUY",
+      "hash": "56621a121a47ed9333273e21c83b660cff37ae50",
+      "best_bid": "0.5",
+      "best_ask": "1"
+    }
+  ],
+  "timestamp": "1757908892351",
+  "event_type": "price_change"
+}"#;
+
+    const LIVE_ASSET: &str =
+        "71321045679252212594626385532706912750332728571942532289631379312455583992563";
+
+    /// A hand-built snapshot for `asset`, so a delta test has a book to change.
+    fn snapshot_for(asset: &str, bids: &str, asks: &str, ts: i64) -> String {
+        format!(
+            r#"{{"event_type":"book","asset_id":"{asset}","timestamp":"{ts}",
+                "bids":[{bids}],"asks":[{asks}]}}"#
+        )
+    }
+
+    /// (a) The frame the venue actually sends parses, routes to the asset named *inside*
+    /// the entry, and moves the book. This is the M6.5 regression: 4.8 M of these were
+    /// received and none applied, because the parser wanted `changes[]` and a frame-level
+    /// `asset_id`.
+    #[test]
+    fn the_verbatim_live_delta_frame_parses_and_applies() {
+        let asset = tok_id(LIVE_ASSET);
+        let frames = parse_frames(LIVE_DELTA).expect("the live delta must parse");
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            MarketFrame::PriceChange {
+                asset_id,
+                changes,
+                meta,
+            } => {
+                assert_eq!(asset_id, &asset, "routed by the entry's own asset_id");
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].side, Side::Bid, "BUY is the bid side");
+                assert_eq!(changes[0].price, dec!(0.5));
+                assert_eq!(changes[0].size, dec!(200));
+                assert_eq!(changes[0].best_bid, Some(dec!(0.5)));
+                assert_eq!(changes[0].best_ask, Some(dec!(1)));
+                assert_eq!(
+                    meta.server_ts,
+                    DateTime::from_timestamp_millis(1_757_908_892_351),
+                    "the parent timestamp dates the entry"
+                );
+            }
+            other => panic!("expected a price change, got {other:?}"),
+        }
+
+        // Before: bids 0.49/100 ; asks 1/10.
+        let store = BookStore::new();
+        let now = Instant::now();
+        for frame in frames_of(&snapshot_for(
+            LIVE_ASSET,
+            r#"{"price":"0.49","size":"100"}"#,
+            r#"{"price":"1","size":"10"}"#,
+            1_757_908_892_000i64,
+        )) {
+            store.apply_frame(&frame, now);
+        }
+        let before = &store.snapshot_of(std::slice::from_ref(&asset))[&asset];
+        assert_eq!(before.best_bid(), Some(dec!(0.49)));
+        assert_eq!(before.bids.len(), 1);
+
+        for frame in &frames {
+            assert_eq!(store.apply_frame(frame, now).as_ref(), Some(&asset));
+        }
+
+        // After: 0.5/200 is set on the bid side and becomes the top; nothing else moved.
+        let after = &store.snapshot_of(std::slice::from_ref(&asset))[&asset];
+        assert_eq!(
+            after.bids,
+            vec![
+                PriceLevel::new(dec!(0.5), dec!(200)),
+                PriceLevel::new(dec!(0.49), dec!(100)),
+            ]
+        );
+        assert_eq!(after.asks, vec![PriceLevel::new(dec!(1), dec!(10))]);
+
+        let stats = store.stats.snapshot();
+        assert_eq!(stats.deltas, 1);
+        assert_eq!(stats.delta_entries_applied, 1);
+        assert_eq!(stats.delta_entries_skipped, 0);
+        assert_eq!(stats.frames_unrecognized, 0);
+        assert_eq!(
+            stats.delta_top_mismatch, 0,
+            "the entry's best_bid/best_ask agree with the book we built"
+        );
+    }
+
+    /// The cross-check earns its keep only if it can fire. It counts and stops there — the
+    /// periodic REST sweep stays the authority on what a book really is.
+    #[test]
+    fn a_top_of_book_claim_we_contradict_is_counted_but_not_acted_on() {
+        let store = BookStore::new();
+        let now = Instant::now();
+        for frame in frames_of(&snapshot_for(
+            "1001",
+            r#"{"price":"0.49","size":"100"}"#,
+            r#"{"price":"0.52","size":"50"}"#,
+            1_757_908_892_000i64,
+        )) {
+            store.apply_frame(&frame, now);
+        }
+        // We apply 0.50/200 to the bid side; the venue claims the best ask is 0.90, which
+        // our copy (0.52) disagrees with.
+        let delta = r#"{"event_type":"price_change","timestamp":"1757908892351","price_changes":[
+            {"asset_id":"1001","price":"0.50","size":"200","side":"BUY",
+             "best_bid":"0.50","best_ask":"0.90"}]}"#;
+        for frame in frames_of(delta) {
+            store.apply_frame(&frame, now);
+        }
+        let stats = store.stats.snapshot();
+        assert_eq!(stats.delta_top_mismatch, 1);
+        assert_eq!(stats.delta_entries_applied, 1, "the level still landed");
+        assert_eq!(
+            store.is_stale(&tok_id("1001")),
+            Some(false),
+            "a mismatch never invalidates the book by itself"
+        );
+    }
+
+    /// (b) One market's frame may carry entries for several of its assets — that is the
+    /// whole reason `asset_id` moved onto the entry. Each must reach its own book, and each
+    /// must produce its own touch so the detector wakes for both events.
+    #[test]
+    fn one_frame_updates_every_asset_it_touches() {
+        let store = BookStore::new();
+        let now = Instant::now();
+        for asset in ["1001", "2002"] {
+            for frame in frames_of(&snapshot_for(
+                asset,
+                r#"{"price":"0.30","size":"10"}"#,
+                r#"{"price":"0.70","size":"10"}"#,
+                1_757_908_892_000i64,
+            )) {
+                store.apply_frame(&frame, now);
+            }
+        }
+
+        let delta = r#"{"market":"0xabc","event_type":"price_change","timestamp":"1757908892351",
+            "price_changes":[
+                {"asset_id":"1001","price":"0.31","size":"55","side":"BUY"},
+                {"asset_id":"2002","price":"0.69","size":"77","side":"SELL"},
+                {"asset_id":"1001","price":"0.72","size":"12","side":"SELL"}
+            ]}"#;
+        let frames = frames_of(delta);
+        assert_eq!(frames.len(), 2, "one frame per asset, in first-seen order");
+
+        let touched: Vec<TokenId> = frames
+            .iter()
+            .filter_map(|f| store.apply_frame(f, now))
+            .collect();
+        assert_eq!(touched, vec![tok_id("1001"), tok_id("2002")]);
+
+        let books = store.snapshot_of(&[tok_id("1001"), tok_id("2002")]);
+        let one = &books[&tok_id("1001")];
+        assert_eq!(one.best_bid(), Some(dec!(0.31)), "new best bid");
+        assert_eq!(
+            one.asks,
+            vec![
+                PriceLevel::new(dec!(0.70), dec!(10)),
+                PriceLevel::new(dec!(0.72), dec!(12)),
+            ],
+            "both of this asset's entries applied, in order"
+        );
+        let two = &books[&tok_id("2002")];
+        assert_eq!(
+            two.asks,
+            vec![
+                PriceLevel::new(dec!(0.69), dec!(77)),
+                PriceLevel::new(dec!(0.70), dec!(10)),
+            ],
+            "SELL is the ask side, and 0.69 sorts in front of the untouched 0.70"
+        );
+        assert_eq!(two.bids, vec![PriceLevel::new(dec!(0.30), dec!(10))]);
+
+        let stats = store.stats.snapshot();
+        assert_eq!(stats.deltas, 2);
+        assert_eq!(stats.delta_entries_applied, 3);
+        assert_eq!(stats.delta_entries_skipped, 0);
+    }
+
+    /// (c) Size "0" is how the channel says "this price is gone".
+    #[test]
+    fn a_zero_size_entry_removes_the_level() {
+        let store = BookStore::new();
+        let now = Instant::now();
+        for frame in frames_of(&snapshot_for(
+            "1001",
+            r#"{"price":"0.49","size":"100"},{"price":"0.48","size":"20"}"#,
+            r#"{"price":"0.52","size":"50"}"#,
+            1_757_908_892_000i64,
+        )) {
+            store.apply_frame(&frame, now);
+        }
+        let delta = r#"{"event_type":"price_change","timestamp":"1757908892351","price_changes":[
+            {"asset_id":"1001","price":"0.49","size":"0","side":"BUY"}]}"#;
+        for frame in frames_of(delta) {
+            store.apply_frame(&frame, now);
+        }
+        let book = &store.snapshot_of(&[tok_id("1001")])[&tok_id("1001")];
+        assert_eq!(book.bids, vec![PriceLevel::new(dec!(0.48), dec!(20))]);
+        assert_eq!(book.best_bid(), Some(dec!(0.48)));
+        assert_eq!(store.stats.snapshot().delta_entries_applied, 1);
+    }
+
+    /// (d) An entry for an asset we hold no book for cannot be applied — but it must not
+    /// take its siblings down with it, and the fact that it was dropped has to be visible.
+    #[test]
+    fn an_entry_for_an_unknown_asset_is_skipped_without_dropping_the_frame() {
+        let store = BookStore::new();
+        let now = Instant::now();
+        for frame in frames_of(&snapshot_for(
+            "1001",
+            r#"{"price":"0.49","size":"100"}"#,
+            r#"{"price":"0.52","size":"50"}"#,
+            1_757_908_892_000i64,
+        )) {
+            store.apply_frame(&frame, now);
+        }
+        let delta = r#"{"event_type":"price_change","timestamp":"1757908892351","price_changes":[
+            {"asset_id":"9999","price":"0.10","size":"5","side":"BUY"},
+            {"asset_id":"9999","price":"0.90","size":"5","side":"SELL"},
+            {"asset_id":"1001","price":"0.50","size":"200","side":"BUY"}
+        ]}"#;
+        let frames = frames_of(delta);
+        assert_eq!(frames.len(), 2);
+        let touched: Vec<TokenId> = frames
+            .iter()
+            .filter_map(|f| store.apply_frame(f, now))
+            .collect();
+        assert_eq!(touched, vec![tok_id("1001")], "only the known asset moved");
+
+        let book = &store.snapshot_of(&[tok_id("1001")])[&tok_id("1001")];
+        assert_eq!(book.best_bid(), Some(dec!(0.50)), "the good entry applied");
+
+        let stats = store.stats.snapshot();
+        assert_eq!(stats.delta_entries_applied, 1);
+        assert_eq!(stats.delta_entries_skipped, 2, "both unknown-asset entries");
+        assert_eq!(stats.orphan_deltas, 1);
+        assert_eq!(
+            stats.frames_unrecognized, 0,
+            "an unroutable entry is not a shape we failed to understand"
+        );
+        // …and the unknown asset is remembered so the resync sweep fetches it over REST.
+        assert_eq!(store.is_stale(&tok_id("9999")), Some(true));
+    }
+
+    /// (e) The shapes we accepted before M6.5 still work. They cost nothing to keep, and a
+    /// parser that understands exactly one spelling is how this bug happened.
+    #[test]
+    fn the_legacy_delta_shapes_remain_accepted() {
+        // `changes[]` with the asset on the frame.
+        let legacy = r#"{"event_type":"price_change","asset_id":"1001","timestamp":"1757908892351",
+            "changes":[{"price":"0.41","size":"7","side":"SELL"}]}"#;
+        match &frames_of(legacy)[0] {
+            MarketFrame::PriceChange {
+                asset_id, changes, ..
+            } => {
+                assert_eq!(asset_id, &tok_id("1001"));
+                assert_eq!(changes[0], LevelChange::new(Side::Ask, dec!(0.41), dec!(7)));
+            }
+            other => panic!("expected a price change, got {other:?}"),
+        }
+
+        // The single-level form, fields at the top of the frame.
+        let single =
+            r#"{"event_type":"price_change","asset_id":"7","price":0.5,"size":"12","side":"buy"}"#;
+        match &frames_of(single)[0] {
+            MarketFrame::PriceChange { changes, .. } => {
+                assert_eq!(changes[0], LevelChange::new(Side::Bid, dec!(0.5), dec!(12)));
+            }
+            other => panic!("expected a price change, got {other:?}"),
+        }
+
+        // Both arrays present: the verified one wins.
+        let both = r#"{"event_type":"price_change","asset_id":"1001",
+            "price_changes":[{"asset_id":"2002","price":"0.6","size":"1","side":"BUY"}],
+            "changes":[{"price":"0.4","size":"9","side":"BUY"}]}"#;
+        match &frames_of(both)[0] {
+            MarketFrame::PriceChange {
+                asset_id, changes, ..
+            } => {
+                assert_eq!(asset_id, &tok_id("2002"));
+                assert_eq!(changes[0].size, dec!(1));
+            }
+            other => panic!("expected a price change, got {other:?}"),
+        }
+    }
+
+    /// (f) The diagnosability half of M6.5. A frame we cannot use is counted *and* the
+    /// first few are dumped raw, so the next shape drift arrives in the log with the bytes
+    /// needed to fix it. The dump is budgeted: an 8 500 frames/s stream must not write the
+    /// whole market to disk.
+    #[tokio::test]
+    async fn unrecognized_payloads_are_counted_and_the_first_few_are_logged_raw() {
+        let books = Arc::new(BookStore::new());
+        let (touches, _rx) = mpsc::channel(64);
+        // Exactly the class of payload that broke us: a `price_change` whose level array is
+        // under a key this build has never heard of.
+        let payload = r#"{"event_type":"price_change","market":"0xabc",
+            "some_future_key":[{"asset_id":"1001","price":"0.5","size":"200","side":"BUY"}]}"#;
+        let bursts = UNRECOGNIZED_SAMPLE_LIMIT + 5;
+
+        let capture = crate::testlog::LogCapture::new();
+        {
+            let _guard = capture.install(tracing::Level::WARN);
+            for _ in 0..bursts {
+                assert!(
+                    handle_payload(3, payload, &books, &touches, Instant::now()).await,
+                    "an unusable payload must never kill the reader"
+                );
+            }
+        }
+        let log = capture.text();
+
+        assert_eq!(
+            log.matches("unrecognized market-data payload").count(),
+            UNRECOGNIZED_SAMPLE_LIMIT as usize,
+            "the raw sample is rate limited to the budget:\n{log}"
+        );
+        assert!(
+            log.contains("some_future_key"),
+            "the sample must carry the raw payload:\n{log}"
+        );
+        assert!(
+            log.contains("shard=3"),
+            "…and say where it came from:\n{log}"
+        );
+
+        let stats = books.stats.snapshot();
+        assert_eq!(stats.frames_unrecognized, bursts, "every one is counted");
+        assert_eq!(stats.malformed_frames, bursts);
+        assert_eq!(stats.messages, bursts);
+        assert_eq!(stats.delta_entries_applied, 0);
+    }
+
+    #[test]
+    fn a_sampled_payload_is_truncated_on_a_character_boundary() {
+        let long = format!("{}€tail", "x".repeat(600));
+        let cut = truncate_payload(&long, UNRECOGNIZED_SAMPLE_CHARS);
+        assert!(cut.starts_with(&"x".repeat(500)));
+        assert!(cut.contains("more bytes"), "{cut}");
+        // A payload that fits is passed through untouched.
+        assert_eq!(
+            truncate_payload("short", UNRECOGNIZED_SAMPLE_CHARS),
+            "short"
+        );
+        // Multi-byte characters must not be sliced in half.
+        assert_eq!(truncate_payload("€€€", 2), "€€… (+3 more bytes)");
     }
 
     #[test]

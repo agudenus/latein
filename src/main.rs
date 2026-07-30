@@ -13,6 +13,8 @@ mod gamma;
 mod http;
 mod risk;
 mod store;
+#[cfg(test)]
+mod testlog;
 mod types;
 mod ws;
 

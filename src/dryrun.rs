@@ -66,7 +66,7 @@ use crate::store::{
     CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, ScanTotals, Store,
 };
 use crate::types::{BookMap, Opportunity, Side, TokenId, Universe};
-use crate::ws::{self, DirtyBatch, StreamManager, DIVERGENCE_SAMPLE};
+use crate::ws::{self, DirtyBatch, StreamManager, StreamStatsSnapshot, DIVERGENCE_SAMPLE};
 
 /// Phase A is dry-run only. Live execution does not exist yet — not behind a flag, not
 /// behind a feature: there is no order-placing code in this binary.
@@ -841,34 +841,13 @@ impl Daemon {
     fn log_stream_pulse(&self, manager: &StreamManager, last: &mut Option<StreamPulse>) {
         let stats = manager.books().stats.snapshot();
         let now = Instant::now();
-        let pulse = StreamPulse {
-            at: now,
-            messages: stats.messages,
-            deltas: stats.deltas,
-            snapshots: stats.snapshots,
-        };
-        match last.replace(pulse) {
-            Some(previous) => {
-                let elapsed = now.saturating_duration_since(previous.at);
-                let messages = stats.messages.saturating_sub(previous.messages);
-                tracing::info!(
-                    frames = messages,
-                    price_changes_applied = stats.deltas.saturating_sub(previous.deltas),
-                    snapshots_applied = stats.snapshots.saturating_sub(previous.snapshots),
-                    events_per_sec = %ws::events_per_sec(messages, elapsed),
-                    since_secs = elapsed.as_secs(),
-                    connections = manager.health().live_connections(),
-                    "stream data-plane health"
-                );
-            }
-            // First sweep: totals only, because there is no interval to divide by yet.
-            None => tracing::info!(
-                frames_total = stats.messages,
-                price_changes_applied_total = stats.deltas,
-                connections = manager.health().live_connections(),
-                "stream data-plane health (first sweep — no rate yet)"
-            ),
-        }
+        emit_stream_pulse(
+            &stats,
+            last.as_ref(),
+            now,
+            manager.health().live_connections(),
+        );
+        *last = Some(StreamPulse { at: now, stats });
     }
 
     fn record_cycle(&self, stats: CycleStats) {
@@ -997,9 +976,66 @@ impl Daemon {
 #[derive(Debug, Clone, Copy)]
 struct StreamPulse {
     at: Instant,
-    messages: u64,
-    deltas: u64,
-    snapshots: u64,
+    stats: StreamStatsSnapshot,
+}
+
+/// Render one data-plane health line: everything as a per-sweep delta against `previous`.
+///
+/// Split out of [`Daemon::log_stream_pulse`] so the *line itself* is testable. M6.5's whole
+/// lesson is that this line is the only place a wire-format break becomes visible, so what
+/// it prints is behaviour, not decoration:
+///
+/// * `frames` vs `price_changes_applied` — traffic arriving vs traffic understood. The soak
+///   that motivated M6.5 ran at 8 500 frames/s with `price_changes_applied=0`.
+/// * `delta_entries_applied` / `delta_entries_skipped` — level updates that reached a book,
+///   and those dropped for an unknown asset or an out-of-order frame.
+/// * `frames_unrecognized` — parsed, but matched no shape we handle. Non-zero means the
+///   channel is saying something we do not understand; the first few such payloads are also
+///   in the log verbatim (see [`ws::BookStore::sample_unrecognized`]).
+/// * `delta_top_mismatch` — applied deltas whose own `best_bid`/`best_ask` disagreed with
+///   the book we built from them. Drift between REST sweeps, counted but never acted on.
+fn emit_stream_pulse(
+    stats: &StreamStatsSnapshot,
+    previous: Option<&StreamPulse>,
+    now: Instant,
+    connections: u32,
+) {
+    let Some(previous) = previous else {
+        // First sweep: totals only, because there is no interval to divide by yet.
+        tracing::info!(
+            frames_total = stats.messages,
+            price_changes_applied_total = stats.deltas,
+            delta_entries_applied_total = stats.delta_entries_applied,
+            frames_unrecognized_total = stats.frames_unrecognized,
+            connections,
+            "stream data-plane health (first sweep — no rate yet)"
+        );
+        return;
+    };
+    let elapsed = now.saturating_duration_since(previous.at);
+    let since = &previous.stats;
+    let messages = stats.messages.saturating_sub(since.messages);
+    tracing::info!(
+        frames = messages,
+        price_changes_applied = stats.deltas.saturating_sub(since.deltas),
+        snapshots_applied = stats.snapshots.saturating_sub(since.snapshots),
+        delta_entries_applied = stats
+            .delta_entries_applied
+            .saturating_sub(since.delta_entries_applied),
+        delta_entries_skipped = stats
+            .delta_entries_skipped
+            .saturating_sub(since.delta_entries_skipped),
+        frames_unrecognized = stats
+            .frames_unrecognized
+            .saturating_sub(since.frames_unrecognized),
+        delta_top_mismatch = stats
+            .delta_top_mismatch
+            .saturating_sub(since.delta_top_mismatch),
+        events_per_sec = %ws::events_per_sec(messages, elapsed),
+        since_secs = elapsed.as_secs(),
+        connections,
+        "stream data-plane health"
+    );
 }
 
 fn elapsed_ms(since: Instant) -> i64 {
@@ -2308,32 +2344,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Somewhere to collect what the daemon logged.
-    #[derive(Clone)]
-    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
-        type Writer = LogCapture;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// The retry line is the *only* thing an operator sees while discovery is failing, so
     /// it has to carry the whole cause chain. It used to log `anyhow`'s plain `Display`,
     /// which prints the outermost context and nothing else — every attempt read "market
@@ -2361,18 +2371,13 @@ mod tests {
         cfg.stream.enabled = false;
         cfg.validate().expect("config must validate");
 
-        let buffer = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let capture = crate::testlog::LogCapture::new();
         {
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(LogCapture(buffer.clone()))
-                .with_ansi(false)
-                .with_max_level(tracing::Level::ERROR)
-                .finish();
-            let _guard = tracing::subscriber::set_default(subscriber);
+            let _guard = capture.install(tracing::Level::ERROR);
             run(cfg, Some(1)).await.expect("daemon run");
         }
 
-        let log = String::from_utf8_lossy(&buffer.lock().expect("log buffer")).to_string();
+        let log = capture.text();
         assert!(
             log.contains("market discovery failed at startup"),
             "the retry line is missing entirely:\n{log}"
@@ -2390,6 +2395,67 @@ mod tests {
         assert!(log.contains("upstream is having a moment"), "got:\n{log}");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// M6.5. The health line is the only place a wire-format break is visible, and the
+    /// first soak proved a line can be *correct* and still hide the failure: it reported
+    /// `frames=4807541 price_changes_applied=0` for ten hours, which is indistinguishable
+    /// from a quiet market unless you know deltas exist. Every counter that would have
+    /// named the fault is now on the line, so this asserts they are all actually printed —
+    /// and as per-sweep deltas, not totals.
+    #[test]
+    fn the_data_plane_health_line_names_every_counter_that_can_hide_a_break() {
+        let previous = StreamPulse {
+            at: Instant::now(),
+            stats: StreamStatsSnapshot {
+                messages: 100,
+                deltas: 10,
+                snapshots: 5,
+                delta_entries_applied: 40,
+                delta_entries_skipped: 1,
+                frames_unrecognized: 2,
+                delta_top_mismatch: 3,
+                ..StreamStatsSnapshot::default()
+            },
+        };
+        let current = StreamStatsSnapshot {
+            messages: 350,
+            deltas: 60,
+            snapshots: 9,
+            delta_entries_applied: 240,
+            delta_entries_skipped: 8,
+            frames_unrecognized: 11,
+            delta_top_mismatch: 4,
+            ..StreamStatsSnapshot::default()
+        };
+
+        let capture = crate::testlog::LogCapture::new();
+        {
+            let _guard = capture.install(tracing::Level::INFO);
+            emit_stream_pulse(&current, Some(&previous), Instant::now(), 177);
+            emit_stream_pulse(&current, None, Instant::now(), 177);
+        }
+        let log = capture.text();
+
+        for field in [
+            "frames=250",
+            "price_changes_applied=50",
+            "snapshots_applied=4",
+            "delta_entries_applied=200",
+            "delta_entries_skipped=7",
+            "frames_unrecognized=9",
+            "delta_top_mismatch=1",
+            "connections=177",
+        ] {
+            assert!(
+                log.contains(field),
+                "the health line is missing {field}:\n{log}"
+            );
+        }
+        // The first sweep has no interval to divide by, but must still show whether deltas
+        // are landing at all — that is the whole point of it.
+        assert!(log.contains("delta_entries_applied_total=240"), "{log}");
+        assert!(log.contains("frames_unrecognized_total=11"), "{log}");
     }
 
     /// The renderer itself, over a hand-built chain.
