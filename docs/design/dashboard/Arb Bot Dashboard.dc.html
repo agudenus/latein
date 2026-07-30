@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics><meta name="design_doc_mode" content="canvas"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"><link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css"><style>
+body{margin:0;background:#0e0f18;font-family:"Inter",system-ui,sans-serif;color:#e9e9ed}
+a{color:#b5abfc;text-decoration:none}a:hover{color:#d2cefd}
+@keyframes dot{0%,100%{opacity:1}50%{opacity:.25}}
+.dv-turn{padding:40px 44px 32px;border-bottom:1px solid rgba(233,233,237,.08);scroll-margin-top:16px}
+.dv-thd{display:flex;align-items:baseline;gap:10px;margin:0 0 20px}
+.dv-tid{font:600 10px "Inter";padding:3px 7px;background:#e9e9ed;color:#161826;border-radius:4px;text-decoration:none}
+.dv-tname{font:500 13px/1.2 "Inter";color:#e9e9ed}
+.dv-opts{display:flex;flex-wrap:wrap;gap:34px;align-items:flex-start}
+.dv-opt{flex:none;display:flex;flex-direction:column;gap:9px;scroll-margin-top:16px}
+.dv-oid{font:600 10.5px "Inter";padding:3px 7px;background:rgba(233,233,237,.10);color:#e9e9ed;border-radius:5px;text-decoration:none}
+.dv-olabel{display:flex;align-items:baseline;gap:8px;font:400 11px/1.35 "Inter";color:#9397ab;max-width:1440px}
+.dv-card{max-width:100%;background:#161826;border-radius:8px;box-shadow:0 0 0 1px #3f424d,0 16px 40px rgba(0,0,0,.55);overflow:hidden}
+.dv-opt:target .dv-oid{background:#9184d9;color:#161826}
+.dv-next{margin:22px 0 0;font:12px/1.5 "Inter";color:#75798c}
+.kpi{background:#232532;border-radius:8px;padding:15px 16px 13px;box-shadow:0 0 0 1px #3f424d}
+.kpil{font:500 10.5px/1 "Inter";letter-spacing:.09em;color:#9397ab;text-transform:uppercase}
+.kpiv{font:500 30px/1 "Inter";font-variant-numeric:tabular-nums}
+.kpid{font:500 12px/1 "Inter";color:#9397ab;padding-bottom:3px}
+.sec{font:500 11px/1 "Inter";letter-spacing:.09em;text-transform:uppercase}
+.num{font-variant-numeric:tabular-nums}
+</style></helmet>
+
+<section class="dv-turn" id="t2">
+<div class="dv-thd"><a class="dv-tid" href="#t2">2</a><span class="dv-tname">polyarb soak monitor — Phase A dry-run scanner, no P&amp;L anywhere</span></div>
+<div class="dv-olabel" style="margin:-8px 0 20px;max-width:1180px">An earlier pass assumed a live trading bot. The repo can't trade: no signing code, no wallet, <span style="color:#cfd3e5">mode</span> locked to <span style="color:#cfd3e5">dry-run</span>. So the subject is the soak evidence — how many detected gaps survive spread, the taker fee curve and book depth, and whether the walked fills were still there on re-poll.</div>
+<div class="dv-opts">
+
+<div class="dv-opt" id="2a">
+<div class="dv-olabel"><a class="dv-oid" href="#2a">2a</a>Evidence console — the go/no-go number up top, the cost-survival funnel as the main graphic, opportunities with maker and taker reported separately, pipeline health in the rail.</div>
+<div class="dv-card" style="width:1440px">
+  <div style="display:flex;align-items:center;gap:14px;height:52px;padding:0 22px;background:#1a1c2b;box-shadow:inset 0 -1px 0 rgba(233,233,237,.10)">
+    <div style="display:flex;align-items:center;gap:9px">
+      <div style="width:9px;height:9px;border-radius:2px;background:#9184d9"></div>
+      <div style="font:500 13.5px/1 'Inter'">polyarb</div>
+      <div style="font:400 11px/1 'Inter';color:#75798c">scanner · phase A</div>
+    </div>
+    <div style="padding:5px 10px;border-radius:99px;font:500 10.5px/1 'Inter';letter-spacing:.06em;color:#b5abfc;box-shadow:inset 0 0 0 1px #5d5294">DRY-RUN · LOCKED</div>
+    <div style="flex:1"></div>
+    <div style="display:flex;align-items:center;gap:7px;padding:5px 10px;border-radius:99px;box-shadow:inset 0 0 0 1px rgba(99,201,154,.35)">
+      <div style="width:6px;height:6px;border-radius:99px;background:#63c99a;animation:dot 2s infinite"></div>
+      <div style="font:500 11px/1 'Inter';color:#63c99a">STREAMING · 4 shards</div>
+    </div>
+    <div class="num" style="display:flex;gap:20px;font:400 11.5px/1 'Inter';color:#9397ab">
+      <div>universe <span style="color:#e9e9ed">312</span> events</div>
+      <div>refresh <span style="color:#e9e9ed">600s</span></div>
+      <div>uptime <span style="color:#e9e9ed">4d 17h</span></div>
+      <div>{{ clock }}</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 336px">
+    <div style="padding:22px;display:flex;flex-direction:column;gap:18px;box-shadow:inset -1px 0 0 rgba(233,233,237,.08)">
+      <div style="background:#232532;border-radius:8px;padding:18px 20px;box-shadow:0 0 0 1px #3f424d;display:flex;align-items:center;gap:28px">
+        <div style="flex:1">
+          <div class="kpil">Soak day 5 of 7 — is there enough fillable edge to build execution?</div>
+          <div style="display:flex;align-items:flex-end;gap:12px;margin-top:12px">
+            <div class="num" style="font:500 42px/1 'Inter';color:#63c99a">{{ survivors }}</div>
+            <div style="font:400 12.5px/1.4 'Inter';color:#9397ab;padding-bottom:4px;max-width:330px;text-wrap:pretty">opportunities net-positive after spread, fee and depth — and still fillable on re-poll</div>
+          </div>
+        </div>
+        <div style="width:1px;align-self:stretch;background:rgba(233,233,237,.10)"></div>
+        <div>
+          <div class="kpil">Simulated net edge</div>
+          <div class="num" style="font:500 26px/1 'Inter';margin-top:9px">$1,847</div>
+          <div style="font:400 11px/1 'Inter';color:#75798c;margin-top:7px">at walked size · maker basis</div>
+        </div>
+        <div>
+          <div class="kpil">Median net maker</div>
+          <div class="num" style="font:500 26px/1 'Inter';margin-top:9px">84 <span style="font-size:14px;color:#9397ab">bps</span></div>
+          <div style="font:400 11px/1 'Inter';color:#75798c;margin-top:7px">taker basis: 11 bps</div>
+        </div>
+        <div>
+          <div class="kpil">Detect latency</div>
+          <div class="num" style="font:500 26px/1 'Inter';margin-top:9px">{{ latEl }} <span style="font-size:14px;color:#9397ab">ms</span></div>
+          <div style="font:400 11px/1 'Inter';color:#75798c;margin-top:7px">p50 · p95 610ms</div>
+        </div>
+      </div>
+
+      <div style="background:#232532;border-radius:8px;padding:17px 20px 19px;box-shadow:0 0 0 1px #3f424d">
+        <div style="display:flex;align-items:baseline;gap:12px">
+          <div style="font:500 13px/1 'Inter'">Where the gaps die</div>
+          <div style="font:400 11.5px/1 'Inter';color:#75798c">last 24h · executable book sides only, never mid or last</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:9px;margin-top:16px">
+          <sc-for list="{{ funnel }}" as="f" hint-placeholder-count="5">
+            <div style="display:grid;grid-template-columns:210px 1fr 88px 62px;align-items:center;gap:14px">
+              <div style="font:400 12px/1.3 'Inter';color:#cfd3e5">{{ f.name }}</div>
+              <div style="height:18px;border-radius:3px;background:rgba(233,233,237,.055);overflow:hidden">{{ f.bar }}</div>
+              <div class="num" style="font:500 12.5px/1 'Inter';text-align:right">{{ f.n }}</div>
+              <div class="num" style="font:400 11.5px/1 'Inter';color:#75798c;text-align:right">{{ f.pct }}</div>
+            </div>
+          </sc-for>
+        </div>
+        <div style="font:400 11.5px/1.5 'Inter';color:#75798c;margin-top:15px;max-width:720px;text-wrap:pretty">The spread step is the big one, as the tick study predicted. Of what survives, <span style="color:#cfd3e5">{{ vanishedPct }}</span> was gone by the first re-poll and is recorded <span style="color:#e0706b">vanished</span> — never revised in its favour.</div>
+      </div>
+
+      <div>
+        <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:10px">
+          <div style="font:500 13px/1 'Inter'">Opportunities</div>
+          <div style="font:400 11.5px/1 'Inter';color:#75798c">{{ scanNote }}</div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 104px 74px 74px 78px 78px 84px 96px;padding:0 12px 7px;font:500 10.5px/1 'Inter';letter-spacing:.07em;color:#75798c;text-transform:uppercase;box-shadow:inset 0 -1px 0 rgba(233,233,237,.10)">
+          <div>Event</div><div>Detector</div><div style="text-align:right">Gross</div><div style="text-align:right">Spread</div><div style="text-align:right">Net mk</div><div style="text-align:right">Net tk</div><div style="text-align:right">Size</div><div style="text-align:right">Verdict</div>
+        </div>
+        <sc-for list="{{ opps }}" as="o" hint-placeholder-count="8">
+          <div class="num" style="display:grid;grid-template-columns:1fr 104px 74px 74px 78px 78px 84px 96px;align-items:center;padding:9px 12px;font:400 12.5px/1.25 'Inter';box-shadow:inset 0 -1px 0 rgba(233,233,237,.055)" style-hover="background:#1c1e2c">
+            <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:14px">{{ o.event }}<span style="color:#595d6c"> · {{ o.cat }} {{ o.fee }}</span></div>
+            <div>{{ o.kindEl }}</div>
+            <div style="text-align:right;color:#9397ab">{{ o.gross }}</div>
+            <div style="text-align:right;color:#9397ab">{{ o.spread }}</div>
+            <div style="text-align:right">{{ o.makerEl }}</div>
+            <div style="text-align:right">{{ o.takerEl }}</div>
+            <div style="text-align:right;color:#cfd3e5">{{ o.size }}</div>
+            <div style="text-align:right">{{ o.verdictEl }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+
+    <div style="padding:22px 20px;display:flex;flex-direction:column;gap:22px">
+      <div>
+        <div class="kpil">Pipeline</div>
+        <div style="margin-top:12px">
+          <sc-for list="{{ health }}" as="h" hint-placeholder-count="7">
+            <div class="num" style="display:flex;align-items:center;gap:9px;padding:8px 0;font:400 11.5px/1.35 'Inter';box-shadow:inset 0 -1px 0 rgba(233,233,237,.05)">
+              <div style="flex:none">{{ h.dot }}</div>
+              <div style="flex:1;color:#cfd3e5">{{ h.name }}</div>
+              <div style="color:#9397ab;text-align:right">{{ h.val }}</div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+      <div>
+        <div class="kpil">By category · taker rate</div>
+        <div style="margin-top:12px">
+          <sc-for list="{{ catRows }}" as="c" hint-placeholder-count="6">
+            <div class="num" style="display:grid;grid-template-columns:1fr 46px 40px 60px;align-items:center;gap:6px;padding:7px 0;font:400 11.5px/1.3 'Inter';box-shadow:inset 0 -1px 0 rgba(233,233,237,.05)">
+              <div style="color:#cfd3e5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ c.name }}</div>
+              <div style="color:#75798c;text-align:right">{{ c.rate }}</div>
+              <div style="text-align:right">{{ c.n }}</div>
+              <div style="text-align:right;color:#9397ab">{{ c.bps }}</div>
+            </div>
+          </sc-for>
+        </div>
+        <div style="font:400 10.5px/1.5 'Inter';color:#75798c;margin-top:10px;text-wrap:pretty">crypto 5m/15m series open and resolve inside the 600s refresh — <span style="color:#cfd3e5">0 opportunities</span> here means not looked at properly, not no edge.</div>
+      </div>
+      <div>
+        <div class="kpil">Log</div>
+        <div style="margin-top:10px">
+          <sc-for list="{{ logs }}" as="l" hint-placeholder-count="9">
+            <div class="num" style="display:flex;gap:8px;padding:6px 0;font:400 10.5px/1.4 'Inter';box-shadow:inset 0 -1px 0 rgba(233,233,237,.045)">
+              <div style="color:#595d6c;flex:none">{{ l.t }}</div><div style="flex:1">{{ l.el }}</div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<div class="dv-opt" id="2b">
+<div class="dv-olabel"><a class="dv-oid" href="#2b">2b</a>Soak terminal — one screen, hairlines only. Status strip carries the whole state; funnel collapses to a single inline row; three live columns.</div>
+<div class="dv-card" style="width:1440px">
+  <div style="display:flex">
+    <div style="width:46px;flex:none;background:#131522;display:flex;flex-direction:column;align-items:center;gap:15px;padding:14px 0;box-shadow:inset -1px 0 0 rgba(233,233,237,.08)">
+      <div style="width:10px;height:10px;border-radius:2px;background:#9184d9"></div>
+      <div style="width:26px;height:26px;border-radius:5px;background:rgba(145,132,217,.16);display:flex;align-items:center;justify-content:center;color:#b5abfc;font-size:15px"><i class="ph ph-funnel"></i></div>
+      <div style="width:26px;height:26px;display:flex;align-items:center;justify-content:center;color:#75798c;font-size:15px" style-hover="color:#e9e9ed"><i class="ph ph-list-dashes"></i></div>
+      <div style="width:26px;height:26px;display:flex;align-items:center;justify-content:center;color:#75798c;font-size:15px" style-hover="color:#e9e9ed"><i class="ph ph-broadcast"></i></div>
+      <div style="width:26px;height:26px;display:flex;align-items:center;justify-content:center;color:#75798c;font-size:15px" style-hover="color:#e9e9ed"><i class="ph ph-file-text"></i></div>
+    </div>
+    <div style="flex:1;min-width:0">
+      <div class="num" style="display:flex;align-items:center;height:34px;padding:0 14px;background:#1a1c2b;font:400 11.5px/1 'Inter';color:#9397ab;box-shadow:inset 0 -1px 0 rgba(233,233,237,.10)">
+        <div style="display:flex;align-items:center;gap:7px;padding-right:12px"><div style="width:5px;height:5px;border-radius:99px;background:#63c99a;animation:dot 2s infinite"></div><span style="color:#e9e9ed;font-weight:500">DRY-RUN</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">soak <span style="color:#e9e9ed">d5/7</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">gaps <span style="color:#e9e9ed">4,182</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">surv <span style="color:#63c99a;font-weight:500">{{ survivors }}</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">netmk <span style="color:#e9e9ed">84bps</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">nettk <span style="color:#e9e9ed">11bps</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">p50 <span style="color:#e9e9ed">{{ latEl }}</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">p95 <span style="color:#e9e9ed">610</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">ws <span style="color:#e9e9ed">4/4</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">rest <span style="color:#e9e9ed">seed</span></div>
+        <div style="padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">tg <span style="color:#63c99a">ok</span></div>
+        <div style="flex:1"></div>
+        <div style="color:#595d6c">{{ clock }} UTC</div>
+      </div>
+
+      <div class="num" style="display:flex;align-items:center;gap:0;height:30px;padding:0 14px;font:400 11px/1 'Inter';color:#9397ab;box-shadow:inset 0 -1px 0 rgba(233,233,237,.08)">
+        <div style="font:500 9.5px/1 'Inter';letter-spacing:.08em;text-transform:uppercase;color:#595d6c;padding-right:12px">funnel</div>
+        <sc-for list="{{ funnel }}" as="f" hint-placeholder-count="5">
+          <div style="display:flex;align-items:center;gap:7px;padding:0 12px;box-shadow:inset 1px 0 0 rgba(233,233,237,.10)">
+            <span style="color:#595d6c">{{ f.shortName }}</span><span style="color:#e9e9ed;font-weight:500">{{ f.n }}</span><span style="color:#75798c">{{ f.pct }}</span>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 400px 340px">
+        <div style="padding:12px 14px;box-shadow:inset -1px 0 0 rgba(233,233,237,.08)">
+          <div style="display:flex;align-items:baseline;gap:9px;margin-bottom:9px"><div class="sec">Opportunities</div><div style="font:400 10.5px/1 'Inter';color:#595d6c">{{ scanNote }}</div></div>
+          <div style="display:grid;grid-template-columns:1fr 74px 54px 54px 58px;font:500 9.5px/1 'Inter';letter-spacing:.08em;color:#595d6c;text-transform:uppercase;padding-bottom:6px;box-shadow:inset 0 -1px 0 rgba(233,233,237,.10)">
+            <div>event</div><div>kind</div><div style="text-align:right">netmk</div><div style="text-align:right">nettk</div><div style="text-align:right">size</div>
+          </div>
+          <sc-for list="{{ opps }}" as="o" hint-placeholder-count="9">
+            <div class="num" style="display:grid;grid-template-columns:1fr 74px 54px 54px 58px;align-items:center;height:23px;font:400 11.5px/1 'Inter';box-shadow:inset 0 -1px 0 rgba(233,233,237,.045)" style-hover="background:#1c1e2c">
+              <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:10px;color:#cfd3e5">{{ o.slug }}</div>
+              <div style="color:#75798c;font-size:10.5px">{{ o.kind }}</div>
+              <div style="text-align:right">{{ o.makerEl }}</div>
+              <div style="text-align:right">{{ o.takerEl }}</div>
+              <div style="text-align:right;color:#9397ab">{{ o.size }}</div>
+            </div>
+          </sc-for>
+        </div>
+        <div style="padding:12px 14px;box-shadow:inset -1px 0 0 rgba(233,233,237,.08)">
+          <div class="sec" style="margin-bottom:9px">Re-poll verdicts</div>
+          <div style="display:grid;grid-template-columns:1fr 96px 84px;font:500 9.5px/1 'Inter';letter-spacing:.08em;color:#595d6c;text-transform:uppercase;padding-bottom:6px;box-shadow:inset 0 -1px 0 rgba(233,233,237,.10)">
+            <div>event</div><div style="text-align:right">verdict</div><div style="text-align:right">held</div>
+          </div>
+          <sc-for list="{{ verdicts }}" as="v" hint-placeholder-count="9">
+            <div class="num" style="display:grid;grid-template-columns:1fr 96px 84px;align-items:center;height:23px;font:400 11.5px/1 'Inter';box-shadow:inset 0 -1px 0 rgba(233,233,237,.045)" style-hover="background:#1c1e2c">
+              <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:10px;color:#cfd3e5">{{ v.slug }}</div>
+              <div style="text-align:right">{{ v.el }}</div>
+              <div style="text-align:right;color:#75798c">{{ v.held }}</div>
+            </div>
+          </sc-for>
+        </div>
+        <div style="padding:12px 14px">
+          <div class="sec" style="margin-bottom:9px">Log</div>
+          <sc-for list="{{ logs }}" as="l" hint-placeholder-count="12">
+            <div class="num" style="display:flex;gap:8px;height:22px;align-items:center;font:400 10.5px/1 'Inter'">
+              <div style="color:#4a4d5c;flex:none">{{ l.t }}</div><div style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.el }}</div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(7,1fr);box-shadow:inset 0 1px 0 rgba(233,233,237,.08)">
+        <sc-for list="{{ catRows }}" as="c" hint-placeholder-count="7">
+          <div class="num" style="padding:11px 14px;box-shadow:inset 1px 0 0 rgba(233,233,237,.06)">
+            <div style="font:500 9.5px/1 'Inter';letter-spacing:.07em;text-transform:uppercase;color:#75798c;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ c.name }} <span style="color:#595d6c">{{ c.rate }}</span></div>
+            <div style="display:flex;align-items:baseline;gap:7px;margin-top:8px"><div style="font:500 17px/1 'Inter'">{{ c.n }}</div><div style="font:400 10.5px/1 'Inter';color:#9397ab">{{ c.bps }}</div></div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<div class="dv-opt" id="2c">
+<div class="dv-olabel"><a class="dv-oid" href="#2c">2c</a>Verdict-first — the soak answer stated in a sentence, the funnel as a stepped hero, one saturated band for the decision numbers. For the weekly go/no-go read, not the minute-to-minute watch.</div>
+<div class="dv-card" style="width:1440px">
+  <div style="padding:34px 40px 30px">
+    <div style="display:flex;align-items:center;gap:12px">
+      <div style="padding:5px 10px;border-radius:99px;font:500 10.5px/1 'Inter';letter-spacing:.06em;color:#b5abfc;box-shadow:inset 0 0 0 1px #5d5294">DRY-RUN · LOCKED</div>
+      <div class="kpil">Soak day 5 of 7 · 312 events · 4,182 gaps examined</div>
+      <div style="flex:1"></div>
+      <div class="num" style="font:400 11.5px/1 'Inter';color:#75798c">{{ clock }} UTC</div>
+    </div>
+    <div style="font:500 38px/1.2 'Inter';margin-top:20px;max-width:1040px;text-wrap:pretty">{{ survivors }} of 4,182 detected gaps were still fillable after spread, fee and depth — <span style="color:#63c99a">enough to justify an execution engine</span>, and almost all of it maker-side.</div>
+    <div style="font:400 14px/1.6 'Inter';color:#9397ab;margin-top:14px;max-width:760px;text-wrap:pretty">NegRisk rebalancing carries it, as the strategy report predicted. As a taker the same set nets 11 bps median and most of it is not worth the capital lockup; the case rests on maker capture, which means legging risk becomes the Phase B problem to solve.</div>
+  </div>
+
+  <div style="background:#262a60;padding:22px 40px;display:grid;grid-template-columns:repeat(5,1fr);gap:26px;position:relative;overflow:hidden">
+    
+    <div><div class="kpil" style="color:#a8adde">Median net maker</div><div class="num" style="font:500 28px/1 'Inter';margin-top:9px">84 bps</div><div style="font:400 11px/1 'Inter';color:#a8adde;margin-top:7px">zero fee, no spread crossed</div></div>
+    <div><div class="kpil" style="color:#a8adde">Median net taker</div><div class="num" style="font:500 28px/1 'Inter';margin-top:9px">11 bps</div><div style="font:400 11px/1 'Inter';color:#a8adde;margin-top:7px">fee curve peaks at 50/50</div></div>
+    <div><div class="kpil" style="color:#a8adde">Still there on re-poll</div><div class="num" style="font:500 28px/1 'Inter';margin-top:9px">62.7%</div><div style="font:400 11px/1 'Inter';color:#a8adde;margin-top:7px">rest recorded vanished</div></div>
+    <div><div class="kpil" style="color:#a8adde">Median walked size</div><div class="num" style="font:500 28px/1 'Inter';margin-top:9px">$740</div><div style="font:400 11px/1 'Inter';color:#a8adde;margin-top:7px">depth-constrained, retail</div></div>
+    <div><div class="kpil" style="color:#a8adde">Detect p50 · p95</div><div class="num" style="font:500 28px/1 'Inter';margin-top:9px">{{ latEl }} · 610</div><div style="font:400 11px/1 'Inter';color:#a8adde;margin-top:7px">ms from book move</div></div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 460px">
+    <div style="padding:26px 40px 30px;box-shadow:inset -1px 0 0 rgba(233,233,237,.08)">
+      <div style="font:500 13px/1 'Inter'">Cost survival</div>
+      <div style="display:flex;flex-direction:column;gap:12px;margin-top:18px">
+        <sc-for list="{{ funnel }}" as="f" hint-placeholder-count="5">
+          <div>
+            <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:6px">
+              <div class="num" style="font:500 15px/1 'Inter'">{{ f.n }}</div>
+              <div style="font:400 12px/1 'Inter';color:#cfd3e5">{{ f.name }}</div>
+              <div style="flex:1"></div>
+              <div class="num" style="font:400 11.5px/1 'Inter';color:#75798c">{{ f.pct }}</div>
+            </div>
+            <div style="height:26px;border-radius:3px;background:rgba(233,233,237,.05);overflow:hidden">{{ f.bar }}</div>
+            <div style="font:400 11px/1.4 'Inter';color:#75798c;margin-top:6px">{{ f.note }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+    <div style="padding:26px 32px 30px">
+      <div style="font:500 13px/1 'Inter'">By category</div>
+      <div style="display:grid;grid-template-columns:1fr 62px 52px 72px;padding:14px 0 7px;font:500 9.5px/1 'Inter';letter-spacing:.08em;color:#595d6c;text-transform:uppercase;box-shadow:inset 0 -1px 0 rgba(233,233,237,.10)">
+        <div>category</div><div style="text-align:right">taker</div><div style="text-align:right">opps</div><div style="text-align:right">net mk</div>
+      </div>
+      <sc-for list="{{ catRows }}" as="c" hint-placeholder-count="7">
+        <div class="num" style="display:grid;grid-template-columns:1fr 62px 52px 72px;align-items:center;padding:9px 0;font:400 12px/1.3 'Inter';box-shadow:inset 0 -1px 0 rgba(233,233,237,.05)">
+          <div style="color:#cfd3e5">{{ c.name }}</div>
+          <div style="text-align:right;color:#75798c">{{ c.rate }}</div>
+          <div style="text-align:right">{{ c.n }}</div>
+          <div style="text-align:right;color:#9397ab">{{ c.bps }}</div>
+        </div>
+      </sc-for>
+      <div style="font:400 11px/1.5 'Inter';color:#75798c;margin-top:14px;text-wrap:pretty">Geopolitics is fee-free and therefore the only tier where taker-side survives at any scale. Crypto's zero is an instrumentation gap, not a finding.</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<div class="dv-opt" id="2d">
+<div class="dv-olabel"><a class="dv-oid" href="#2d">2d</a>Break state — <span style="color:#cfd3e5">ApiError::EmptyDiscovery</span>. The one failure the scanner must never hide: a discovery pass returning zero events looks identical to a quiet market.</div>
+<div class="dv-card" style="width:1440px">
+  <div style="display:flex;align-items:center;gap:14px;height:52px;padding:0 22px;background:#2a1519;box-shadow:inset 0 -1px 0 rgba(224,112,107,.45)">
+    <div style="display:flex;align-items:center;gap:9px">
+      <div style="width:9px;height:9px;border-radius:2px;background:#e0706b"></div>
+      <div style="font:500 13.5px/1 'Inter'">polyarb</div>
+      <div style="font:400 11px/1 'Inter';color:#c08e8b">scanner · phase A</div>
+    </div>
+    <div style="padding:5px 10px;border-radius:99px;font:600 10.5px/1 'Inter';letter-spacing:.05em;color:#2a1519;background:#e0706b">BLIND</div>
+    <div style="flex:1"></div>
+    <div class="num" style="display:flex;gap:20px;font:400 11.5px/1 'Inter';color:#c08e8b">
+      <div>universe <span style="color:#e0706b">0</span> events</div>
+      <div>last good <span style="color:#e9e9ed">11m ago</span></div>
+      <div>{{ clock }}</div>
+    </div>
+  </div>
+  <div style="padding:40px 44px 44px;background:radial-gradient(120% 100% at 50% 0%,#2a1519 0%,#161826 70%)">
+    <div style="display:flex;align-items:center;gap:11px;font:500 11px/1 'Inter';letter-spacing:.09em;text-transform:uppercase;color:#e0706b">
+      <i class="ph ph-warning-octagon" style="font-size:16px"></i>ApiError::EmptyDiscovery
+    </div>
+    <div style="font:500 40px/1.15 'Inter';margin-top:16px;max-width:960px;text-wrap:pretty">Discovery returned <span class="num">0</span> events. The scanner is not quiet — it is blind, and every clean line below it is meaningless.</div>
+    <div style="font:400 14px/1.6 'Inter';color:#9397ab;margin-top:14px;max-width:740px;text-wrap:pretty">Three consecutive <span style="color:#cfd3e5">/events/keyset</span> passes parsed successfully and yielded an empty <span style="color:#cfd3e5">events[]</span>. Books are held from the last good pass and are past their staleness window; detection is suspended rather than run against stale depth. Soak evidence for this window will be excluded from the daily summary.</div>
+    <div style="display:flex;gap:12px;margin-top:26px">
+      <div style="background:#232532;border-radius:8px;padding:14px 16px;box-shadow:0 0 0 1px #4d3a3d;min-width:190px">
+        <div class="kpil">Events discovered</div><div class="num" style="font:500 24px/1 'Inter';margin-top:9px;color:#e0706b">0 <span style="font-size:13px;color:#9397ab">of 312</span></div>
+      </div>
+      <div style="background:#232532;border-radius:8px;padding:14px 16px;box-shadow:0 0 0 1px #3f424d;min-width:190px">
+        <div class="kpil">Endpoint</div><div class="num" style="font:500 15px/1.35 'Inter';margin-top:9px">gamma /events/keyset</div><div style="font:400 11px/1 'Inter';color:#75798c;margin-top:6px">HTTP 200 · schema valid</div>
+      </div>
+      <div style="background:#232532;border-radius:8px;padding:14px 16px;box-shadow:0 0 0 1px #3f424d;min-width:190px">
+        <div class="kpil">Books held</div><div class="num" style="font:500 24px/1 'Inter';margin-top:9px">0 fresh</div><div style="font:400 11px/1 'Inter';color:#75798c;margin-top:6px">1,240 past staleness</div>
+      </div>
+      <div style="background:#232532;border-radius:8px;padding:14px 16px;box-shadow:0 0 0 1px #3f424d;min-width:190px">
+        <div class="kpil">Alert</div><div class="num" style="font:500 24px/1 'Inter';margin-top:9px">sent</div><div style="font:400 11px/1 'Inter';color:#75798c;margin-top:6px">telegram · 11m ago</div>
+      </div>
+    </div>
+    <div style="margin-top:26px;background:#1a1c2b;border-radius:8px;padding:14px 16px;box-shadow:0 0 0 1px #3f424d">
+      <div class="num" style="font:400 11.5px/1.9 'Inter';color:#9397ab">
+        <div><span style="color:#595d6c">14:02:11</span> <span style="color:#e9e9ed">discovery</span> 312 events · 1,240 books seeded</div>
+        <div><span style="color:#595d6c">14:12:14</span> <span style="color:#e0706b">discovery</span> EmptyDiscovery: 0 events from /events/keyset — retrying</div>
+        <div><span style="color:#595d6c">14:22:16</span> <span style="color:#e0706b">discovery</span> EmptyDiscovery: 0 events (2 consecutive)</div>
+        <div><span style="color:#595d6c">14:22:16</span> <span style="color:#9397ab">stream</span> 4/4 shards connected · no book updates for 600s</div>
+        <div><span style="color:#595d6c">14:32:18</span> <span style="color:#e0706b">discovery</span> EmptyDiscovery: 0 events (3 consecutive) · detection suspended</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:24px;align-items:center">
+      <div style="padding:9px 16px;border-radius:8px;font:500 12.5px/1 'Inter';color:#e9e9ed;box-shadow:inset 0 0 0 1px #9184d9" style-hover="background:rgba(145,132,217,.14)">Open discovery log</div>
+      <div style="padding:9px 16px;border-radius:8px;font:500 12.5px/1 'Inter';color:#9397ab" style-hover="color:#e9e9ed">Show last good scan</div>
+      <div style="flex:1"></div>
+      <div class="num" style="font:400 11.5px/1 'Inter';color:#75798c">read-only · nothing to pause, the daemon cannot trade</div>
+    </div>
+  </div>
+</div>
+</div>
+
+</div>
+<p class="dv-next">Try next: "<a class="dv-oid" href="#2a">2a</a> with <a class="dv-oid" href="#2b">2b</a>'s density" · "add the opportunity drill-in with both legs' walked book" · "design the daily report email" · "show the maker-vs-taker split as a chart"</p>
+</section>
+
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1560,&quot;height&quot;:1000}}">
+const R = React;
+
+
+const FUNNEL = [
+  ["Gaps detected", "detected", 4182, 100, "Sum of executable asks below $1.00 across binary and NegRisk events."],
+  ["Survive bid–ask spread", "spread", 1024, 24.5, "Gross gap computed on the sides you would lift, not mid — three quarters die here."],
+  ["Survive taker fee curve", "fee", 386, 9.2, "fee = shares × rate × p × (1−p); worst exactly at 50/50, where gaps cluster."],
+  ["Fillable at size ≥ $250", "depth", 118, 2.8, "Depth-walked VWAP still clears the net floor at a size worth having."],
+  ["Still there on re-poll", "held", 74, 1.8, "filled_simulated. The 44 that had gone are recorded vanished and never revised."]
+];
+const OPPS = [
+  ["NYC mayoral race — winner", "nyc-mayor-2026", "negrisk-yes", "politics", "0.04", "2.41%", "0.62%", "+118", "+31", "$1,840", "filled_simulated", "true-arb"],
+  ["Fed decision — September", "fed-sep-2026", "negrisk-no", "finance", "0.04", "1.88%", "0.71%", "+94", "+12", "$1,120", "filled_simulated", "true-arb"],
+  ["Israel–Lebanon ceasefire by Q4", "isr-lbn-q4", "negrisk-yes", "geopolitics", "0", "1.44%", "0.55%", "+88", "+88", "$620", "open", "true-arb"],
+  ["US CPI print — August band", "cpi-aug-band", "negrisk-yes", "economics", "0.05", "1.62%", "0.94%", "+68", "−4", "$740", "vanished", "true-arb"],
+  ["Premier League — title winner", "epl-title-26", "negrisk-no", "sports", "0.05", "1.31%", "0.88%", "+43", "−18", "$410", "vanished", "rel-value"],
+  ["Next UK general election year", "uk-ge-year", "negrisk-yes", "politics", "0.04", "1.19%", "0.61%", "+58", "+6", "$980", "filled_simulated", "true-arb"],
+  ["Best Picture 2027", "oscars-bp-27", "negrisk-yes", "culture", "0.05", "1.08%", "0.72%", "+36", "−21", "$280", "vanished", "rel-value"],
+  ["Bitcoin above $180k by Dec 31", "btc-180k-dec", "binary", "crypto", "0.07", "0.96%", "0.51%", "+45", "−38", "$310", "vanished", "rel-value"],
+  ["Government shutdown before Oct", "gov-shutdown-oct", "binary", "politics", "0.04", "0.88%", "0.44%", "+44", "+2", "$520", "open", "true-arb"]
+];
+const CATROWS = [
+  ["politics", "0.04", 31, "+96"], ["geopolitics", "0", 14, "+88"], ["finance", "0.04", 12, "+81"],
+  ["economics", "0.05", 9, "+64"], ["sports", "0.05", 6, "+41"], ["culture", "0.05", 2, "+33"], ["crypto", "0.07", 0, "—"]
+];
+const HEALTH = [
+  ["ok", "Stream shards", "4/4 connected"],
+  ["ok", "Books maintained", "1,240 · 0 stale"],
+  ["ok", "REST role", "seed + slow sweep"],
+  ["ok", "Universe refresh", "312 events · 4m ago"],
+  ["warn", "Fee model fallback", "7 markets → table"],
+  ["ok", "Store", "sqlite · 18,402 rows"],
+  ["ok", "Telegram", "closed · 2 cooldown"]
+];
+const VERDICTS = [
+  ["nyc-mayor-2026", "filled_simulated", "4.1s"], ["fed-sep-2026", "filled_simulated", "6.8s"],
+  ["cpi-aug-band", "vanished", "1.2s"], ["uk-ge-year", "filled_simulated", "3.4s"],
+  ["epl-title-26", "vanished", "0.9s"], ["btc-180k-dec", "vanished", "1.6s"],
+  ["isr-lbn-q4", "filled_simulated", "9.2s"], ["oscars-bp-27", "vanished", "2.0s"],
+  ["gov-shutdown-oct", "filled_simulated", "5.5s"], ["mlb-al-east", "vanished", "1.1s"]
+];
+const LOGS = [
+  ["detect", "negrisk-yes", " nyc-mayor-2026 net_maker +118bps @ $1,840"],
+  ["repoll", "filled_simulated", " fed-sep-2026 walked fills held 6.8s"],
+  ["stream", "shard 2", " resync 41 books after disconnect"],
+  ["fees", "api-stated", " politics 0.04 from feeSchedule"],
+  ["repoll", "vanished", " cpi-aug-band asks gone on first re-poll"],
+  ["fees", "fallback", " feeSchedule exponent 2 → category table"],
+  ["alert", "cooldown", " (epl-title-26, negrisk-no) held 300s"],
+  ["detect", "binary", " gov-shutdown-oct net_taker +2bps · logged not alerted"],
+  ["rest", "sweep", " 312 events reconciled in 1.9s"],
+  ["stream", "dirty", " 18 events re-evaluated in 41ms"],
+  ["detect", "negrisk-no", " epl-title-26 labelled rel-value, below floor"],
+  ["store", "commit", " 74 opportunities · money as TEXT decimal"]
+];
+const KIND_TONE = { "negrisk-yes": "#b5abfc", "negrisk-no": "#9690c9", binary: "#9397ab" };
+const VERDICT_TONE = { filled_simulated: ["#63c99a", "rgba(99,201,154,.14)"], vanished: ["#e0706b", "rgba(224,112,107,.14)"], open: ["#b5abfc", "rgba(145,132,217,.16)"] };
+const LOG_TONE = { detect: "#e9e9ed", repoll: "#b5abfc", stream: "#9397ab", fees: "#9397ab", alert: "#9690c9", rest: "#75798c", store: "#75798c" };
+
+class Component extends DCLogic {
+  state = { tick: 0 };
+  componentDidMount() { this._t = setInterval(() => this.setState(s => ({ tick: s.tick + 1 })), 2500); }
+  componentWillUnmount() { clearInterval(this._t); }
+  scanVals() {
+    if (this._sv) return this._sv;
+    const bps = (v, tone) => R.createElement("span", { style: { color: tone, fontWeight: 500 } }, v);
+    this._sv = {
+      vanishedPct: "37.3%",
+      funnel: FUNNEL.map(f => ({
+        name: f[0], shortName: f[1], n: f[2].toLocaleString("en-US"), pct: f[3] + "%", note: f[4],
+        bar: R.createElement("div", { style: { height: "100%", borderRadius: 3, width: Math.max(1.2, f[3]) + "%", background: f[1] === "held" ? "#63c99a" : "#9184d9", opacity: f[1] === "detected" ? 0.42 : 1 } })
+      })),
+      opps: OPPS.map(o => {
+        const [vc, vbg] = VERDICT_TONE[o[10]];
+        const tk = parseInt(o[8], 10);
+        return {
+          event: o[0], slug: o[1], kind: o[2], cat: o[3], fee: o[4] === "0" ? "fee-free" : o[4],
+          gross: o[5], spread: o[6], size: o[9],
+          kindEl: R.createElement("span", { style: { color: KIND_TONE[o[2]], font: "500 11px/1 Inter" } }, o[2]),
+          makerEl: bps(o[7], "#63c99a"),
+          takerEl: bps(o[8], tk > 0 ? "#cfd3e5" : "#e0706b"),
+          verdictEl: R.createElement("span", { style: { color: vc, background: vbg, padding: "3px 7px", borderRadius: 4, font: "500 10px/1 Inter", letterSpacing: ".03em" } }, o[10] === "filled_simulated" ? "filled·sim" : o[10])
+        };
+      }),
+      catRows: CATROWS.map(c => ({ name: c[0], rate: c[1], n: c[2], bps: c[3] === "—" ? "—" : c[3] + "bps" })),
+      health: HEALTH.map(h => ({
+        name: h[1], val: h[2],
+        dot: R.createElement("div", { style: { width: 6, height: 6, borderRadius: 99, background: h[0] === "ok" ? "#63c99a" : "#b5abfc" } })
+      })),
+      verdicts: VERDICTS.map(v => {
+        const [vc, vbg] = VERDICT_TONE[v[1]];
+        return { slug: v[0], held: v[2], el: R.createElement("span", { style: { color: vc, background: vbg, padding: "2px 6px", borderRadius: 3, font: "500 10px/1 Inter" } }, v[1] === "filled_simulated" ? "filled·sim" : v[1]) };
+      }),
+      logs: LOGS.map((l, i) => ({
+        t: new Date(Date.UTC(2026, 6, 30, 14, 32 - i, (i * 11 + 7) % 60)).toISOString().slice(11, 19),
+        el: R.createElement("span", null,
+          R.createElement("span", { style: { color: LOG_TONE[l[0]], fontWeight: 500 } }, l[0]),
+          " ",
+          R.createElement("span", { style: { color: "#cfd3e5" } }, l[1]),
+          R.createElement("span", { style: { color: "#75798c" } }, l[2]))
+      }))
+    };
+    return this._sv;
+  }
+  renderVals() {
+    const t = this.state.tick;
+    return {
+      ...this.scanVals(),
+      clock: new Date(Date.UTC(2026, 6, 30, 14, 32, 18 + t * 3)).toISOString().slice(11, 19),
+      latEl: 372 + ((t * 17) % 41),
+      survivors: 74 + (t % 3),
+      scanNote: "312 events · " + (9 + (t % 4)) + " live above the 1.5% net floor · dirty-event driven"
+    };
+  }
+}
+</script>
+</body>
+</html>
