@@ -80,3 +80,86 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # ---------------------------------------------------------------------------------
+  # The read-only soak monitor (M7).
+  # ---------------------------------------------------------------------------------
+  #
+  # Same image, different command. A SEPARATE PROCESS from the daemon on purpose: it opens
+  # the same SQLite file with SQLITE_OPEN_READ_ONLY (WAL allows a concurrent reader),
+  # serves GET routes only, and shares no state with the scanner. It cannot disturb a
+  # running soak, and there is nothing on the page to press — the binary has no order
+  # path, no wallet and no signing code.
+  #
+  # It needs the daemon's `runtime_status` row (schema v3), so let `polyarb` come up first.
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: polyarb:local
+    container_name: polyarb-dashboard
+    restart: unless-stopped
+
+    # Nothing here reads a credential — the dashboard has no alert path and no API client.
+    # env_file is omitted deliberately: the fewer processes that see the token, the better.
+
+    # LOOPBACK ONLY. The published side is 127.0.0.1, so the page is reachable from the
+    # VPS itself and from an SSH tunnel, and from nowhere else. It has no authentication
+    # and shows a whole soak's evidence — do not change the left-hand side to 0.0.0.0
+    # without putting an authenticating reverse proxy in front of it.
+    #
+    #   ssh -L 8080:127.0.0.1:8080 you@your-vps   # then open http://127.0.0.1:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      # `:ro` is the belt to the code's braces: the container itself cannot write the
+      # database directory even if the process tried. logs/ and reports/ are not mounted
+      # at all, because the dashboard reads neither — it reads SQLite and only SQLite.
+      #
+      # NOTE: SQLite in WAL mode needs to write the -wal and -shm sidecars to open a
+      # database for reading, so a read-only mount only works while the daemon (which owns
+      # those files) is running and has already created them. That is the normal case
+      # here; if the dashboard ever fails to start with "unable to open database file"
+      # while `polyarb` is stopped, drop the `:ro` — it is defence in depth, not the
+      # mechanism. The mechanism is SQLITE_OPEN_READ_ONLY in the process itself.
+      - ./data:/app/data:ro
+      # Uncomment together with the daemon's copy above to tune [dashboard] without a
+      # rebuild.
+      # - ./config/default.toml:/app/config/default.toml:ro
+
+    command: ["dashboard"]
+
+    # `bind` must be reachable from outside the container, so it is overridden here rather
+    # than in the file the daemon shares. 0.0.0.0 INSIDE the container is still loopback
+    # OUTSIDE it: the port mapping above is what decides who can reach it.
+    environment:
+      POLYARB_DASHBOARD_BIND: "0.0.0.0:8080"
+
+    # The daemon creates and migrates the database; the dashboard only reads it and exits
+    # with a clear message if it is absent. `depends_on` orders the start, and
+    # `restart: unless-stopped` covers the case where the daemon is still paginating its
+    # first universe when the dashboard first looks.
+    depends_on:
+      - polyarb
+
+    # Liveness, again — not correctness. It proves the HTTP server is answering; it says
+    # nothing about whether the daemon behind the database is still scanning (the page
+    # itself says that, loudly, by taking itself over). `bash` rather than CMD-SHELL
+    # because /dev/tcp is a bash feature and the image ships no curl.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf "GET /api/state HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q " 200 "'
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

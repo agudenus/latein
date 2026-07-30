@@ -17,6 +17,7 @@
 #   POLYARB_ALERT_MIN_NET       alerts.alert_min_net_per_share
 #   POLYARB_STREAM_ENABLED      stream.enabled  (true/false)
 #   POLYARB_STREAM_URL          stream.url
+#   POLYARB_DASHBOARD_BIND      dashboard.bind
 #
 # Alert credentials are read from the environment only and never appear here:
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -277,6 +278,37 @@ crypto = 0.008
 database_path = "data/polyarb.sqlite"
 log_dir = "logs"
 report_dir = "reports"
+
+# ---------------------------------------------------------------------------------
+# M7 — `polyarb dashboard`, the read-only soak monitor
+# ---------------------------------------------------------------------------------
+#
+# A SEPARATE PROCESS from `polyarb run`, by design. It opens the database above with
+# SQLITE_OPEN_READ_ONLY (WAL allows a concurrent reader), serves GET routes only, and
+# shares no memory, channel or lock with the daemon. It cannot disturb a running scan,
+# and there is nothing on the page to press: the binary has no execution path, no wallet
+# and no signing code, so a pause button would be a button that pauses nothing.
+#
+# It needs the daemon's `runtime_status` row (schema v3) to tell "the market is quiet"
+# from "the scanner is blind". Start `polyarb run` against a database at least once
+# before pointing the dashboard at it — the dashboard never creates or migrates one.
+[dashboard]
+# LOOPBACK BY DEFAULT, and think hard before changing it. The page has no authentication
+# and shows a soak's whole evidence trail. Reach it over an SSH tunnel
+# (`ssh -L 8080:127.0.0.1:8080 vps`) or put a reverse proxy with auth in front.
+bind = "127.0.0.1:8080"
+# How often the page re-fetches /api/state. The design asks for 2-5s; below 250ms the
+# config is rejected, because that is a busy loop against a page whose slowest input
+# (the universe refresh) moves every ten minutes.
+poll_interval_ms = 3000
+# The evidence window the funnel, the KPI row and the category table cover.
+window_hours = 24
+# Rows rendered in the opportunity feed (newest first). Not a page size: there is no
+# paging, and no sorting or filtering is offered.
+max_rows = 40
+# Planned soak length, for the "soak day n of m" line. Day 1 is counted from the first
+# scan cycle this database ever recorded, so a daemon restart does not reset it.
+soak_days = 7
 
 # Taker fee rates: fee = shares * rate * p * (1 - p). Makers pay zero.
 # Verified against https://docs.polymarket.com/trading/fees (2026-07). Re-check

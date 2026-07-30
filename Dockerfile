@@ -107,6 +107,11 @@ VOLUME ["/app/data", "/app/logs", "/app/reports"]
 
 ENV RUST_LOG=polyarb=info
 
+# Documentation only (compose publishes the port explicitly, on the host's loopback): the
+# M7 dashboard listens here when the image is run with `dashboard` instead of `run`. The
+# daemon itself listens on nothing at all.
+EXPOSE 8080
+
 # Exec form: the daemon becomes PID 1 and receives SIGTERM directly, which it handles by
 # draining the in-flight lifecycle re-polls before exiting.
 ENTRYPOINT ["polyarb"]

@@ -493,8 +493,7 @@ mod tests {
         let cli = Cli::try_parse_from(["polyarb", "report", "--date", "2026-07-26", "--no-send"])
             .expect("report");
         match cli.command {
-            Command::Dashboard => dashboard::serve(cfg).await,
-        Command::Report { date, no_send } => {
+            Command::Report { date, no_send } => {
                 assert_eq!(date.as_deref(), Some("2026-07-26"));
                 assert!(no_send);
             }

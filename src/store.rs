@@ -1510,6 +1510,8 @@ pub(crate) mod tests {
                         new_opportunities: 1,
                         duration_ms: 100 + i * 10,
                         failed: i == 2,
+                        gaps_detected: 30,
+                        fee_survivors: 4,
                     },
                     t0 + chrono::Duration::minutes(i),
                 )
@@ -1533,6 +1535,146 @@ pub(crate) mod tests {
         assert_eq!(totals.duration_ms_total, 100 + 110 + 120 + 90);
         assert_eq!(totals.duration_ms_max, 120);
         assert_eq!(totals.markets_scanned_max, 130);
+    }
+
+    #[test]
+    fn runtime_status_round_trips_and_stays_a_single_row() {
+        let store = Store::in_memory().expect("db");
+        assert_eq!(
+            store.read_runtime_status().expect("read"),
+            None,
+            "a daemon that has never published must read as 'we do not know', not as a \
+             default-constructed healthy daemon"
+        );
+
+        let t0 = DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let status = RuntimeStatus {
+            mode: "dry-run".into(),
+            started_at: now_str(t0 - chrono::Duration::hours(30)),
+            universe_events: 312,
+            stream_enabled: true,
+            stream_shards: 4,
+            stream_shards_connected: 4,
+            books_total: 1_240,
+            books_stale: 0,
+            rest_ok: true,
+            fee_fallback_markets: 7,
+            alerts_cooldown_held: 2,
+            net_floor_default_taker: "0.005".into(),
+            ..RuntimeStatus::default()
+        };
+        store.write_runtime_status(&status, t0).expect("write");
+
+        let read = store.read_runtime_status().expect("read").expect("row");
+        assert_eq!(read.updated_at, t0);
+        assert_eq!(read.status, status);
+
+        // An upsert, not an append: the dashboard asks for *the* current state.
+        let mut later = status.clone();
+        later.stream_shards_connected = 3;
+        let t1 = t0 + chrono::Duration::seconds(5);
+        store
+            .write_runtime_status(&later, t1)
+            .expect("second write");
+        let read = store.read_runtime_status().expect("read").expect("row");
+        assert_eq!(read.updated_at, t1);
+        assert_eq!(read.status.stream_shards_connected, 3);
+        let rows: i64 = store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM runtime_status", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn the_dashboard_window_reads_rows_newest_first_and_sums_the_funnel_counters() {
+        let store = Store::in_memory().expect("db");
+        let t0 = DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let books = sample_books();
+
+        let mut older = sample_opportunity();
+        older.event_slug = "older".into();
+        store
+            .record_opportunity(&older, &books, t0 - chrono::Duration::hours(2), None)
+            .expect("insert");
+        let mut newer = sample_opportunity();
+        newer.event_slug = "newer".into();
+        newer.legs[0].best_ask = d!(0.41);
+        store
+            .record_opportunity(&newer, &books, t0 - chrono::Duration::minutes(5), Some(12))
+            .expect("insert");
+        // Outside the window entirely.
+        let mut ancient = sample_opportunity();
+        ancient.event_slug = "ancient".into();
+        ancient.legs[0].best_ask = d!(0.42);
+        store
+            .record_opportunity(&ancient, &books, t0 - chrono::Duration::days(3), None)
+            .expect("insert");
+
+        let rows = store
+            .opportunities_since(t0 - chrono::Duration::hours(24), 100)
+            .expect("read");
+        let slugs: Vec<&str> = rows.iter().map(|r| r.event_slug.as_str()).collect();
+        assert_eq!(slugs, vec!["newer", "older"]);
+        // The exact decimal strings survive the round trip; no f64 anywhere in the path.
+        assert_eq!(rows[0].net_taker, d!(0.0305));
+        assert_eq!(rows[0].net_maker, Some(d!(0.07)));
+        assert_eq!(rows[0].gross_gap, d!(0.05));
+        assert_eq!(rows[0].spread_cost, Some(d!(0.02)));
+        assert_eq!(rows[0].label, "true-arb");
+
+        for (i, gaps) in [(0i64, 40i64), (1, 60)] {
+            store
+                .record_cycle(
+                    &CycleStats {
+                        opportunities: 3,
+                        gaps_detected: gaps,
+                        fee_survivors: 5,
+                        ..CycleStats::default()
+                    },
+                    t0 - chrono::Duration::hours(i),
+                )
+                .expect("cycle");
+        }
+        let totals = store
+            .scan_totals_since(t0 - chrono::Duration::hours(24))
+            .expect("totals");
+        assert_eq!(totals.gaps_detected, 100);
+        assert_eq!(totals.fee_survivors, 10);
+        assert_eq!(totals.opportunities, 6);
+        assert_eq!(totals.cycles, 2);
+    }
+
+    #[test]
+    fn a_read_only_store_cannot_write_and_never_migrates() {
+        let dir = std::env::temp_dir().join(format!("polyarb-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("polyarb.sqlite");
+        {
+            let store = Store::open(&path).expect("create");
+            store
+                .record_opportunity(&sample_opportunity(), &sample_books(), Utc::now(), None)
+                .expect("insert");
+        }
+
+        let reader = Store::open_read_only(&path).expect("open read-only");
+        assert_eq!(
+            reader.schema_version().expect("version"),
+            DASHBOARD_MIN_SCHEMA
+        );
+        assert_eq!(reader.opportunity_row_count().expect("count"), 1);
+        // Read-only by construction: even a caller who asked for a write cannot get one.
+        let write = reader.write_runtime_status(&RuntimeStatus::default(), Utc::now());
+        assert!(
+            write.is_err(),
+            "a read-only connection must refuse to write"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

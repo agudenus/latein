@@ -324,6 +324,30 @@ message arrives on your phone, alerting is correctly plumbed.
 docker compose logs -f
 ```
 
+**The dashboard.** `docker compose up -d` starts a second container, `polyarb-dashboard`,
+running the same image with `command: ["dashboard"]`. It opens the same database
+**read-only** and serves the soak monitor — the survivor count, the "where the gaps die"
+funnel, the opportunity feed and the pipeline health rail — on the VPS's own loopback,
+port 8080. It has no controls, and there is nothing to control: the scanner has no order
+path.
+
+It is **not** exposed to the internet, and should not be: the page has no authentication
+and shows the whole evidence trail. Reach it by tunnelling from your own machine:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 you@your-vps    # leave this running
+```
+
+Then open <http://127.0.0.1:8080> in your browser. If the page takes itself over with a
+red header, read what it says — it means the scanner is blind (discovery returning zero
+events, both transports down, or the daemon no longer publishing its status), and every
+clean number underneath would have been meaningless.
+
+```bash
+docker compose logs -f dashboard      # just the dashboard's own log
+docker compose restart dashboard      # safe: it cannot affect a running soak
+```
+
 **Reports.** One file per UTC day appears in `reports/`, written automatically at **23:55
 UTC** (`daemon.daily_summary_utc` in `config/default.toml`):
 

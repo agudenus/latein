@@ -56,6 +56,10 @@ pub struct DashboardState {
     pub funnel: Funnel,
     pub opportunities: Vec<OpportunityView>,
     pub opportunity_note: String,
+    /// The configured default taker floor as a percentage — the number the empty state
+    /// has to quote. "None above the floor" is a measurement; "no edge" is a conclusion
+    /// the dashboard has no right to draw.
+    pub net_floor_pct: String,
     pub pipeline: Vec<PipelineRow>,
     pub categories: Vec<CategoryRow>,
     /// True when a category tile reads zero for crypto. The caveat below it is mandatory:
@@ -116,6 +120,9 @@ pub struct FunnelStage {
     /// `None` when this pipeline does not measure the stage. Rendered as "not
     /// instrumented", never as a zero or an estimate.
     pub count: Option<i64>,
+    /// The same count with thousands separators — what the cell shows. Kept apart from
+    /// `count` so a JSON consumer still gets the number.
+    pub count_display: Option<String>,
     pub pct: Option<String>,
     /// Bar width as a percentage string, already floored so a tiny survivor stays visible.
     pub bar_pct: Option<String>,
@@ -239,7 +246,10 @@ pub struct BreakCard {
 /// * a **REST fallback** — degraded latency, fully working detection;
 /// * a **fee-model fallback** — a `warn` dot in the rail, not an outage;
 /// * an **alert cooldown** — the message was held, the measurement was not.
-pub fn derive_break(status: Option<&RuntimeStatusRecord>, now: DateTime<Utc>) -> Option<BreakReason> {
+pub fn derive_break(
+    status: Option<&RuntimeStatusRecord>,
+    now: DateTime<Utc>,
+) -> Option<BreakReason> {
     let Some(record) = status else {
         return Some(BreakReason::NoStatus);
     };
@@ -308,7 +318,11 @@ fn transport(status: Option<&RuntimeStatus>, blind: bool) -> Transport {
 // ---------------------------------------------------------------------------------
 
 /// Read the store and build the whole snapshot. The only function the routes call.
-pub fn build(cfg: &Config, store: &Store, now: DateTime<Utc>) -> Result<DashboardState, StoreError> {
+pub fn build(
+    cfg: &Config,
+    store: &Store,
+    now: DateTime<Utc>,
+) -> Result<DashboardState, StoreError> {
     let record = store.read_runtime_status()?;
     let status = record.as_ref().map(|r| &r.status);
     let reason = derive_break(record.as_ref(), now);
@@ -320,7 +334,10 @@ pub fn build(cfg: &Config, store: &Store, now: DateTime<Utc>) -> Result<Dashboar
     let stored_rows = store.opportunity_row_count()?;
     let first_hour = store.first_scan_hour()?;
 
-    let survivors = rows.iter().filter(|r| r.status == "filled_simulated").count() as i64;
+    let survivors = rows
+        .iter()
+        .filter(|r| r.status == "filled_simulated")
+        .count() as i64;
     let vanished = rows.iter().filter(|r| r.status == "vanished").count() as i64;
 
     let hero = Hero {
@@ -342,11 +359,8 @@ pub fn build(cfg: &Config, store: &Store, now: DateTime<Utc>) -> Result<Dashboar
     };
 
     let funnel = funnel(cfg, &scan, &rows, survivors, vanished);
-    let opportunities: Vec<OpportunityView> = rows
-        .iter()
-        .take(cfg.dashboard.max_rows)
-        .map(view)
-        .collect();
+    let opportunities: Vec<OpportunityView> =
+        rows.iter().take(cfg.dashboard.max_rows).map(view).collect();
     let categories = categories(cfg, &rows);
     let crypto_zero = categories
         .iter()
@@ -391,6 +405,7 @@ pub fn build(cfg: &Config, store: &Store, now: DateTime<Utc>) -> Result<Dashboar
         funnel,
         opportunities,
         opportunity_note,
+        net_floor_pct: floor_pct(status),
         pipeline: pipeline(status, stored_rows),
         categories,
         crypto_zero,
@@ -429,6 +444,7 @@ fn funnel(
             key: "detected",
             label: "Gaps detected".into(),
             count: Some(detected),
+            count_display: Some(thousands(detected)),
             pct: Some("100%".into()),
             bar_pct: Some("100".into()),
             instrumented: true,
@@ -441,6 +457,7 @@ fn funnel(
             key: "spread",
             label: "Survive bid–ask spread".into(),
             count: None,
+            count_display: None,
             pct: None,
             bar_pct: None,
             instrumented: false,
@@ -454,6 +471,7 @@ fn funnel(
             key: "fee",
             label: "Survive taker fee curve".into(),
             count: Some(scan.fee_survivors),
+            count_display: Some(thousands(scan.fee_survivors)),
             pct: Some(pct_of(scan.fee_survivors, detected)),
             bar_pct: bar(scan.fee_survivors, detected),
             instrumented: true,
@@ -466,6 +484,7 @@ fn funnel(
             key: "depth",
             label: "Fillable at walked size".into(),
             count: Some(scan.opportunities),
+            count_display: Some(thousands(scan.opportunities)),
             pct: Some(pct_of(scan.opportunities, detected)),
             bar_pct: bar(scan.opportunities, detected),
             instrumented: true,
@@ -480,6 +499,7 @@ fn funnel(
             key: "held",
             label: "Still there on re-poll".into(),
             count: Some(survivors),
+            count_display: Some(thousands(survivors)),
             pct: Some(pct_of(survivors, distinct)),
             bar_pct: bar(survivors, distinct.max(1)),
             instrumented: true,
@@ -626,7 +646,11 @@ fn pipeline(status: Option<&RuntimeStatus>, stored_rows: i64) -> Vec<PipelineRow
     });
 
     rows.push(PipelineRow {
-        dot: if s.fee_fallback_markets == 0 { "ok" } else { "warn" },
+        dot: if s.fee_fallback_markets == 0 {
+            "ok"
+        } else {
+            "warn"
+        },
         name: "Fee model fallback",
         value: format!("{} markets → table", thousands(s.fee_fallback_markets)),
     });
@@ -638,7 +662,11 @@ fn pipeline(status: Option<&RuntimeStatus>, stored_rows: i64) -> Vec<PipelineRow
     });
 
     rows.push(PipelineRow {
-        dot: if s.telegram_circuit_open { "warn" } else { "ok" },
+        dot: if s.telegram_circuit_open {
+            "warn"
+        } else {
+            "ok"
+        },
         name: "Telegram",
         value: format!(
             "{} · {} cooldown",
@@ -674,8 +702,13 @@ fn categories(cfg: &Config, rows: &[DashboardRow]) -> Vec<CategoryRow> {
     let mut out: Vec<CategoryRow> = buckets
         .into_iter()
         .map(|(name, nets)| {
-            let mut present: Vec<Decimal> = nets.into_iter().flatten().collect();
-            present.sort();
+            // The count is every opportunity in the category; the median is over the ones
+            // that had a maker side at all. A construction with no bid on every leg is not
+            // quotable as a maker, and dropping it from the *count* as well would quietly
+            // shrink the category to "the rows we could compute a median for".
+            let count = nets.len() as i64;
+            let mut quotable: Vec<Decimal> = nets.into_iter().flatten().collect();
+            quotable.sort();
             let rate = fees.rate_for(&crate::types::Category::new(name.clone()));
             CategoryRow {
                 rate_display: if rate.is_zero() {
@@ -683,8 +716,8 @@ fn categories(cfg: &Config, rows: &[DashboardRow]) -> Vec<CategoryRow> {
                 } else {
                     rate.normalize().to_string()
                 },
-                count: present.len() as i64,
-                median_net_maker_bps: percentile_dec(&present, 50).map(signed),
+                count,
+                median_net_maker_bps: percentile_dec(&quotable, 50).map(signed),
                 name,
             }
         })
@@ -824,10 +857,7 @@ fn break_state(
         BreakCard {
             label: "Transports".into(),
             value: match status {
-                Some(s) => format!(
-                    "{}/{} shards",
-                    s.stream_shards_connected, s.stream_shards
-                ),
+                Some(s) => format!("{}/{} shards", s.stream_shards_connected, s.stream_shards),
                 None => "—".into(),
             },
             value_tone: "plain",
@@ -861,10 +891,7 @@ fn break_state(
             },
             suffix: None,
             note: Some(match status {
-                Some(s) => format!(
-                    "alerts sent {} · failed {}",
-                    s.alerts_sent, s.alerts_failed
-                ),
+                Some(s) => format!("alerts sent {} · failed {}", s.alerts_sent, s.alerts_failed),
                 None => "no row in runtime_status".into(),
             }),
         },
@@ -917,7 +944,8 @@ pub fn bps(value: Decimal, payout: Decimal) -> Decimal {
     if payout.is_zero() {
         return Decimal::ZERO;
     }
-    (value / payout * Decimal::from(10_000)).round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
+    (value / payout * Decimal::from(10_000))
+        .round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
 }
 
 fn pct_of_payout(value: Decimal, payout: Decimal) -> String {
@@ -935,11 +963,19 @@ fn signed(value: Decimal) -> String {
     }
 }
 
-/// Dollars, rounded (never truncated) to whole units with thousands separators — the
-/// design's `$1,840`.
+/// Dollars, always to the cent, with thousands separators.
+///
+/// Rounded and never truncated: `Decimal`'s `{:.2}` truncates, which would print $49.998
+/// as $49.99 next to a mean of $50.00 and read as an arithmetic bug (the daily summary
+/// makes the same choice). Cents are kept at every magnitude — the shipped per-trade cap
+/// is $50, so a real walked size is *mostly* cents, and a column that drops them above
+/// $1,000 and keeps them below would jitter between two shapes as values cross.
 fn money(value: Decimal) -> String {
-    let rounded = value.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero);
-    format!("${}", thousands(rounded.to_string().parse::<i64>().unwrap_or(0)))
+    let cents = value.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
+    let whole = cents.trunc().to_string().parse::<i64>().unwrap_or(0);
+    let fraction = (cents.abs().fract() * Decimal::ONE_HUNDRED)
+        .round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero);
+    format!("${}.{:02}", thousands(whole), fraction)
 }
 
 fn thousands(n: i64) -> String {
@@ -947,7 +983,7 @@ fn thousands(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -990,7 +1026,10 @@ fn latencies(rows: &[DashboardRow]) -> Vec<i64> {
     out
 }
 
-fn median_bps(rows: &[DashboardRow], pick: impl Fn(&DashboardRow) -> Option<Decimal>) -> Option<Decimal> {
+fn median_bps(
+    rows: &[DashboardRow],
+    pick: impl Fn(&DashboardRow) -> Option<Decimal>,
+) -> Option<Decimal> {
     let mut values: Vec<Decimal> = rows
         .iter()
         .filter_map(|r| pick(r).map(|v| bps(v, r.payout)))

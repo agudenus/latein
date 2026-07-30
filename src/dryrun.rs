@@ -63,8 +63,7 @@ use crate::detect;
 use crate::gamma::{GammaClient, PaginationState};
 use crate::http::HttpClient;
 use crate::store::{
-    CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, RuntimeStatus, ScanTotals,
-    Store,
+    CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, RuntimeStatus, ScanTotals, Store,
 };
 use crate::types::{BookMap, Opportunity, Side, TokenId, Universe};
 use crate::ws::{self, DirtyBatch, StreamManager, StreamStatsSnapshot, DIVERGENCE_SAMPLE};
@@ -578,15 +577,17 @@ impl Daemon {
     /// losing a dashboard refresh must never disturb the scan loop.
     fn publish_status(&mut self, stream: Option<&StreamManager>, force: bool) {
         let now = Instant::now();
-        let due = self
-            .last_status_publish
-            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(STATUS_PUBLISH_SECS));
+        let due = self.last_status_publish.is_none_or(|last| {
+            now.duration_since(last) >= Duration::from_secs(STATUS_PUBLISH_SECS)
+        });
         if !force && !due {
             return;
         }
         self.last_status_publish = Some(now);
 
-        let stats = stream.map(|m| m.books().stats.snapshot()).unwrap_or_default();
+        let stats = stream
+            .map(|m| m.books().stats.snapshot())
+            .unwrap_or_default();
         let alerts = self.alerter.stats();
         let status = RuntimeStatus {
             mode: self.cfg.mode.clone(),
@@ -597,7 +598,10 @@ impl Daemon {
             universe_refreshed_at: self.status.universe_refreshed_at.map(crate::store::now_str),
             universe_refresh_secs: self.cfg.daemon.universe_refresh_secs,
             scan_interval_secs: self.cfg.daemon.scan_interval_secs,
-            last_good_discovery_at: self.status.last_good_discovery_at.map(crate::store::now_str),
+            last_good_discovery_at: self
+                .status
+                .last_good_discovery_at
+                .map(crate::store::now_str),
             discovery_empty_streak: self.status.discovery_empty_streak,
             discovery_error: self.status.discovery_error.clone(),
             stream_enabled: self.cfg.stream.enabled,
@@ -664,8 +668,10 @@ impl Daemon {
         self.status.markets_with_api_fee = stats.markets_with_api_fee as i64;
         // "Fell back to the category table" is everything the API did not state a usable
         // rate for — including the markets whose stated formula this build cannot price.
-        self.status.fee_fallback_markets =
-            (stats.markets_kept.saturating_sub(stats.markets_with_api_fee)) as i64;
+        self.status.fee_fallback_markets = (stats
+            .markets_kept
+            .saturating_sub(stats.markets_with_api_fee))
+            as i64;
         self.status.fee_unsupported_formula = stats.markets_unsupported_fee_formula as i64;
         let partial_negrisk = universe
             .events

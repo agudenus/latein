@@ -57,12 +57,9 @@
     var out = flatten(state, '', {});
     /* Funnel stages and opportunities are arrays; give them stable dotted keys. */
     (state.funnel.stages || []).forEach(function (s) {
-      out['funnel.' + s.key + '.count'] = s.count === null ? '—' : String(s.count);
+      out['funnel.' + s.key + '.count_display'] = s.count_display === null ? '—' : s.count_display;
       out['funnel.' + s.key + '.pct'] = s.pct === null ? '—' : s.pct;
       if (s.bar_pct !== null) out['funnel.' + s.key + '.bar_pct'] = s.bar_pct;
-    });
-    (state.pipeline || []).forEach(function (row) {
-      out['pipeline.' + row.name.toLowerCase().replace(/ /g, '_')] = row.value;
     });
     (state.opportunities || []).forEach(function (o) {
       out['opp.' + o.id + '.gross_pct'] = o.gross_pct;
@@ -197,6 +194,29 @@
     });
   }
 
+  /* The pipeline's dot tone changes with its value, so the block is rebuilt as a whole
+     when anything in it moves — seven rows, and a stale dot next to a fresh number would
+     be worse than a repaint. */
+  function renderPipeline(list) {
+    var container = document.getElementById('pipeline-rows');
+    if (!container) return;
+    var signature = list
+      .map(function (row) {
+        return row.dot + row.name + row.value;
+      })
+      .join('|');
+    if (container.getAttribute('data-sig') === signature) return;
+    container.setAttribute('data-sig', signature);
+    container.textContent = '';
+    list.forEach(function (row) {
+      var node = el('div', 'prow num');
+      node.appendChild(el('span', 'dot dot-' + row.dot));
+      node.appendChild(el('span', 'pname', row.name));
+      node.appendChild(el('span', 'pval', row.value));
+      container.appendChild(node);
+    });
+  }
+
   function renderCategories(list) {
     var container = document.getElementById('category-rows');
     if (!container) return;
@@ -236,7 +256,12 @@
     }
     if (next !== 'none') return;
     applyKeys(keysFrom(state));
+    /* The transport pill's tone is an attribute, not text: set it before the label so the
+       two never disagree for a frame. */
+    var pill = document.querySelector('.pill-stream');
+    if (pill) pill.setAttribute('data-state', state.header.transport.state);
     syncOpportunities(state.opportunities || []);
+    renderPipeline(state.pipeline || []);
     renderCategories(state.categories || []);
     renderLog(state.log || []);
   }

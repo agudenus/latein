@@ -749,6 +749,13 @@ impl Config {
         if let Some(v) = env_bool("POLYARB_STREAM_ENABLED")? {
             self.stream.enabled = v;
         }
+        // Overridable because the address depends on where the process runs, not on what
+        // the operator wants it to do: inside a container it must bind 0.0.0.0 for the
+        // port mapping to reach it, while the mapping itself keeps it on the host's
+        // loopback. See docker-compose.yml.
+        if let Some(v) = env_str("POLYARB_DASHBOARD_BIND") {
+            self.dashboard.bind = v;
+        }
         Ok(())
     }
 
@@ -1121,6 +1128,65 @@ mod tests {
         );
         // Unknown categories fall through to `default`, on both sides.
         assert_eq!(cfg.net_floor_maker(&Category::new("nonsense")), dec!(0.005));
+    }
+
+    #[test]
+    fn the_dashboard_section_parses_validates_and_stays_read_only_shaped() {
+        let cfg = Config::from_toml_str(SHIPPED).expect("parse");
+        cfg.validate().expect("validate");
+        assert_eq!(cfg.dashboard.bind, "127.0.0.1:8080");
+        assert_eq!(cfg.dashboard.poll_interval_ms, 3_000);
+        assert_eq!(cfg.dashboard.window_hours, 24);
+        assert_eq!(cfg.dashboard.soak_days, 7);
+        assert_eq!(
+            cfg.dashboard.socket_addr().expect("addr").to_string(),
+            "127.0.0.1:8080"
+        );
+        assert!(
+            cfg.dashboard.bind.starts_with("127.0.0.1"),
+            "the shipped bind must stay on loopback: the page has no authentication and \
+             shows a whole soak's evidence"
+        );
+
+        // A config written before M7 keeps loading and gets the shipped defaults.
+        const HEADER: &str = "\n[dashboard]\n";
+        let older: String = {
+            let start = SHIPPED.find(HEADER).expect("section present") + 1;
+            let end = SHIPPED[start..]
+                .find("\n[")
+                .map(|i| start + i + 1)
+                .expect("a section follows");
+            format!("{}{}", &SHIPPED[..start], &SHIPPED[end..])
+        };
+        assert!(!older.contains(HEADER), "the section must really be gone");
+        let cfg = Config::from_toml_str(&older).expect("a config without the section must load");
+        cfg.validate().expect("validate");
+        assert_eq!(cfg.dashboard, DashboardConfig::default());
+
+        // A typo is refused rather than silently ignored.
+        assert!(
+            Config::from_toml_str("[dashboard]\nbindd = \"0.0.0.0:80\"\n").is_err(),
+            "deny_unknown_fields must cover the new section too"
+        );
+
+        // Every knob is validated, and each rejection says what the knob is for.
+        let mut bad = Config::default();
+        bad.dashboard.bind = "not-an-address".into();
+        assert!(bad.validate().is_err());
+
+        let mut fast = Config::default();
+        fast.dashboard.poll_interval_ms = 10;
+        assert!(fast.validate().is_err(), "a 10ms poll is a busy loop");
+
+        for mutate in [
+            |c: &mut Config| c.dashboard.window_hours = 0,
+            |c: &mut Config| c.dashboard.max_rows = 0,
+            |c: &mut Config| c.dashboard.soak_days = 0,
+        ] {
+            let mut cfg = Config::default();
+            mutate(&mut cfg);
+            assert!(cfg.validate().is_err());
+        }
     }
 
     #[test]

@@ -26,6 +26,10 @@ headline number:
 - **Honest fill accounting.** Every detected opportunity is re-polled after detection. If
   the walked fills are gone by the first re-poll it is recorded as `vanished`, and the
   verdict is never revised in its favour.
+- **A read-only monitor.** `polyarb dashboard` serves the soak's evidence — the
+  cost-survival funnel, the opportunity feed with maker and taker kept apart, and the
+  pipeline's own health — as a web page. It is a separate process that opens the same
+  SQLite read-only and has no control on it, because there is nothing to control.
 - **Event-driven detection.** Books are maintained live from the CLOB WebSocket market
   channel and only the events whose books actually moved are re-evaluated, so detection
   happens tens of milliseconds after the market moves rather than on a five-second timer.
@@ -71,13 +75,14 @@ Needs Rust 1.94+. No credentials of any kind.
 
 ```bash
 cargo build --release
-cargo test                  # 128 tests
+cargo test                  # 207 tests
 
 ./target/release/polyarb markets      # discover the tracked universe, fetch one book batch
 ./target/release/polyarb scan         # run the detectors once, with the full cost breakdown
 ./target/release/polyarb scan --json  # the same, as JSON
 ./target/release/polyarb run          # the continuous dry-run daemon
 ./target/release/polyarb report       # today's summary
+./target/release/polyarb dashboard    # the read-only web monitor on 127.0.0.1:8080
 ```
 
 Configuration is `config/default.toml`, overridable per setting by environment variable —
@@ -97,6 +102,59 @@ For a real deployment — provisioning a VPS, installing Docker, getting a Teleg
 verifying it works, and the week-long soak — follow **[docs/deploy.md](docs/deploy.md)**.
 It assumes no prior Docker experience.
 
+## The dashboard
+
+`polyarb dashboard` serves the soak monitor at `dashboard.bind` (default
+`http://127.0.0.1:8080`). Run it **alongside** `polyarb run`, against the same database:
+
+```bash
+./target/release/polyarb run &        # the daemon writes
+./target/release/polyarb dashboard    # the dashboard reads
+```
+
+It answers the question the soak exists to answer — *is there enough real, fillable edge
+to justify building an execution engine?* — on one screen: the survivor count, the
+"where the gaps die" funnel over the last 24 h, the newest opportunities with maker and
+taker in separate columns, and a health rail (stream shards, REST role, fee-model
+fallbacks, the Telegram breaker).
+
+**It is read-only by construction, not by convention.**
+
+- A **separate process** from the daemon. No shared memory, no channel, no lock.
+- It opens the database with `SQLITE_OPEN_READ_ONLY` plus `PRAGMA query_only` (WAL allows
+  a concurrent reader), and it never migrates: the writer owns the schema.
+- Every route is a `GET` — `/`, `/api/state`, `/assets/*` — and a test enumerates them and
+  refuses anything else. The page carries no button, no form and no input.
+- There is nothing to control anyway: the binary has no signing code, no wallet and no
+  order path, and `mode` is locked to `dry-run`. A pause button would pause nothing.
+
+Two things it deliberately refuses to fake:
+
+- **The break state.** When the scanner is *blind rather than idle* — discovery returning
+  zero events, both transports down, every book past its staleness window, or the daemon
+  no longer publishing its status — the whole page is taken over and says so. A quiet
+  socket, a fee-model fallback and an alert cooldown are none of those things and do not
+  trigger it.
+- **The unmeasured funnel stage.** "Survive bid–ask spread" renders as *not instrumented*,
+  because polyarb computes every gap on the executable side from the start and so has no
+  pre-spread population to filter. A plausible number there would be an invented one.
+
+The daemon publishes the state only it can see (shard counts, REST role, discovery health,
+the alert breaker) to a single `runtime_status` row every ~5 s, which is what lets a
+read-only reader tell a quiet market from a blind scanner. That row and the funnel
+counters are schema v3: run `polyarb run` against a database once before pointing the
+dashboard at it.
+
+The page has **no authentication** and shows a whole soak's evidence, so `bind` stays on
+loopback. Reach a remote one over an SSH tunnel:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 you@your-vps    # then open http://127.0.0.1:8080
+```
+
+Under Docker, `docker compose up -d` starts the dashboard alongside the daemon and
+publishes it on the host's loopback only (see `docker-compose.yml`).
+
 ## Safety posture
 
 - **Dry-run only.** No order path exists. Config validation rejects any mode but
@@ -111,12 +169,15 @@ It assumes no prior Docker experience.
   that can be lost.
 - **The container runs unprivileged** (uid 10001), with the per-trade capital cap applied
   inside the sizing path.
+- **The dashboard cannot write.** It is a separate read-only process on a loopback port
+  with `GET` routes only — see [The dashboard](#the-dashboard).
 
 ## Layout
 
 ```
 src/            the binary: config, types, gamma, clob, detect, costs, dryrun, alert,
-                store, risk, http
+                store, risk, http, ws
+src/dashboard/  the read-only web monitor (state, render, embedded css/js assets)
 config/         default.toml — no secrets, ever
 tests/          integration tests over recorded order-book fixtures
 research/       the strategy source of truth (below)

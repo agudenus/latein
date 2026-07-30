@@ -106,7 +106,7 @@ fn header(s: &DashboardState, broken: bool) -> String {
         )
     } else {
         format!(
-            r#"<span class="pill pill-stream" data-state="{state}" data-key="header.transport.state">
+            r#"<span class="pill pill-stream" data-state="{state}">
              <span class="dot"></span>
              <span data-key="header.transport.label">{label}</span>
            </span>"#,
@@ -255,7 +255,7 @@ fn funnel_row(stage: &FunnelStage) -> String {
         r#"<div class="frow" title="{note}">
      <div class="flabel">{label}</div>
      <div class="ftrack"><div class="fbar fbar-{tone}" data-key="funnel.{key}.bar_pct" style="width:{bar}%"></div></div>
-     <div class="fcount num" data-key="funnel.{key}.count">{count}</div>
+     <div class="fcount num" data-key="funnel.{key}.count_display">{count}</div>
      <div class="fpct num" data-key="funnel.{key}.pct">{pct}</div>
    </div>"#,
         note = esc(&stage.note),
@@ -263,10 +263,7 @@ fn funnel_row(stage: &FunnelStage) -> String {
         tone = tone,
         key = key,
         bar = esc(stage.bar_pct.as_deref().unwrap_or("0")),
-        count = stage
-            .count
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "—".into()),
+        count = esc(stage.count_display.as_deref().unwrap_or("—")),
         pct = opt(&stage.pct),
     )
 }
@@ -274,9 +271,13 @@ fn funnel_row(stage: &FunnelStage) -> String {
 fn table(s: &DashboardState) -> String {
     let rows: String = s.opportunities.iter().map(opp_row).collect();
     let body = if rows.is_empty() {
+        // Say what was measured, not what it means. "No edge" is a conclusion this page
+        // has no standing to draw, and an operator who reads one into a blank table has
+        // been misled by the table.
         format!(
-            r#"<div class="empty">none above the {} net floor in this window — that is a measurement, not an absence of edge</div>"#,
-            esc(&s.opportunity_note)
+            r#"<div class="empty">None above the {floor} net floor in the last {hours}h. That is a measurement of this window, not a finding about the market.</div>"#,
+            floor = esc(&s.net_floor_pct),
+            hours = s.funnel.window_hours,
         )
     } else {
         rows
@@ -334,10 +335,9 @@ fn rail(s: &DashboardState) -> String {
         .iter()
         .map(|row| {
             format!(
-                r#"<div class="prow num"><span class="dot dot-{dot}"></span><span class="pname">{name}</span><span class="pval" data-key="pipeline.{key}">{value}</span></div>"#,
+                r#"<div class="prow num"><span class="dot dot-{dot}"></span><span class="pname">{name}</span><span class="pval">{value}</span></div>"#,
                 dot = row.dot,
                 name = esc(row.name),
-                key = esc(&row.name.to_lowercase().replace(' ', "_")),
                 value = esc(&row.value),
             )
         })

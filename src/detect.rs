@@ -307,15 +307,18 @@ impl<'a> Detector<'a> {
         // resting for as a maker.
         let floor = self.cfg.floor_for(&event.category);
 
-        if let Some(sized) = self.size_taker(
+        let taker = self.size_taker(
             &books,
             &best_asks,
             &best_bids,
             payout,
             &fee_rates,
             floor.taker,
-            counters,
-        ) {
+        );
+        if taker.fee_survived {
+            counters.fee_survivors = counters.fee_survivors.saturating_add(1);
+        }
+        if let Some(sized) = taker.sized {
             return Some(self.build(
                 event,
                 kind,
@@ -354,6 +357,10 @@ impl<'a> Detector<'a> {
     /// Both predicates are monotone in size (VWAP is non-decreasing as we walk deeper,
     /// and `d net / d vwap = −1 − rate·(1−2·vwap) < 0` for every rate ≤ 0.07), so the
     /// feasible set is a prefix and the search is exact to `size_search_tolerance`.
+    ///
+    /// Reports [`TakerAttempt::fee_survived`] alongside the sizing rather than taking a
+    /// counter parameter: the caller owns the funnel, and the fee stage is something this
+    /// search *observes* on its way past, not a side effect it should be performing.
     fn size_taker(
         &self,
         books: &[&OrderBook],
@@ -362,8 +369,7 @@ impl<'a> Detector<'a> {
         payout: Decimal,
         fee_rates: &[Decimal],
         floor: Decimal,
-        counters: &mut ScanCounters,
-    ) -> Option<SizedTaker> {
+    ) -> TakerAttempt {
         let min_size = self.cfg.scan.min_size_shares;
         let max_size = books
             .iter()
@@ -371,7 +377,7 @@ impl<'a> Detector<'a> {
             .min()
             .unwrap_or(Decimal::ZERO);
         if max_size < min_size {
-            return None;
+            return TakerAttempt::none();
         }
 
         let eval = |size: Decimal| -> Option<SizedTaker> {
@@ -393,14 +399,20 @@ impl<'a> Detector<'a> {
         // Funnel stage 3, measured at the smallest tradeable size — where the fee curve is
         // at its kindest, so this is the most generous honest reading of "survived fees".
         // It is charged slippage and the taker fee but not yet the configured net floor.
-        if eval(min_size).is_some_and(|s| s.cost.net_taker > Decimal::ZERO) {
-            counters.fee_survivors = counters.fee_survivors.saturating_add(1);
-        }
+        let fee_survived = eval(min_size).is_some_and(|s| s.cost.net_taker > Decimal::ZERO);
 
         // Not viable even at the smallest size we would bother trading.
-        feasible(min_size)?;
+        if feasible(min_size).is_none() {
+            return TakerAttempt {
+                fee_survived,
+                sized: None,
+            };
+        }
         if let Some(sized) = feasible(max_size) {
-            return Some(sized);
+            return TakerAttempt {
+                fee_survived,
+                sized: Some(sized),
+            };
         }
 
         let tol = self.cfg.scan.size_search_tolerance;
@@ -420,7 +432,10 @@ impl<'a> Detector<'a> {
                 hi = mid;
             }
         }
-        feasible(lo)
+        TakerAttempt {
+            fee_survived,
+            sized: feasible(lo),
+        }
     }
 
     /// Fallback for gaps that die to fees/slippage as a taker but survive as a maker.
@@ -637,6 +652,23 @@ struct SizedTaker {
     cost: CostBreakdown,
 }
 
+/// What one taker-sizing attempt learned: whether the construction cleared the fee curve
+/// at all (funnel stage 3), and the sizing if it also cleared the floor and the cap.
+struct TakerAttempt {
+    fee_survived: bool,
+    sized: Option<SizedTaker>,
+}
+
+impl TakerAttempt {
+    /// Not even enough depth to try — nothing observed, nothing sized.
+    fn none() -> Self {
+        Self {
+            fee_survived: false,
+            sized: None,
+        }
+    }
+}
+
 fn leg_prices(
     best_asks: &[Decimal],
     best_bids: &[Option<Decimal>],
@@ -753,6 +785,93 @@ mod tests {
             .map(|b| (b.asset_id.clone(), b))
             .collect::<HashMap<_, _>>();
         scan(cfg, &universe, &map)
+    }
+
+    /// The two M7 funnel counters, which is the only place the dashboard can learn what
+    /// happened *before* an opportunity row existed.
+    #[test]
+    fn the_funnel_counters_count_gaps_and_fee_survivors_not_reported_rows() {
+        let config = cfg();
+        let fees = FeeModel::new(config.fees.clone());
+        let detector = Detector::new(&config, &fees);
+
+        // A real, comfortable geopolitics gap: it shows on the executable side, survives
+        // the (zero) fee curve, and is reported.
+        let good: BookMap = vec![
+            book(
+                "0-yes",
+                &[(dec!(0.46), dec!(400))],
+                &[(dec!(0.48), dec!(500))],
+            ),
+            book(
+                "0-no",
+                &[(dec!(0.47), dec!(400))],
+                &[(dec!(0.49), dec!(500))],
+            ),
+        ]
+        .into_iter()
+        .map(|b| (b.asset_id.clone(), b))
+        .collect();
+        let universe = Universe {
+            events: vec![event(false, "geopolitics", vec![market(0, "Q?")])],
+        };
+        let (ops, counters) = detector.scan_counted(&universe, &good);
+        assert_eq!(counters.gaps_detected, 1);
+        assert_eq!(counters.fee_survivors, 1);
+        assert_eq!(ops.len(), 1);
+
+        // No gap at all on the executable side: nothing is counted anywhere. This is the
+        // stage-1 gate, and it is what makes the funnel's denominator honest.
+        let none: BookMap = vec![
+            book(
+                "0-yes",
+                &[(dec!(0.50), dec!(400))],
+                &[(dec!(0.52), dec!(500))],
+            ),
+            book(
+                "0-no",
+                &[(dec!(0.49), dec!(400))],
+                &[(dec!(0.51), dec!(500))],
+            ),
+        ]
+        .into_iter()
+        .map(|b| (b.asset_id.clone(), b))
+        .collect();
+        let (ops, counters) = detector.scan_counted(&universe, &none);
+        assert_eq!(counters.gaps_detected, 0);
+        assert_eq!(counters.fee_survivors, 0);
+        assert!(ops.is_empty());
+
+        // A one-tick gap in the 0.07 crypto tier: it exists on the ask side (stage 1) and
+        // is then eaten by the fee curve (~0.035/share at mid prices), so it never
+        // reaches stage 3. That gap-minus-fee story is exactly what the funnel shows.
+        let crypto_universe = Universe {
+            events: vec![event(false, "crypto", vec![market(0, "Q?")])],
+        };
+        let thin: BookMap = vec![
+            book(
+                "0-yes",
+                &[(dec!(0.4900), dec!(400))],
+                &[(dec!(0.4990), dec!(500))],
+            ),
+            book(
+                "0-no",
+                &[(dec!(0.4900), dec!(400))],
+                &[(dec!(0.4995), dec!(500))],
+            ),
+        ]
+        .into_iter()
+        .map(|b| (b.asset_id.clone(), b))
+        .collect();
+        let (_, counters) = detector.scan_counted(&crypto_universe, &thin);
+        assert_eq!(
+            counters.gaps_detected, 1,
+            "the gap is there on the ask side"
+        );
+        assert_eq!(
+            counters.fee_survivors, 0,
+            "and the 0.07 taker fee curve is what kills it"
+        );
     }
 
     // --- binary YES/NO -------------------------------------------------------------
