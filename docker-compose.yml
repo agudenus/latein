@@ -108,14 +108,17 @@ services:
     # Nothing here reads a credential — the dashboard has no alert path and no API client.
     # env_file is omitted deliberately: the fewer processes that see the token, the better.
 
-    # LOOPBACK ONLY. The published side is 127.0.0.1, so the page is reachable from the
-    # VPS itself and from an SSH tunnel, and from nowhere else. It has no authentication
-    # and shows a whole soak's evidence — do not change the left-hand side to 0.0.0.0
-    # without putting an authenticating reverse proxy in front of it.
+    # HOME-LAN EXPOSED (owner decision, 2026-08-08): published on all interfaces so the
+    # dashboard is reachable from any device on the home network at http://<host-ip>:8080
+    # — no SSH tunnel needed. It stays read-only with no controls and no credentials, so
+    # the exposure is view-only; anyone on the same network can SEE the soak's evidence.
     #
+    # Only do this on a trusted private network (home LAN behind NAT). On a VPS or any
+    # host with a public interface, revert to loopback-only and use an SSH tunnel:
+    #     - "127.0.0.1:8080:8080"
     #   ssh -L 8080:127.0.0.1:8080 you@your-vps   # then open http://127.0.0.1:8080
     ports:
-      - "127.0.0.1:8080:8080"
+      - "8080:8080"
 
     volumes:
       # `:ro` is the belt to the code's braces: the container itself cannot write the
