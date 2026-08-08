@@ -23,9 +23,14 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::store::{DashboardRow, RuntimeStatus, RuntimeStatusRecord, Store, StoreError};
 
-/// A runtime status older than this means the daemon is not talking to us. Six times the
-/// daemon's publish cadence: long enough to survive a slow sweep, short enough that a
-/// stopped daemon does not keep a stale page looking healthy.
+/// A runtime status older than this means the daemon **process** is not talking to us. Six
+/// times the heartbeat's publish cadence.
+///
+/// Since M7.1 the row is published by a task of its own, decoupled from the scan loop, so
+/// this threshold answers exactly one question — is the process there? — and a slow loop can
+/// no longer be mistaken for a dead one. "The process is up but its loop is stuck" is a
+/// separate verdict with a separate threshold: see [`BreakReason::LoopStalled`] and
+/// `dashboard.loop_stall_secs`.
 pub const RUNTIME_STATUS_STALE_SECS: i64 = 30;
 
 /// Consecutive empty discovery passes before the break state takes the page over. Matches
@@ -190,8 +195,14 @@ pub struct LogLine {
 pub enum BreakReason {
     /// The daemon has never published a runtime status row.
     NoStatus,
-    /// It published one, but not recently enough to describe the present.
+    /// It published one, but not recently enough to describe the present. Since M7.1 the
+    /// heartbeat is independent of the scan loop, so this means the *process* is gone —
+    /// not that it is busy.
     StatusStale,
+    /// The heartbeat is current — the process is alive — but the scan loop has finished no
+    /// unit of work in a long time. A slow loop is not this: progress is recorded per book
+    /// batch, so a 195 s REST sweep reports throughout.
+    LoopStalled,
     /// `ApiError::EmptyDiscovery` — passes parse cleanly and yield zero events.
     EmptyDiscovery,
     /// The socket is down *and* REST is failing: a network outage, not a fallback.
@@ -206,10 +217,20 @@ impl BreakReason {
         match self {
             Self::NoStatus => "runtime_status::Missing",
             Self::StatusStale => "runtime_status::Stale",
+            Self::LoopStalled => "dryrun::LoopStalled",
             Self::EmptyDiscovery => "ApiError::EmptyDiscovery",
             Self::TransportsDown => "transport::BothDown",
             Self::AllBooksStale => "ws::AllBooksStale",
         }
+    }
+
+    /// Whether this break makes the transport pill meaningless.
+    ///
+    /// For a stalled loop it does not: the heartbeat publishes shard counts straight from
+    /// the live pool, so those numbers are current even while the loop is wedged — and
+    /// "sockets fine, loop stuck" is precisely the diagnosis worth showing.
+    fn blinds_transport(self) -> bool {
+        !matches!(self, Self::LoopStalled)
     }
 }
 
@@ -245,10 +266,16 @@ pub struct BreakCard {
 /// * a **quiet socket** — silence is the normal state of most books, never a fault (M6.1);
 /// * a **REST fallback** — degraded latency, fully working detection;
 /// * a **fee-model fallback** — a `warn` dot in the rail, not an outage;
-/// * an **alert cooldown** — the message was held, the measurement was not.
+/// * an **alert cooldown** — the message was held, the measurement was not;
+/// * a **slow loop** (M7.1) — a full REST sweep of the live universe takes ~195 s and
+///   reports progress on every book batch. Only the *absence* of progress counts, and only
+///   after `loop_stall_secs`.
+///
+/// `loop_stall_secs` of `0` switches the stall verdict off.
 pub fn derive_break(
     status: Option<&RuntimeStatusRecord>,
     now: DateTime<Utc>,
+    loop_stall_secs: u64,
 ) -> Option<BreakReason> {
     let Some(record) = status else {
         return Some(BreakReason::NoStatus);
@@ -257,6 +284,24 @@ pub fn derive_break(
         return Some(BreakReason::StatusStale);
     }
     let s = &record.status;
+
+    // The row is fresh, so the process is alive. The remaining question — is its loop
+    // moving? — is what the heartbeat was split off to make answerable. Before the first
+    // unit of work completes there is nothing to measure but the daemon's own start, which
+    // is the right reference: a daemon that has been up for ten minutes without finishing
+    // anything is wedged, however early it is.
+    if loop_stall_secs > 0 {
+        let since = s
+            .last_progress_at
+            .as_deref()
+            .and_then(parse_ts)
+            .or_else(|| parse_ts(&s.started_at));
+        if let Some(since) = since {
+            if (now - since) > Duration::seconds(loop_stall_secs as i64) {
+                return Some(BreakReason::LoopStalled);
+            }
+        }
+    }
 
     // A universe of zero events is blind on the first empty pass; a universe we still hold
     // survives a few, because detection keeps running against the last good one.
@@ -325,7 +370,7 @@ pub fn build(
 ) -> Result<DashboardState, StoreError> {
     let record = store.read_runtime_status()?;
     let status = record.as_ref().map(|r| &r.status);
-    let reason = derive_break(record.as_ref(), now);
+    let reason = derive_break(record.as_ref(), now, cfg.dashboard.loop_stall_secs);
 
     let window = Duration::hours(cfg.dashboard.window_hours as i64);
     let from = now - window;
@@ -387,7 +432,7 @@ pub fn build(
                 .map(|s| s.mode.clone())
                 .unwrap_or_else(|| cfg.mode.clone()),
             mode_pill: "DRY-RUN · LOCKED".into(),
-            transport: transport(status, reason.is_some()),
+            transport: transport(status, reason.is_some_and(BreakReason::blinds_transport)),
             universe_events: status.map(|s| s.universe_events).unwrap_or(0),
             refresh_secs: status
                 .map(|s| s.universe_refresh_secs)
@@ -406,7 +451,7 @@ pub fn build(
         opportunities,
         opportunity_note,
         net_floor_pct: floor_pct(status),
-        pipeline: pipeline(status, stored_rows),
+        pipeline: pipeline(status, stored_rows, now, cfg.dashboard.loop_stall_secs),
         categories,
         crypto_zero,
         log: log_lines(&rows),
@@ -585,7 +630,12 @@ fn verdict_display(status: &str) -> &str {
 
 // ---- rail ------------------------------------------------------------------------
 
-fn pipeline(status: Option<&RuntimeStatus>, stored_rows: i64) -> Vec<PipelineRow> {
+fn pipeline(
+    status: Option<&RuntimeStatus>,
+    stored_rows: i64,
+    now: DateTime<Utc>,
+    loop_stall_secs: u64,
+) -> Vec<PipelineRow> {
     let Some(s) = status else {
         return vec![PipelineRow {
             dot: "warn",
@@ -594,6 +644,34 @@ fn pipeline(status: Option<&RuntimeStatus>, stored_rows: i64) -> Vec<PipelineRow
         }];
     };
     let mut rows = Vec::new();
+
+    // The loop's own row (M7.1). The heartbeat proves the process is up; this is the only
+    // line that says whether the loop is moving — including while it is merely slow, which
+    // is a `warn`, not a takeover.
+    let progress_age = s
+        .last_progress_at
+        .as_deref()
+        .and_then(parse_ts)
+        .map(|t| now - t);
+    rows.push(PipelineRow {
+        dot: match progress_age {
+            Some(age) if loop_stall_secs > 0 && age.num_seconds() > loop_stall_secs as i64 => {
+                "warn"
+            }
+            Some(_) => "ok",
+            None => "warn",
+        },
+        name: "Scan loop",
+        value: match progress_age {
+            Some(age) => format!(
+                "{} ticks · {} since {}",
+                thousands(s.ticks_completed as i64),
+                ago(age),
+                s.last_progress_phase
+            ),
+            None => "no progress recorded yet".into(),
+        },
+    });
 
     rows.push(if s.stream_enabled {
         PipelineRow {
@@ -830,9 +908,39 @@ fn break_state(
              the present."
                 .to_string(),
             format!(
-                "The runtime status row is older than {RUNTIME_STATUS_STALE_SECS}s (the daemon \
-                 republishes it every few seconds while it runs). The scan loop is wedged, the \
-                 process is gone, or this database is not the one it writes."
+                "The runtime status row is older than {RUNTIME_STATUS_STALE_SECS}s. That row is \
+                 written by a heartbeat task with its own timer, independent of the scan loop — \
+                 so a slow sweep can no longer cause this. The process is gone, or this database \
+                 is not the one it writes."
+            ),
+        ),
+        BreakReason::LoopStalled => (
+            "The daemon is alive but its scan loop has stopped moving. Nothing below is being \
+             re-measured."
+                .to_string(),
+            format!(
+                "The heartbeat is current, so the process is up and answering. Its loop last \
+                 finished a unit of work ({}) {} — and progress is recorded per book batch, not \
+                 per sweep, so a slow sweep reports throughout and cannot produce this. It is \
+                 stuck: a hung request, a wedged socket read, or a retry storm.{}",
+                status
+                    .map(|s| s.last_progress_phase.clone())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| "unknown phase".into()),
+                status
+                    .and_then(|s| s.last_progress_at.as_deref().and_then(parse_ts))
+                    .map(|t| format!("{} ago", ago(now - t)))
+                    .unwrap_or_else(|| "never".into()),
+                match status.map(|s| s.watchdog_stall_secs) {
+                    Some(0) | None => " The progress watchdog is disabled \
+                                        (<code>daemon.watchdog_stall_secs = 0</code>), so nothing \
+                                        will restart it on its own."
+                        .to_string(),
+                    Some(secs) => format!(
+                        " The daemon's own watchdog exits the process after {secs}s without \
+                         progress, so a restart policy should be reviving it about now."
+                    ),
+                },
             ),
         ),
     };
@@ -881,24 +989,65 @@ fn break_state(
                 None => "unknown".into(),
             }),
         },
-        BreakCard {
-            label: "Runtime status".into(),
-            value: status_age,
-            value_tone: if matches!(reason, BreakReason::NoStatus | BreakReason::StatusStale) {
-                "bad"
-            } else {
-                "plain"
-            },
-            suffix: None,
-            note: Some(match status {
-                Some(s) => format!("alerts sent {} · failed {}", s.alerts_sent, s.alerts_failed),
-                None => "no row in runtime_status".into(),
-            }),
+        // The fourth card answers the question this particular break raises. For a stalled
+        // loop that is the loop's age, not the heartbeat's — the heartbeat is fresh, and
+        // showing "3s" under a red headline would read as a contradiction.
+        if reason == BreakReason::LoopStalled {
+            BreakCard {
+                label: "Loop progress".into(),
+                value: status
+                    .and_then(|s| s.last_progress_at.as_deref().and_then(parse_ts))
+                    .map(|t| ago(now - t))
+                    .unwrap_or_else(|| "never".into()),
+                value_tone: "bad",
+                suffix: Some("ago".into()),
+                note: Some(match status {
+                    Some(s) => format!(
+                        "{} ticks completed · heartbeat {} old",
+                        thousands(s.ticks_completed as i64),
+                        status_age
+                    ),
+                    None => "no row in runtime_status".into(),
+                }),
+            }
+        } else {
+            BreakCard {
+                label: "Runtime status".into(),
+                value: status_age,
+                value_tone: if matches!(reason, BreakReason::NoStatus | BreakReason::StatusStale) {
+                    "bad"
+                } else {
+                    "plain"
+                },
+                suffix: None,
+                note: Some(match status {
+                    Some(s) => {
+                        format!("alerts sent {} · failed {}", s.alerts_sent, s.alerts_failed)
+                    }
+                    None => "no row in runtime_status".into(),
+                }),
+            }
         },
     ];
 
     let mut log = Vec::new();
     if let Some(s) = status {
+        // Always, whatever the reason: where the loop was and how long ago is the first
+        // thing to know about any of these states.
+        log.push(LogLine {
+            time: record.map(|r| clock_dt(r.updated_at)).unwrap_or_default(),
+            kind: "loop",
+            subject: format!("phase {}", s.last_progress_phase),
+            detail: format!(
+                "{} ticks · last progress {}",
+                thousands(s.ticks_completed as i64),
+                s.last_progress_at
+                    .as_deref()
+                    .and_then(parse_ts)
+                    .map(|t| format!("{} ago", ago(now - t)))
+                    .unwrap_or_else(|| "never".into())
+            ),
+        });
         if let Some(err) = &s.discovery_error {
             log.push(LogLine {
                 time: record.map(|r| clock_dt(r.updated_at)).unwrap_or_default(),

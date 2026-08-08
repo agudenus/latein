@@ -1477,7 +1477,9 @@ mod tests {
 
         assert_eq!(cfg.scan.activity_floor, ActivityFloor::default());
         assert!(cfg.scan.activity_floor.enabled, "the floor ships on");
-        assert_eq!(cfg.scan.activity_floor.min_liquidity_usd, dec!(100));
+        // Raised 100 -> 500 in M7.1: at $100 a live pass kept 73 450 markets / 146 900
+        // tokens / 294 shards and a full REST sweep took 195 s.
+        assert_eq!(cfg.scan.activity_floor.min_liquidity_usd, dec!(500));
         assert_eq!(
             cfg.scan.activity_floor.min_volume24h_usd,
             dec!(0),
@@ -1556,6 +1558,70 @@ mod tests {
         eager.alerts.per_event_cooldown_secs = 0;
         eager.alerts.realert_improvement = Decimal::ZERO;
         assert!(eager.validate().is_ok());
+    }
+
+    /// (h) M7.1: the three robustness knobs ship, default sanely, survive an older config
+    /// file that has never heard of them, and refuse the settings that would defeat them.
+    #[test]
+    fn the_m7_1_robustness_keys_are_shipped_optional_and_validated() {
+        let cfg = Config::from_toml_str(SHIPPED).expect("parse");
+        cfg.validate().expect("validate");
+        assert_eq!(cfg.api.connect_timeout_secs, 10);
+        assert_eq!(cfg.daemon.watchdog_stall_secs, 600);
+        assert_eq!(cfg.dashboard.loop_stall_secs, 300);
+        assert!(
+            cfg.dashboard.loop_stall_secs < cfg.daemon.watchdog_stall_secs,
+            "the page must show the stall before the watchdog restarts the process"
+        );
+        assert_eq!(
+            cfg.api.connect_timeout_secs,
+            ApiConfig::default().connect_timeout_secs
+        );
+        assert_eq!(
+            cfg.daemon.watchdog_stall_secs,
+            DaemonConfig::default().watchdog_stall_secs
+        );
+        assert_eq!(
+            cfg.dashboard.loop_stall_secs,
+            DashboardConfig::default().loop_stall_secs
+        );
+
+        // An operator's older file predates all three.
+        let older = SHIPPED
+            .lines()
+            .filter(|l| {
+                !l.starts_with("connect_timeout_secs")
+                    && !l.starts_with("watchdog_stall_secs")
+                    && !l.starts_with("loop_stall_secs")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let old = Config::from_toml_str(&older).expect("a config without the new keys must load");
+        old.validate().expect("validate");
+        assert_eq!(old.api.connect_timeout_secs, 10);
+        assert_eq!(old.daemon.watchdog_stall_secs, 600);
+        assert_eq!(old.dashboard.loop_stall_secs, 300);
+
+        // A request with no connect ceiling is how one DNS outage became a two-hour one.
+        let mut no_ceiling = Config::default();
+        no_ceiling.api.connect_timeout_secs = 0;
+        assert!(no_ceiling.validate().is_err());
+
+        // 0 disables the watchdog; a hair-trigger restarts a daemon that is merely busy.
+        let mut off = Config::default();
+        off.daemon.watchdog_stall_secs = 0;
+        assert!(off.validate().is_ok(), "0 must mean disabled, not invalid");
+        let mut trigger_happy = Config::default();
+        trigger_happy.daemon.watchdog_stall_secs = 30;
+        assert!(trigger_happy.validate().is_err());
+
+        // Same shape for the dashboard's threshold, against the scan interval.
+        let mut stall_off = Config::default();
+        stall_off.dashboard.loop_stall_secs = 0;
+        assert!(stall_off.validate().is_ok());
+        let mut stall_tiny = Config::default();
+        stall_tiny.dashboard.loop_stall_secs = stall_tiny.daemon.scan_interval_secs;
+        assert!(stall_tiny.validate().is_err());
     }
 
     #[test]

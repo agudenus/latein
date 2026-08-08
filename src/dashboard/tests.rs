@@ -29,6 +29,10 @@ use crate::types::{Category, Label, OpportunityKind};
 // Fixtures
 // ---------------------------------------------------------------------------------
 
+/// The shipped `dashboard.loop_stall_secs`. Every derivation test states it explicitly, so
+/// a change to the default cannot silently change what these tests mean.
+const LOOP_STALL_SECS: u64 = 300;
+
 fn healthy_status() -> RuntimeStatus {
     RuntimeStatus {
         mode: "dry-run".into(),
@@ -51,6 +55,13 @@ fn healthy_status() -> RuntimeStatus {
         frames: 4_800_000,
         delta_entries_applied: 1_900_000,
         frames_unrecognized: 0,
+        trade_prints: 4_012,
+        // A loop that finished something a moment ago: alive *and* moving.
+        last_progress_at: Some(crate::store::now_str(Utc::now() - Duration::seconds(2))),
+        last_progress_phase: "rest_sweep".into(),
+        ticks_completed: 8_412,
+        last_tick_completed_at: Some(crate::store::now_str(Utc::now() - Duration::seconds(4))),
+        watchdog_stall_secs: 600,
         rest_ok: true,
         rest_failure_streak: 0,
         fee_fallback_markets: 7,
@@ -378,7 +389,7 @@ async fn the_funnel_says_which_stage_it_does_not_measure() {
 #[test]
 fn a_healthy_daemon_is_not_blind() {
     assert_eq!(
-        state::derive_break(Some(&record(healthy_status())), Utc::now()),
+        state::derive_break(Some(&record(healthy_status())), Utc::now(), LOOP_STALL_SECS),
         None
     );
 }
@@ -389,7 +400,7 @@ fn empty_discovery_takes_the_page() {
     let mut status = healthy_status();
     status.discovery_empty_streak = 3;
     assert_eq!(
-        state::derive_break(Some(&record(status)), Utc::now()),
+        state::derive_break(Some(&record(status)), Utc::now(), LOOP_STALL_SECS),
         Some(BreakReason::EmptyDiscovery)
     );
 
@@ -399,7 +410,7 @@ fn empty_discovery_takes_the_page() {
     cold.universe_events = 0;
     cold.discovery_empty_streak = 1;
     assert_eq!(
-        state::derive_break(Some(&record(cold)), Utc::now()),
+        state::derive_break(Some(&record(cold)), Utc::now(), LOOP_STALL_SECS),
         Some(BreakReason::EmptyDiscovery)
     );
 
@@ -407,7 +418,10 @@ fn empty_discovery_takes_the_page() {
     // running against the last good universe.
     let mut once = healthy_status();
     once.discovery_empty_streak = 1;
-    assert_eq!(state::derive_break(Some(&record(once)), Utc::now()), None);
+    assert_eq!(
+        state::derive_break(Some(&record(once)), Utc::now(), LOOP_STALL_SECS),
+        None
+    );
 }
 
 #[test]
@@ -417,7 +431,7 @@ fn both_transports_down_is_an_outage_and_says_so() {
     status.rest_ok = false;
     status.rest_failure_streak = 3;
     assert_eq!(
-        state::derive_break(Some(&record(status)), Utc::now()),
+        state::derive_break(Some(&record(status)), Utc::now(), LOOP_STALL_SECS),
         Some(BreakReason::TransportsDown)
     );
 }
@@ -427,7 +441,7 @@ fn all_books_past_staleness_takes_the_page() {
     let mut status = healthy_status();
     status.books_stale = status.books_total;
     assert_eq!(
-        state::derive_break(Some(&record(status)), Utc::now()),
+        state::derive_break(Some(&record(status)), Utc::now(), LOOP_STALL_SECS),
         Some(BreakReason::AllBooksStale)
     );
 
@@ -435,7 +449,7 @@ fn all_books_past_staleness_takes_the_page() {
     let mut partial = healthy_status();
     partial.books_stale = 41;
     assert_eq!(
-        state::derive_break(Some(&record(partial)), Utc::now()),
+        state::derive_break(Some(&record(partial)), Utc::now(), LOOP_STALL_SECS),
         None
     );
 }
@@ -443,7 +457,7 @@ fn all_books_past_staleness_takes_the_page() {
 #[test]
 fn a_missing_or_stale_runtime_status_is_itself_a_break() {
     assert_eq!(
-        state::derive_break(None, Utc::now()),
+        state::derive_break(None, Utc::now(), LOOP_STALL_SECS),
         Some(BreakReason::NoStatus)
     );
 
@@ -452,8 +466,114 @@ fn a_missing_or_stale_runtime_status_is_itself_a_break() {
         status: healthy_status(),
     };
     assert_eq!(
-        state::derive_break(Some(&stale), Utc::now()),
+        state::derive_break(Some(&stale), Utc::now(), LOOP_STALL_SECS),
         Some(BreakReason::StatusStale)
+    );
+}
+
+/// M7.1. The heartbeat runs in its own task, so a fresh status row proves the *process* is
+/// alive and nothing more. These are the four answers that separation has to produce.
+#[test]
+fn a_stalled_loop_is_its_own_break_and_a_slow_one_is_not() {
+    let now = Utc::now();
+    let with_progress = |secs: i64| {
+        let mut s = healthy_status();
+        s.last_progress_at = Some(crate::store::now_str(now - Duration::seconds(secs)));
+        s
+    };
+
+    // (a) Slow but progressing. A full REST sweep at live scale takes ~195 s and reports on
+    // every book batch, so this is the normal shape of a busy daemon — never a takeover.
+    assert_eq!(
+        state::derive_break(Some(&record(with_progress(200))), now, LOOP_STALL_SECS),
+        None
+    );
+
+    // (b) Stalled: nothing finished for longer than the threshold, while the heartbeat kept
+    // publishing. That is the state the old single-timestamp design could not express.
+    assert_eq!(
+        state::derive_break(
+            Some(&record(with_progress(LOOP_STALL_SECS as i64 + 60))),
+            now,
+            LOOP_STALL_SECS
+        ),
+        Some(BreakReason::LoopStalled)
+    );
+
+    // (c) A daemon gone is still a daemon gone: a stale row outranks the loop verdict,
+    // because a status we cannot trust says nothing about a loop.
+    let gone = RuntimeStatusRecord {
+        updated_at: now - Duration::seconds(RUNTIME_STATUS_STALE_SECS + 5),
+        status: with_progress(LOOP_STALL_SECS as i64 + 60),
+    };
+    assert_eq!(
+        state::derive_break(Some(&gone), now, LOOP_STALL_SECS),
+        Some(BreakReason::StatusStale)
+    );
+
+    // (d) Switched off.
+    assert_eq!(
+        state::derive_break(
+            Some(&record(with_progress(LOOP_STALL_SECS as i64 + 600))),
+            now,
+            0
+        ),
+        None
+    );
+
+    // Before the first unit of work there is nothing but the daemon's own start to measure
+    // from — which is the right reference: starting up is fine, never getting going is not.
+    let mut starting = healthy_status();
+    starting.last_progress_at = None;
+    starting.started_at = crate::store::now_str(now - Duration::seconds(30));
+    assert_eq!(
+        state::derive_break(Some(&record(starting.clone())), now, LOOP_STALL_SECS),
+        None
+    );
+    starting.started_at =
+        crate::store::now_str(now - Duration::seconds(LOOP_STALL_SECS as i64 * 2));
+    assert_eq!(
+        state::derive_break(Some(&record(starting)), now, LOOP_STALL_SECS),
+        Some(BreakReason::LoopStalled)
+    );
+}
+
+/// The stalled page has to read differently from the blind ones: the transports are fine
+/// and their numbers are live (the heartbeat reads the pool directly), so the pill must not
+/// claim BLIND and the copy must name the loop.
+#[tokio::test]
+async fn the_stalled_loop_page_names_the_loop_and_keeps_the_transport_pill_honest() {
+    let dir = TempDir::new("stalled");
+    let path = dir.db();
+    let mut status = healthy_status();
+    status.last_progress_at = Some(crate::store::now_str(
+        Utc::now() - Duration::seconds(LOOP_STALL_SECS as i64 + 120),
+    ));
+    status.last_progress_phase = "rest_sweep".into();
+    {
+        let store = crate::store::Store::open(&path).expect("open");
+        store
+            .write_runtime_status(&status, Utc::now())
+            .expect("status");
+    }
+    let store = crate::store::Store::open_read_only(&path).expect("read-only");
+    let app = Arc::new(App::new(Arc::new(Config::default()), Arc::new(store)));
+    let (code, html) = get(app, "/").await;
+
+    assert_eq!(code, StatusCode::OK);
+    assert!(html.contains("dryrun::LoopStalled"));
+    assert!(html.contains("data-break=\"loopstalled\""));
+    assert!(
+        html.contains("rest_sweep"),
+        "the page must name where the loop stopped"
+    );
+    assert!(
+        html.contains("watchdog"),
+        "the page must say what is about to happen to the process"
+    );
+    assert!(
+        html.contains("STREAMING · 4 shards") && !html.contains(">BLIND<"),
+        "the sockets are fine and their counts are live — claiming BLIND would misdiagnose it"
     );
 }
 
@@ -468,19 +588,28 @@ fn the_deliberate_non_triggers_stay_non_triggers() {
     quiet.frames = 4_800_000;
     quiet.delta_entries_applied = 0;
     quiet.books_stale = 0;
-    assert_eq!(state::derive_break(Some(&record(quiet)), now), None);
+    assert_eq!(
+        state::derive_break(Some(&record(quiet)), now, LOOP_STALL_SECS),
+        None
+    );
 
     // A fee-model fallback is a warn dot in the rail, not an outage.
     let mut fees = healthy_status();
     fees.fee_fallback_markets = 1_240;
     fees.fee_unsupported_formula = 12;
-    assert_eq!(state::derive_break(Some(&record(fees)), now), None);
+    assert_eq!(
+        state::derive_break(Some(&record(fees)), now, LOOP_STALL_SECS),
+        None
+    );
 
     // An alert cooldown means the message was held, not that the measurement was lost.
     let mut cooldown = healthy_status();
     cooldown.alerts_cooldown_held = 96;
     cooldown.telegram_circuit_open = true;
-    assert_eq!(state::derive_break(Some(&record(cooldown)), now), None);
+    assert_eq!(
+        state::derive_break(Some(&record(cooldown)), now, LOOP_STALL_SECS),
+        None
+    );
 
     // An honest REST fallback: the socket is gone, REST demonstrably works. Degraded
     // latency, working detection — the pill changes, the page does not.
@@ -488,13 +617,19 @@ fn the_deliberate_non_triggers_stay_non_triggers() {
     fallback.stream_shards_connected = 0;
     fallback.stream_rest_only = true;
     fallback.rest_ok = true;
-    assert_eq!(state::derive_break(Some(&record(fallback)), now), None);
+    assert_eq!(
+        state::derive_break(Some(&record(fallback)), now, LOOP_STALL_SECS),
+        None
+    );
 
     // REST failing on its own, while the stream still pushes, is a degraded integrity net.
     let mut rest_flaky = healthy_status();
     rest_flaky.rest_ok = false;
     rest_flaky.rest_failure_streak = 9;
-    assert_eq!(state::derive_break(Some(&record(rest_flaky)), now), None);
+    assert_eq!(
+        state::derive_break(Some(&record(rest_flaky)), now, LOOP_STALL_SECS),
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------------

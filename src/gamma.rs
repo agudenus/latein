@@ -1352,7 +1352,25 @@ mod tests {
         parse_events_page("test", ACTIVITY).expect("activity fixture must parse")
     }
 
-    /// The shipped floor: $100 of reported CLOB liquidity, volume criterion off.
+    /// The floor the `ACTIVITY` fixture was authored against: $100 of reported CLOB
+    /// liquidity, volume criterion off.
+    ///
+    /// Deliberately spelled out rather than taken from [`ActivityFloor::default`]. These
+    /// cases test the floor's *mechanics* — the boundary, the "no data is a keep" rule, the
+    /// NegRisk whole-event rule — against fixed fixture values, whereas the shipped default
+    /// is a scale decision that moves with the live universe (raised to $500 in M7.1). Tying
+    /// them together meant a scale decision silently rewrote what these tests prove. The
+    /// default's own value is asserted in `config::tests`.
+    fn fixture_floor() -> ActivityFloor {
+        ActivityFloor {
+            enabled: true,
+            min_liquidity_usd: dec!(100),
+            min_volume24h_usd: Decimal::ZERO,
+        }
+    }
+
+    /// The floor as actually shipped — used where the point *is* the default (the live
+    /// keyset capture must survive it).
     fn shipped_floor() -> ActivityFloor {
         ActivityFloor::default()
     }
@@ -1371,7 +1389,7 @@ mod tests {
     /// figure as a zero would silently delete the entire tracked universe.
     #[test]
     fn a_binary_event_drops_dust_and_keeps_markets_with_no_activity_data() {
-        let (universe, stats) = build_universe(&activity_events(), &shipped_floor());
+        let (universe, stats) = build_universe(&activity_events(), &fixture_floor());
         let binary = universe
             .events
             .iter()
@@ -1431,7 +1449,7 @@ mod tests {
     /// must therefore still be true.
     #[test]
     fn a_negrisk_event_is_kept_whole_when_any_one_outcome_passes() {
-        let (universe, _) = build_universe(&activity_events(), &shipped_floor());
+        let (universe, _) = build_universe(&activity_events(), &fixture_floor());
         let event = universe
             .events
             .iter()
@@ -1448,7 +1466,7 @@ mod tests {
         assert_eq!(event.missing_outcomes(), 0);
 
         // The two illiquid legs are tracked *despite* individually failing the floor.
-        let floor = shipped_floor();
+        let floor = fixture_floor();
         assert_eq!(event.markets[1].activity.liquidity, Some(dec!(8)));
         assert!(!floor.keeps(&event.markets[1].activity));
         assert_eq!(event.markets[2].activity.liquidity, Some(dec!(0))); // exactly zero
@@ -1464,7 +1482,7 @@ mod tests {
     /// up empty keeps its existing `events_no_usable_market` diagnosis.
     #[test]
     fn a_negrisk_event_below_the_floor_throughout_is_dropped_whole_and_counted() {
-        let (universe, stats) = build_universe(&activity_events(), &shipped_floor());
+        let (universe, stats) = build_universe(&activity_events(), &fixture_floor());
 
         assert_eq!(
             slugs(&universe),
@@ -1562,7 +1580,7 @@ mod tests {
     /// a universe count.
     #[test]
     fn the_floor_verdict_is_pass_fail_or_unjudgeable() {
-        let floor = shipped_floor();
+        let floor = fixture_floor();
         let with = |liquidity: Option<Decimal>, volume: Option<Decimal>| MarketActivity {
             liquidity,
             volume_24h: volume,

@@ -1604,22 +1604,22 @@ async fn shard_task(
 
         // A connect that never resolves would strand this shard silently; time it out and
         // let the ordinary failure path (streak, backoff, the daemon's fallback decision)
-        // handle it like any other refusal.
-        let connect = tokio::time::timeout(
+        // handle it like any other refusal. The two failures are flattened to one string so
+        // a timeout is reported exactly like a refusal — because to this task it is one.
+        let connect = match tokio::time::timeout(
             Duration::from_secs(CONNECT_TIMEOUT_SECS),
             tokio_tungstenite::connect_async(url.as_str()),
         )
         .await
-        .unwrap_or_else(|_| {
-            Err(tokio_tungstenite::tungstenite::Error::Io(
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("no connection within {CONNECT_TIMEOUT_SECS}s (DNS, TCP or handshake)"),
-                ),
-            ))
-        });
+        {
+            Ok(Ok((socket, _response))) => Ok(socket),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err(format!(
+                "no connection within {CONNECT_TIMEOUT_SECS}s (DNS, TCP or handshake)"
+            )),
+        };
         match connect {
-            Ok((socket, _response)) => {
+            Ok(socket) => {
                 health.record_connected();
                 attempt = 0;
                 books.assign_shard(id, &tokens, Instant::now());
@@ -2017,6 +2017,86 @@ mod tests {
             stats.delta_top_mismatch, 0,
             "the entry's best_bid/best_ask agree with the book we built"
         );
+    }
+
+    /// A `last_trade_price` frame, verbatim from the first soak's raw samples (2026-08).
+    /// All three unrecognized payloads the M6.5 sampler caught were this shape.
+    const LIVE_TRADE_PRINT: &str = r#"{
+  "event_type": "last_trade_price",
+  "market": "0x5f65...f8f1",
+  "asset_id": "1001",
+  "price": "0.52",
+  "size": "40",
+  "fee_rate_bps": "0",
+  "side": "BUY",
+  "timestamp": "1757908892351",
+  "transaction_hash": "0xdeadbeef"
+}"#;
+
+    /// M7.1. A trade print is a legitimate frame we have no use for: it reports what *did*
+    /// trade, and our books carry what is *resting*. It must therefore be recognized (so it
+    /// stops inflating `frames_unrecognized`, the one counter whose job is to say the wire
+    /// format drifted), counted on its own, and applied to nothing.
+    #[test]
+    fn a_trade_print_is_recognized_counted_and_changes_no_book() {
+        let frames = frames_of(LIVE_TRADE_PRINT);
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            MarketFrame::TradePrint { asset_id } => {
+                assert_eq!(asset_id.as_ref().map(TokenId::as_str), Some("1001"))
+            }
+            other => panic!("a trade print must not be {other:?}"),
+        }
+
+        // A book to leave alone.
+        let store = BookStore::new();
+        let now = Instant::now();
+        for frame in frames_of(&snapshot_for(
+            "1001",
+            r#"{"price":"0.49","size":"100"}"#,
+            r#"{"price":"0.52","size":"50"}"#,
+            1_757_908_892_000i64,
+        )) {
+            store.apply_frame(&frame, now);
+        }
+        let before = store.snapshot_of(&[tok_id("1001")]);
+        let revision = store.revision(&tok_id("1001"));
+
+        assert_eq!(
+            store.apply_frame(&frames[0], now),
+            None,
+            "a trade print touches no token, so it must wake no detection pass"
+        );
+
+        assert_eq!(
+            store.snapshot_of(&[tok_id("1001")]),
+            before,
+            "prints report trades, not resting depth — applying one would invent liquidity"
+        );
+        assert_eq!(store.revision(&tok_id("1001")), revision);
+        assert_eq!(store.is_stale(&tok_id("1001")), Some(false));
+
+        let stats = store.stats.snapshot();
+        assert_eq!(stats.trade_prints, 1);
+        assert_eq!(
+            stats.frames_unrecognized, 0,
+            "~4 000 of these per 5.1 M messages used to read as a wire-format break"
+        );
+        assert_eq!(stats.unknown_frames, 0);
+        assert_eq!(stats.malformed_frames, 0);
+        assert_eq!(stats.deltas, 0);
+        assert_eq!(stats.delta_entries_skipped, 0);
+
+        // A genuinely unknown type is still unknown — the recognition is for this one
+        // event_type, not a blanket amnesty.
+        let odd = r#"{"event_type":"tick_size_change","asset_id":"1001"}"#;
+        for frame in frames_of(odd) {
+            store.apply_frame(&frame, now);
+        }
+        let stats = store.stats.snapshot();
+        assert_eq!(stats.trade_prints, 1);
+        assert_eq!(stats.unknown_frames, 1);
+        assert_eq!(stats.frames_unrecognized, 1);
     }
 
     /// The cross-check earns its keep only if it can fire. It counts and stops there — the

@@ -297,7 +297,10 @@ ls -la data/
 
 You should see `polyarb.sqlite`, plus `polyarb.sqlite-wal` and `polyarb.sqlite-shm`. Run
 it again a minute later; the `-wal` file's timestamp must advance. That heartbeat is
-exactly what the healthcheck watches.
+exactly what the healthcheck watches — and it is a real heartbeat: a task of its own
+republishes `runtime_status` every ~5 s whatever the scan loop is doing, so the check
+answers "is the process alive", not "is the loop fast". Whether the *loop* is moving is a
+separate question, answered by the dashboard's Scan loop row and by the progress watchdog.
 
 **d) The report pipeline works** — do not wait until tomorrow to find out.
 
@@ -450,7 +453,9 @@ docker compose restart
 Out of memory. Go back and do [step 2](#2-add-swap-do-not-skip-this-on-a-1-gb-box).
 
 **`docker compose ps` shows `(unhealthy)`.**
-The scan loop has stopped writing. Look at the logs:
+The process has stopped writing its database at all — it is gone, stopped, or cannot write
+the file. (It no longer means "the loop is slow": the daemon's heartbeat publishes every
+~5 s from its own timer, independent of the scan loop.) Look at the logs:
 
 ```bash
 docker compose logs --tail 100
@@ -458,6 +463,20 @@ docker compose logs --tail 100
 
 Almost always this is a network problem reaching Polymarket, or a crash. The container
 restarts itself; if it restart-loops, the logs will say why.
+
+**The dashboard says "alive but stalled", or the logs show `exit_code=75`.**
+The process is fine but its scan loop finished no unit of work for
+`daemon.watchdog_stall_secs` (600 s by default) — a hung request, a wedged read, a retry
+storm. The daemon logs its last known position at ERROR and exits with code **75**, and
+`restart: unless-stopped` brings up a clean process. Grep for it:
+
+```bash
+docker compose logs --tail 200 | grep -i watchdog
+```
+
+The line names the phase it stopped in (`rest_sweep`, `discovery`, `seed_books`, …) and how
+long it had been stuck. Set `daemon.watchdog_stall_secs = 0` to disable the watchdog; a
+slow loop never trips it, because progress is recorded on every book batch.
 
 **`env file .env not found`.**
 You skipped [step 5](#5-create-your-env). `cp .env.example .env`.

@@ -30,6 +30,12 @@ mode = "dry-run"
 gamma_base_url = "https://gamma-api.polymarket.com"
 clob_base_url = "https://clob.polymarket.com"
 request_timeout_secs = 20
+# Ceiling on the connect phase alone (DNS + TCP + TLS). request_timeout_secs bounds a
+# request that is making progress badly; this one bounds a request that never starts.
+# During a live DNS outage the resolver stopped answering and every book batch sat in it,
+# stretching one loop tick to minutes — a request that will never connect should give up in
+# seconds.
+connect_timeout_secs = 10
 max_retries = 3
 # Client-side throttle between requests to the same host (rate-limit politeness).
 min_request_interval_ms = 120
@@ -135,11 +141,18 @@ crypto = { taker = 0.008, maker = 0.005 }
 # books still balance: markets_kept + drops == markets_seen.
 [scan.activity_floor]
 enabled = true
-# $100 of reported CLOB liquidity. Deliberately low: this is a dust cutoff, not a
-# tradability test — that is the depth walker's job, on the real book. With
-# risk.per_trade_cap_usd = 50, a market reporting under $100 will not fill both legs of
-# anything worth reporting.
-min_liquidity_usd = 100
+# $500 of reported CLOB liquidity. Still a dust cutoff, not a tradability test — that is
+# the depth walker's job, on the real book. With risk.per_trade_cap_usd = 50, a market
+# reporting under $500 is not going to fill both legs of anything worth reporting.
+#
+# RAISED 100 -> 500 (2026-08), from live evidence rather than taste. At $100 a discovery
+# pass kept 73,450 markets / 146,900 tokens / 294 WebSocket shards (61,950 markets were
+# floor-dropped, and max_events was not the binder: truncated=false at 18,079 events). A
+# full REST sweep of those books took 195 s and startup opened 294 sockets at once — past
+# what a home PC on a domestic connection sweeps comfortably, and the overhead lands
+# exactly on the markets that can be traded. $500 targets a universe proportionate to that
+# machine. An explicit value here keeps its own behaviour; only the default moved.
+min_liquidity_usd = 500
 # Off by default: liquidity is the cleaner signal and volume is the figure the research says
 # is inflated. Raise it (e.g. 500) to rescue markets that trade in bursts without leaving
 # resting depth behind.
@@ -166,6 +179,21 @@ scan_interval_secs = 5
 universe_refresh_secs = 600
 # UTC time-of-day at which the daily summary is generated, stored and alerted.
 daily_summary_utc = "23:55"
+# Progress watchdog: seconds of NO loop progress at all before the daemon logs its last
+# known position at ERROR and exits with code 75, so Docker's restart policy revives a
+# clean process. 0 disables it.
+#
+# "Progress" is any finished unit of work — a discovery pass, a book batch, a detection
+# pass — not a completed tick, so a slow-but-working loop never trips it: a full REST sweep
+# of the live universe takes ~195 s and reports progress on every one of its ~1,500
+# batches. The watchdog is also unarmed until the first unit of work completes, so the long
+# first discovery-and-seed at startup can never be mistaken for a wedge.
+#
+# WHY IT EXISTS: during a DNS outage the loop stretched to many minutes, the dashboard
+# showed "daemon stopped reporting", the Docker healthcheck went unhealthy — and nothing
+# restarted anything. Two hours of silent degradation followed. The heartbeat (below) makes
+# the page honest about a slow loop; this ends a stuck one.
+watchdog_stall_secs = 600
 
 [lifecycle]
 # After detection an opportunity's legs are re-polled on this cadence, for this long,
@@ -309,6 +337,16 @@ max_rows = 40
 # Planned soak length, for the "soak day n of m" line. Day 1 is counted from the first
 # scan cycle this database ever recorded, so a daemon restart does not reset it.
 soak_days = 7
+# Seconds without loop progress before the page reports the daemon as ALIVE BUT STALLED.
+# 0 switches that break state off.
+#
+# This is a different question from runtime_status staleness. The daemon's heartbeat runs
+# in its own task, so a fresh status row now proves only that the process is up; this
+# threshold is what turns "the loop has finished nothing since T" into a takeover. Half of
+# daemon.watchdog_stall_secs on purpose: the stall is visible here for ~5 minutes before
+# the watchdog restarts the process, and it still sits far above the ~195 s a full REST
+# sweep takes.
+loop_stall_secs = 300
 
 # Taker fee rates: fee = shares * rate * p * (1 - p). Makers pay zero.
 # Verified against https://docs.polymarket.com/trading/fees (2026-07). Re-check

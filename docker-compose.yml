@@ -47,14 +47,19 @@ services:
 
     # This is a LIVENESS check, not a correctness check — be clear about what it proves.
     #
-    # Every scan cycle upserts a `scan_stats` row, so the SQLite WAL is written every
-    # daemon.scan_interval_secs (5s by default). Crucially that happens even when the book
-    # fetch fails, because the failure path records the cycle too. So:
-    #   healthy   => the scan loop is turning
-    #   unhealthy => the loop is wedged, deadlocked or the process is gone
-    # It does NOT tell you the Polymarket APIs are answering, or that anything is being
-    # detected. For that, read the `errors` count in the daily report and grep the logs —
-    # docs/deploy.md, "Reviewing the soak".
+    # Since M7.1 the daemon's heartbeat task upserts `runtime_status` every ~5s from a timer
+    # of its own, so the SQLite WAL is written whatever the scan loop is doing. So:
+    #   healthy   => the process is alive and writing
+    #   unhealthy => the process is gone, stopped or cannot write its database
+    # It deliberately no longer means "the loop is turning": at live scale a REST sweep takes
+    # ~195s and a DNS outage stretched a tick past this window, which marked a working daemon
+    # unhealthy. A *wedged* loop is not this check's job either — Compose does not restart an
+    # unhealthy container anyway — it is the daemon's own progress watchdog
+    # (daemon.watchdog_stall_secs), which exits with code 75 so `restart: unless-stopped`
+    # below revives it. The dashboard shows the same stall as "alive but stalled".
+    # This check does NOT tell you the Polymarket APIs are answering, or that anything is
+    # being detected. For that, read the `errors` count in the daily report and grep the
+    # logs — docs/deploy.md, "Reviewing the soak".
     healthcheck:
       test:
         - CMD-SHELL

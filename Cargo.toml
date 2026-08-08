@@ -30,6 +30,10 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # bind a port.
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# `#[tokio::test(start_paused = true)]` — the heartbeat and watchdog tests reason about
+# minutes of stall and hours of slow progress, which auto-advancing time turns into
+# microseconds. Test-only: the shipped binary never enables it.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = true

@@ -131,10 +131,10 @@ fallbacks, the Telegram breaker).
 Two things it deliberately refuses to fake:
 
 - **The break state.** When the scanner is *blind rather than idle* — discovery returning
-  zero events, both transports down, every book past its staleness window, or the daemon
-  no longer publishing its status — the whole page is taken over and says so. A quiet
-  socket, a fee-model fallback and an alert cooldown are none of those things and do not
-  trigger it.
+  zero events, both transports down, every book past its staleness window, the daemon no
+  longer publishing its status, or its scan loop alive but stalled — the whole page is
+  taken over and says so. A quiet socket, a fee-model fallback, an alert cooldown and a
+  merely *slow* loop are none of those things and do not trigger it.
 - **The unmeasured funnel stage.** "Survive bid–ask spread" renders as *not instrumented*,
   because polyarb computes every gap on the executable side from the start and so has no
   pre-spread population to filter. A plausible number there would be an invented one.
@@ -144,6 +144,14 @@ the alert breaker) to a single `runtime_status` row every ~5 s, which is what le
 read-only reader tell a quiet market from a blind scanner. That row and the funnel
 counters are schema v3: run `polyarb run` against a database once before pointing the
 dashboard at it.
+
+The row is written by a heartbeat task with its own timer, not by the scan loop, and it
+carries the loop's own progress timestamp alongside. That separation is deliberate: a stale
+row means the *process* is gone, while a fresh row with an old progress timestamp means the
+process is alive and its loop is stuck — two failures a single timestamp used to conflate,
+at the cost of a working daemon being reported as dead. A loop that finishes nothing for
+`daemon.watchdog_stall_secs` is ended by the daemon's own watchdog (exit code 75) so a
+restart policy can revive it.
 
 The page has **no authentication** and shows a whole soak's evidence, so `bind` stays on
 loopback. Reach a remote one over an SSH tunnel:

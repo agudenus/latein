@@ -354,7 +354,12 @@ struct Heartbeat {
 }
 
 impl Heartbeat {
-    fn new(cfg: Arc<Config>, store: Arc<Store>, alerter: Arc<Alerter>, status: DaemonStatus) -> Self {
+    fn new(
+        cfg: Arc<Config>,
+        store: Arc<Store>,
+        alerter: Arc<Alerter>,
+        status: DaemonStatus,
+    ) -> Self {
         Self {
             cfg,
             store,
@@ -370,7 +375,9 @@ impl Heartbeat {
     /// slightly odd status beats publishing none, because "none" is read as "the daemon is
     /// gone".
     fn with<T, U>(mutex: &Mutex<T>, f: impl FnOnce(&mut T) -> U) -> U {
-        let mut guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&mut guard)
     }
 
@@ -518,7 +525,7 @@ fn stall_verdict(
 ) -> Option<StallReport> {
     let last = progress.last_at?;
     let stalled_for = now.saturating_duration_since(last);
-    (stalled_for >= stall_after).then(|| StallReport {
+    (stalled_for >= stall_after).then_some(StallReport {
         phase: progress.phase,
         stalled_for_secs: stalled_for.as_secs(),
         ticks_completed: progress.ticks,
@@ -1215,10 +1222,7 @@ impl Daemon {
         if stale.is_empty() {
             return;
         }
-        match self
-            .fetch_books_noting_progress(&stale, PHASE_RESYNC)
-            .await
-        {
+        match self.fetch_books_noting_progress(&stale, PHASE_RESYNC).await {
             Ok(books) => {
                 tracing::info!(
                     requested = stale.len(),
@@ -2192,6 +2196,184 @@ mod tests {
     use crate::types::{OrderBook, PriceLevel};
     use rust_decimal_macros::dec;
 
+    // -- M7.1: the heartbeat, the loop-progress record and the watchdog -----------------
+
+    /// A heartbeat over a real (temporary) database, with nothing else running.
+    fn heartbeat_fixture(tag: &str) -> (PathBuf, Arc<Heartbeat>, Arc<Store>) {
+        let dir = std::env::temp_dir().join(format!(
+            "polyarb-hb-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = Config::default();
+        cfg.storage.database_path = dir.join("polyarb.sqlite").display().to_string();
+        cfg.storage.log_dir = dir.join("logs").display().to_string();
+        cfg.storage.report_dir = dir.join("reports").display().to_string();
+        cfg.alerts.telegram_api_base = "http://127.0.0.1:1".into();
+
+        let store = Arc::new(Store::open(Path::new(&cfg.storage.database_path)).expect("store"));
+        let events = Arc::new(EventLog::open(Path::new(&cfg.storage.log_dir)).expect("log"));
+        let alerter = Arc::new(Alerter::new(&cfg.alerts, events));
+        let hb = Arc::new(Heartbeat::new(
+            Arc::new(cfg),
+            store.clone(),
+            alerter,
+            DaemonStatus {
+                started_at: Utc::now(),
+                rest_ok: true,
+                ..DaemonStatus::default()
+            },
+        ));
+        (dir, hb, store)
+    }
+
+    /// The bug this milestone exists for: during a DNS outage the loop tick stretched to
+    /// minutes, and because the status row was written *between* ticks the dashboard
+    /// reported `runtime_status::Stale` — "the daemon stopped reporting" — about a daemon
+    /// that was alive and working.
+    ///
+    /// The row must now keep coming while the loop is blocked, and it must say so: the
+    /// heartbeat is current, the loop's own timestamp is not.
+    #[tokio::test(start_paused = true)]
+    async fn the_heartbeat_publishes_while_the_scan_loop_is_blocked() {
+        let (dir, hb, store) = heartbeat_fixture("blocked");
+
+        // One completed unit of work, and then the loop wedges.
+        hb.note(PHASE_REST_SWEEP);
+        let stopped_at = hb.progress().last_wall.expect("progress was recorded");
+        let blocked = tokio::spawn(std::future::pending::<()>());
+
+        let (_tx, rx) = watch::channel(false);
+        let task = tokio::spawn(heartbeat_task(hb.clone(), rx));
+        tokio::time::sleep(Duration::from_secs(STATUS_PUBLISH_SECS * 3)).await;
+
+        let row = store
+            .read_runtime_status()
+            .expect("read")
+            .expect("the heartbeat must publish without the loop's help");
+        assert_eq!(row.status.last_progress_phase, PHASE_REST_SWEEP);
+        assert_eq!(
+            row.status.last_progress_at,
+            Some(crate::store::now_str(stopped_at)),
+            "the loop's timestamp must lag — that is the whole signal"
+        );
+        assert_eq!(
+            row.status.ticks_completed, 0,
+            "no full iteration ever completed"
+        );
+        assert_eq!(row.status.watchdog_stall_secs, 600);
+
+        // …and it is really republishing, not a single write at startup: a state change made
+        // while the loop is still blocked reaches the row on the next beat.
+        hb.update(|s| s.universe_events = 4_242);
+        tokio::time::sleep(Duration::from_secs(STATUS_PUBLISH_SECS * 2)).await;
+        let row = store.read_runtime_status().expect("read").expect("row");
+        assert_eq!(row.status.universe_events, 4_242);
+        assert_eq!(
+            row.status.last_progress_at,
+            Some(crate::store::now_str(stopped_at)),
+            "and the loop is still, correctly, reported as stopped"
+        );
+
+        task.abort();
+        blocked.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stall_verdict_ignores_a_slow_loop_and_an_unstarted_one() {
+        let now = TokioInstant::now();
+        let stall = Duration::from_secs(600);
+
+        // Never completed anything: unarmed, however long ago the process started. At live
+        // scale the first discovery-and-seed is minutes of legitimate work.
+        assert_eq!(stall_verdict(&LoopProgress::default(), now, stall), None);
+
+        let progress = |ago_secs: u64, phase| LoopProgress {
+            last_at: Some(now - Duration::from_secs(ago_secs)),
+            last_wall: Some(Utc::now()),
+            phase,
+            ticks: 7,
+            last_tick_wall: None,
+        };
+        // Slow: a full REST sweep reports per batch, so "a while ago" is still progress.
+        assert_eq!(
+            stall_verdict(&progress(599, PHASE_REST_SWEEP), now, stall),
+            None
+        );
+
+        let report = stall_verdict(&progress(601, PHASE_REST_SWEEP), now, stall)
+            .expect("past the threshold, this is a wedge");
+        assert_eq!(report.phase, PHASE_REST_SWEEP);
+        assert_eq!(report.ticks_completed, 7);
+        assert!(report.stalled_for_secs >= 600);
+    }
+
+    /// The watchdog task itself, on the tokio clock: it trips on a stalled loop, and never
+    /// on a slow one or on a daemon that has not finished its first unit of work.
+    #[tokio::test(start_paused = true)]
+    async fn the_watchdog_trips_on_a_stall_only() {
+        let (dir, hb, _store) = heartbeat_fixture("watchdog");
+        let stall = Duration::from_secs(120);
+
+        // (a) Unarmed before the first unit of work — the long first discovery-and-seed.
+        let (_tx, rx) = watch::channel(false);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(3_600),
+                watchdog_task(hb.clone(), stall, rx)
+            )
+            .await
+            .is_err(),
+            "a daemon still doing its first discovery must never be restarted for it"
+        );
+
+        // (b) Slow but progressing: a book batch every 5 s, an hour of it, no trip.
+        hb.note(PHASE_SEED_BOOKS);
+        let ticker = {
+            let hb = hb.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    hb.note(PHASE_REST_SWEEP);
+                }
+            })
+        };
+        let (_tx2, rx2) = watch::channel(false);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(3_600),
+                watchdog_task(hb.clone(), stall, rx2)
+            )
+            .await
+            .is_err(),
+            "a 195 s sweep reports progress throughout; only silence is a stall"
+        );
+
+        // (c) The loop wedges — and now it trips, naming where it stopped.
+        ticker.abort();
+        let (_tx3, rx3) = watch::channel(false);
+        let report = tokio::time::timeout(
+            Duration::from_secs(3_600),
+            watchdog_task(hb.clone(), stall, rx3),
+        )
+        .await
+        .expect("the watchdog must answer within the hour")
+        .expect("a wedged loop must trip it");
+        assert_eq!(report.phase, PHASE_REST_SWEEP);
+        assert!(report.stalled_for_secs >= stall.as_secs());
+        assert!(report.last_progress_at.is_some());
+
+        // (d) Shutdown wins: a daemon told to stop is not a daemon to kill.
+        let (tx4, rx4) = watch::channel(false);
+        let quiet = tokio::spawn(watchdog_task(hb.clone(), stall, rx4));
+        tx4.send(true).expect("shutdown");
+        assert_eq!(quiet.await.expect("join"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn books_at(ask_a: Decimal, size_a: Decimal, ask_b: Decimal, size_b: Decimal) -> BookMap {
         let mut books = BookMap::new();
         for (id, ask, size, bid) in [
@@ -2932,6 +3114,7 @@ mod tests {
                 snapshots: 5,
                 delta_entries_applied: 40,
                 delta_entries_skipped: 1,
+                trade_prints: 500,
                 frames_unrecognized: 2,
                 delta_top_mismatch: 3,
                 ..StreamStatsSnapshot::default()
@@ -2943,6 +3126,7 @@ mod tests {
             snapshots: 9,
             delta_entries_applied: 240,
             delta_entries_skipped: 8,
+            trade_prints: 1_500,
             frames_unrecognized: 11,
             delta_top_mismatch: 4,
             ..StreamStatsSnapshot::default()
@@ -2962,6 +3146,8 @@ mod tests {
             "snapshots_applied=4",
             "delta_entries_applied=200",
             "delta_entries_skipped=7",
+            // Recognized-and-ignored trade prints, next to the counter they used to inflate.
+            "trade_prints=1000",
             "frames_unrecognized=9",
             "delta_top_mismatch=1",
             "connections=177",
@@ -2974,6 +3160,7 @@ mod tests {
         // The first sweep has no interval to divide by, but must still show whether deltas
         // are landing at all — that is the whole point of it.
         assert!(log.contains("delta_entries_applied_total=240"), "{log}");
+        assert!(log.contains("trade_prints_total=1500"), "{log}");
         assert!(log.contains("frames_unrecognized_total=11"), "{log}");
     }
 
