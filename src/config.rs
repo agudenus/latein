@@ -60,6 +60,11 @@ pub struct Config {
     /// M6 WebSocket market-data stream. Off → the daemon polls REST as before.
     #[serde(default)]
     pub stream: StreamConfig,
+
+    /// M8 maker-fill simulation. `#[serde(default)]` so an operator's older
+    /// `config/default.toml` keeps loading with the shipped defaults.
+    #[serde(default)]
+    pub maker_sim: MakerSimConfig,
     /// M3 alerting. Credentials are *never* here — only in the environment.
     #[serde(default)]
     pub alerts: AlertConfig,
@@ -383,6 +388,41 @@ pub struct StreamConfig {
     /// (logged loudly), so "permanent" really means "until proven working again".
     #[serde(default = "default_reprobe_interval_secs")]
     pub reprobe_interval_secs: u64,
+}
+
+/// M8 — the maker-fill simulator (`src/makersim.rs`).
+///
+/// It places nothing. It records the resting orders a maker-only opportunity *would* imply,
+/// assumes we are last in the queue at that price, and waits for the trade prints that would
+/// have had to occur before we were filled. The result is a lower bound on maker P&L, which
+/// is the number the Phase B decision needs — the existing "if every leg is crossed" figure
+/// is an upper bound and cannot be the basis of a go/no-go.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MakerSimConfig {
+    /// Master switch. `false` = no simulations are opened at all; the daily summary then
+    /// says the measurement is off rather than reporting a zero fill rate.
+    pub enabled: bool,
+    /// How long a phantom order is left resting before its window closes. An hour by
+    /// default: long enough that a slow politics book has a real chance to trade through,
+    /// short enough that the verdict lands inside the day it belongs to. It is *not* a
+    /// claim about how long we would really leave an order out — a live quote would be
+    /// re-priced far sooner, which is one more reason the fill rate here is a floor.
+    pub window_secs: u64,
+    /// Cap on simultaneously tracked simulations. At the cap the **oldest** is evicted and
+    /// recorded `maker_untracked`, never `maker_unfilled`: a capacity limit must not read as
+    /// evidence that quotes do not fill.
+    pub max_concurrent: usize,
+}
+
+impl Default for MakerSimConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_secs: 3_600,
+            max_concurrent: 200,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -719,6 +759,7 @@ impl Default for Config {
             daemon: DaemonConfig::default(),
             lifecycle: LifecycleConfig::default(),
             stream: StreamConfig::default(),
+            maker_sim: MakerSimConfig::default(),
             alerts: AlertConfig::default(),
             storage: StorageConfig::default(),
             dashboard: DashboardConfig::default(),
@@ -968,6 +1009,23 @@ impl Config {
                      — otherwise streaming detects no faster than polling",
                     self.stream.debounce_ms, self.daemon.scan_interval_secs
                 )));
+            }
+        }
+
+        // ---- M8 maker-fill simulation ------------------------------------------------
+        if self.maker_sim.enabled {
+            if self.maker_sim.window_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "maker_sim.window_secs must be > 0 (a zero-length window closes every \
+                     simulation unfilled before a single print can arrive, which would \
+                     report a fill rate of 0% as though it were a measurement)"
+                        .into(),
+                ));
+            }
+            if self.maker_sim.max_concurrent == 0 {
+                return Err(ConfigError::Invalid(
+                    "maker_sim.max_concurrent must be > 0".into(),
+                ));
             }
         }
 

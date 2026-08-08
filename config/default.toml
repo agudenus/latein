@@ -264,6 +264,33 @@ fallback_after_failures = 5
 # fallback is "until proven working again" rather than permanent.
 reprobe_interval_secs = 3600
 
+# ---------------------------------------------------------------------------------
+# M8 — the maker-fill simulator
+# ---------------------------------------------------------------------------------
+#
+# Turns the daily summary's hypothetical maker P&L ("if every resting leg is crossed")
+# into a defensible LOWER bound. When a maker-only opportunity is detected, the simulator
+# records the resting buy orders it implies — one per leg, at the best bid the maker
+# economics were computed from — and assumes we are LAST in that queue: behind the entire
+# size visible at that price. A leg fills only once subsequent SELL trade prints at or
+# through our price total the whole visible queue plus our own size. Cancels ahead of us
+# are never credited (we cannot see them in public data), and a book improving past our
+# level without prints is not a fill.
+#
+# NOTHING IS PLACED. This is arithmetic over trade prints that arrive whether we are here
+# or not; the binary still has no wallet, no key and no order path.
+[maker_sim]
+enabled = true
+# How long a phantom order rests before its window closes and the verdict is written
+# (maker_filled / maker_partial / maker_unfilled), never to be revised. An hour is long
+# enough for a slow politics book to trade through and short enough that the verdict lands
+# in the day it belongs to. It is not a claim about how long we would really leave a live
+# quote out — we would re-price far sooner, which is one more reason this is a floor.
+window_secs = 3600
+# Simultaneously tracked simulations. At the cap the OLDEST is evicted and recorded
+# `maker_untracked` — a missing measurement, deliberately not counted as a non-fill.
+max_concurrent = 200
+
 [alerts]
 enabled = true
 # Minimum net profit per share before an opportunity is alerted (maker net is used for
