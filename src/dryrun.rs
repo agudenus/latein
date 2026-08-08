@@ -46,7 +46,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -55,6 +55,9 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
+// The watchdog's clock, deliberately tokio's: it follows `tokio::time::pause()`, so the
+// stall tests run in microseconds instead of minutes.
+use tokio::time::Instant as TokioInstant;
 
 use crate::alert::{format_opportunity, AlertStats, Alerter, Delivery, EventLog, Priority};
 use crate::clob::ClobClient;
@@ -66,7 +69,10 @@ use crate::store::{
     CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, RuntimeStatus, ScanTotals, Store,
 };
 use crate::types::{BookMap, Opportunity, Side, TokenId, Universe};
-use crate::ws::{self, DirtyBatch, StreamManager, StreamStatsSnapshot, DIVERGENCE_SAMPLE};
+use crate::ws::{
+    self, BookStore, DirtyBatch, StreamHealth, StreamManager, StreamStatsSnapshot,
+    DIVERGENCE_SAMPLE,
+};
 
 /// Phase A is dry-run only. Live execution does not exist yet — not behind a flag, not
 /// behind a feature: there is no order-placing code in this binary.
@@ -128,6 +134,51 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     spawn_signal_handler(shutdown_tx);
 
+    let hb = Arc::new(Heartbeat::new(
+        cfg.clone(),
+        store.clone(),
+        alerter.clone(),
+        DaemonStatus {
+            started_at: Utc::now(),
+            // Until the first REST call proves otherwise, assume nothing: `rest_ok` starts
+            // true so a daemon that has not yet made a request is not reported as blind.
+            rest_ok: true,
+            ..DaemonStatus::default()
+        },
+    ));
+    // Publish once before anything slow starts, so a daemon that spends its first minutes
+    // in discovery is visibly *starting*, not missing.
+    hb.publish(Utc::now());
+    let heartbeat = tokio::spawn(heartbeat_task(hb.clone(), shutdown_rx.clone()));
+
+    // The watchdog is the other half of the same fix: the heartbeat keeps the dashboard
+    // honest about a slow loop, this ends a stuck one. Docker's restart policy does the
+    // reviving — the daemon's job is to stop lying about being alive.
+    let watchdog = (cfg.daemon.watchdog_stall_secs > 0).then(|| {
+        let hb = hb.clone();
+        let stall = Duration::from_secs(cfg.daemon.watchdog_stall_secs);
+        let shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Some(report) = watchdog_task(hb, stall, shutdown).await {
+                tracing::error!(
+                    phase = report.phase,
+                    stalled_for_secs = report.stalled_for_secs,
+                    ticks_completed = report.ticks_completed,
+                    last_progress_at = report
+                        .last_progress_at
+                        .map(crate::store::now_str)
+                        .unwrap_or_else(|| "never".into()),
+                    watchdog_stall_secs = stall.as_secs(),
+                    exit_code = WATCHDOG_EXIT_CODE,
+                    "scan loop made no progress within the watchdog threshold — exiting so a \
+                     restart policy can revive a clean process (set daemon.watchdog_stall_secs \
+                     = 0 to disable)"
+                );
+                std::process::exit(WATCHDOG_EXIT_CODE);
+            }
+        })
+    });
+
     let mut daemon = Daemon {
         cfg: cfg.clone(),
         http,
@@ -137,18 +188,16 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
         shutdown: shutdown_rx,
         trackers: JoinSet::new(),
         last_summary_day: None,
-        status: DaemonStatus {
-            started_at: Utc::now(),
-            // Until the first REST call proves otherwise, assume nothing: `rest_ok` starts
-            // true so a daemon that has not yet made a request is not reported as blind.
-            rest_ok: true,
-            ..DaemonStatus::default()
-        },
-        last_status_publish: None,
+        hb,
         token_events: HashMap::new(),
         gamma: Arc::new(PaginationState::default()),
     };
-    daemon.main_loop(max_cycles).await
+    let result = daemon.main_loop(max_cycles).await;
+    heartbeat.abort();
+    if let Some(watchdog) = watchdog {
+        watchdog.abort();
+    }
+    result
 }
 
 fn spawn_signal_handler(tx: watch::Sender<bool>) {
@@ -185,13 +234,31 @@ async fn wait_for_signal() {
 // Daemon
 // ---------------------------------------------------------------------------------
 
-/// How often the daemon republishes [`RuntimeStatus`] to SQLite (M7).
+/// How often the heartbeat task republishes [`RuntimeStatus`] to SQLite (M7).
 ///
 /// One tiny upsert; at 5 s it is cheaper than a single scan cycle's own telemetry row and
 /// keeps the dashboard's "is it alive" question answerable without the dashboard ever
 /// touching the daemon. The dashboard treats a status older than
 /// [`RUNTIME_STATUS_STALE_SECS`] as "the daemon is not reporting".
 const STATUS_PUBLISH_SECS: u64 = 5;
+
+/// Exit code the progress watchdog uses when it gives up on a wedged scan loop (M7.1).
+///
+/// Distinct and non-zero so a restart policy, a supervisor log or a human can tell a
+/// watchdog restart from a crash, a clean shutdown or an OOM kill. 75 is `EX_TEMPFAIL`:
+/// "the failure is temporary, try again", which is exactly what it means here.
+pub const WATCHDOG_EXIT_CODE: i32 = 75;
+
+/// Loop phases, as published in `runtime_status.last_progress_phase` and named by the
+/// watchdog's ERROR line. Labels only — nothing branches on them.
+const PHASE_STARTUP: &str = "startup";
+const PHASE_DISCOVERY: &str = "discovery";
+const PHASE_SEED_BOOKS: &str = "seed_books";
+const PHASE_REST_SCAN: &str = "rest_scan";
+const PHASE_REST_SWEEP: &str = "rest_sweep";
+const PHASE_RESYNC: &str = "resync_stale";
+const PHASE_STREAM_DETECT: &str = "stream_detect";
+const PHASE_TICK: &str = "tick";
 
 /// The daemon-memory state the dashboard cannot see any other way.
 ///
@@ -216,6 +283,274 @@ struct DaemonStatus {
     markets_with_api_fee: i64,
 }
 
+/// Where the scan loop was when it last finished a unit of work (M7.1).
+///
+/// The point of the record is what it does **not** wait for: it is written when a piece of
+/// work *completes*, not when a tick begins, so a loop that is mid-sweep, mid-retry or
+/// mid-backoff is described honestly by whoever reads it. `last_at` is monotonic (the
+/// watchdog's clock); `last_wall` is its wall-clock twin, because the dashboard renders an
+/// age and cannot read another process's `Instant`.
+#[derive(Debug, Clone, Copy)]
+struct LoopProgress {
+    /// `None` until the first unit of work completes. That is also what keeps the watchdog
+    /// unarmed through the long first discovery-and-seed.
+    last_at: Option<TokioInstant>,
+    last_wall: Option<chrono::DateTime<Utc>>,
+    phase: &'static str,
+    /// Completed full loop iterations.
+    ticks: u64,
+    last_tick_wall: Option<chrono::DateTime<Utc>>,
+}
+
+impl Default for LoopProgress {
+    fn default() -> Self {
+        Self {
+            last_at: None,
+            last_wall: None,
+            phase: PHASE_STARTUP,
+            ticks: 0,
+            last_tick_wall: None,
+        }
+    }
+}
+
+/// The parts of a live [`StreamManager`] the heartbeat can read without touching the loop:
+/// all shared handles, so the numbers are current even while the loop is blocked.
+#[derive(Clone)]
+struct StreamRefs {
+    books: Arc<BookStore>,
+    health: Arc<StreamHealth>,
+    shards: usize,
+}
+
+fn stream_refs(manager: &StreamManager) -> StreamRefs {
+    StreamRefs {
+        books: manager.books().clone(),
+        health: manager.health().clone(),
+        shards: manager.shard_count(),
+    }
+}
+
+/// The daemon's published state, shared with the heartbeat task (M7.1).
+///
+/// Before this existed, `runtime_status` was written *between* loop ticks. That was fine
+/// while a tick was five seconds; at live scale a REST sweep takes 195 s, and during a DNS
+/// outage retries stretched a tick to many minutes — so the dashboard reported
+/// `runtime_status::Stale` ("the daemon stopped reporting") about a daemon that was alive
+/// and working, the Docker healthcheck went unhealthy, and nothing restarted it.
+///
+/// The fix is a separation of concerns, not a faster loop: **the heartbeat says the process
+/// is alive; [`LoopProgress`] says whether the loop is moving.** Both travel in the same
+/// row, and neither can be starved by the other, because the heartbeat task owns its own
+/// timer and reads only shared handles.
+struct Heartbeat {
+    cfg: Arc<Config>,
+    store: Arc<Store>,
+    alerter: Arc<Alerter>,
+    /// Slow-moving daemon state. A `std` mutex, held for a clone and never across an await.
+    status: Mutex<DaemonStatus>,
+    stream: Mutex<Option<StreamRefs>>,
+    progress: Mutex<LoopProgress>,
+}
+
+impl Heartbeat {
+    fn new(cfg: Arc<Config>, store: Arc<Store>, alerter: Arc<Alerter>, status: DaemonStatus) -> Self {
+        Self {
+            cfg,
+            store,
+            alerter,
+            status: Mutex::new(status),
+            stream: Mutex::new(None),
+            progress: Mutex::new(LoopProgress::default()),
+        }
+    }
+
+    /// A poisoned lock here means another task panicked mid-update. The state is still
+    /// structurally sound and going silent is strictly worse than carrying on: publishing a
+    /// slightly odd status beats publishing none, because "none" is read as "the daemon is
+    /// gone".
+    fn with<T, U>(mutex: &Mutex<T>, f: impl FnOnce(&mut T) -> U) -> U {
+        let mut guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut guard)
+    }
+
+    fn update(&self, f: impl FnOnce(&mut DaemonStatus)) {
+        Self::with(&self.status, f);
+    }
+
+    fn set_stream(&self, refs: Option<StreamRefs>) {
+        Self::with(&self.stream, |slot| *slot = refs);
+    }
+
+    /// Record that the loop finished a unit of work. Cheap enough to call per book batch,
+    /// which is the point: progress must be finer-grained than a tick, or a legitimate
+    /// 195 s sweep is indistinguishable from a wedge.
+    fn note(&self, phase: &'static str) {
+        let now = Utc::now();
+        Self::with(&self.progress, |p| {
+            p.last_at = Some(TokioInstant::now());
+            p.last_wall = Some(now);
+            p.phase = phase;
+        });
+    }
+
+    /// Record a completed loop iteration (which is also progress).
+    fn note_tick(&self) {
+        let now = Utc::now();
+        Self::with(&self.progress, |p| {
+            p.last_at = Some(TokioInstant::now());
+            p.last_wall = Some(now);
+            p.phase = PHASE_TICK;
+            p.ticks = p.ticks.saturating_add(1);
+            p.last_tick_wall = Some(now);
+        });
+    }
+
+    fn progress(&self) -> LoopProgress {
+        Self::with(&self.progress, |p| *p)
+    }
+
+    /// Write one [`RuntimeStatus`] row.
+    ///
+    /// Best-effort by design: a failed write is logged at debug and nothing else — losing a
+    /// dashboard refresh must never disturb the daemon. Each lock is taken and released in
+    /// turn (never nested), so this cannot deadlock against the loop.
+    fn publish(&self, now: chrono::DateTime<Utc>) {
+        let stream = Self::with(&self.stream, |s| s.clone());
+        let status = Self::with(&self.status, |s| s.clone());
+        let progress = self.progress();
+
+        let stats = stream
+            .as_ref()
+            .map(|s| s.books.stats.snapshot())
+            .unwrap_or_default();
+        let alerts = self.alerter.stats();
+        let row = RuntimeStatus {
+            mode: self.cfg.mode.clone(),
+            started_at: crate::store::now_str(status.started_at),
+            universe_events: status.universe_events,
+            universe_markets: status.universe_markets,
+            universe_tokens: status.universe_tokens,
+            universe_refreshed_at: status.universe_refreshed_at.map(crate::store::now_str),
+            universe_refresh_secs: self.cfg.daemon.universe_refresh_secs,
+            scan_interval_secs: self.cfg.daemon.scan_interval_secs,
+            last_good_discovery_at: status.last_good_discovery_at.map(crate::store::now_str),
+            discovery_empty_streak: status.discovery_empty_streak,
+            discovery_error: status.discovery_error.clone(),
+            stream_enabled: self.cfg.stream.enabled,
+            stream_shards: stream.as_ref().map(|s| s.shards as i64).unwrap_or(0),
+            stream_shards_connected: stream
+                .as_ref()
+                .map(|s| i64::from(s.health.live_connections()))
+                .unwrap_or(0),
+            stream_rest_only: status.stream_rest_only,
+            books_total: stream.as_ref().map(|s| s.books.len() as i64).unwrap_or(0),
+            books_stale: stream
+                .as_ref()
+                .map(|s| s.books.stale_count() as i64)
+                .unwrap_or(0),
+            frames: stats.messages,
+            delta_entries_applied: stats.delta_entries_applied,
+            frames_unrecognized: stats.frames_unrecognized,
+            trade_prints: stats.trade_prints,
+            last_progress_at: progress.last_wall.map(crate::store::now_str),
+            last_progress_phase: progress.phase.to_string(),
+            ticks_completed: progress.ticks,
+            last_tick_completed_at: progress.last_tick_wall.map(crate::store::now_str),
+            watchdog_stall_secs: self.cfg.daemon.watchdog_stall_secs,
+            rest_ok: status.rest_ok,
+            rest_failure_streak: status.rest_failure_streak,
+            fee_fallback_markets: status.fee_fallback_markets,
+            fee_unsupported_formula: status.fee_unsupported_formula,
+            markets_with_api_fee: status.markets_with_api_fee,
+            telegram_circuit_open: alerts.circuit_open,
+            alerts_sent: alerts.sent,
+            alerts_failed: alerts.failed,
+            alerts_cooldown_held: alerts.cooldown_suppressed,
+            net_floor_default_taker: self
+                .cfg
+                .net_floor_taker(&crate::types::Category::new("default"))
+                .to_string(),
+        };
+        if let Err(err) = self.store.write_runtime_status(&row, now) {
+            tracing::debug!(%err, "could not publish the runtime status row");
+        }
+    }
+}
+
+/// Republish `runtime_status` on its own timer, whatever the scan loop is doing.
+///
+/// This task touches no scan state and takes no lock the loop can hold for long, so a loop
+/// stuck in a 195 s sweep — or in a DNS retry storm — cannot starve it. That is the whole
+/// point: from here on, a stale status row means the *process* is gone, and nothing else.
+async fn heartbeat_task(hb: Arc<Heartbeat>, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(STATUS_PUBLISH_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = ticker.tick() => hb.publish(Utc::now()),
+        }
+    }
+}
+
+/// What the watchdog found when it gave up: the loop's last known position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StallReport {
+    pub phase: &'static str,
+    pub stalled_for_secs: u64,
+    pub ticks_completed: u64,
+    pub last_progress_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// Has the loop stopped making progress? Pure, so every case is a unit test.
+///
+/// `None` — the honest answer — in two situations that are *not* a wedge:
+///
+/// * the loop is progressing, however slowly (a book batch counts);
+/// * the loop has never completed a unit of work yet. At the live universe scale the first
+///   discovery-and-seed is minutes of legitimate work, and killing a daemon for being slow
+///   to start is a restart loop, not a recovery.
+fn stall_verdict(
+    progress: &LoopProgress,
+    now: TokioInstant,
+    stall_after: Duration,
+) -> Option<StallReport> {
+    let last = progress.last_at?;
+    let stalled_for = now.saturating_duration_since(last);
+    (stalled_for >= stall_after).then(|| StallReport {
+        phase: progress.phase,
+        stalled_for_secs: stalled_for.as_secs(),
+        ticks_completed: progress.ticks,
+        last_progress_at: progress.last_wall,
+    })
+}
+
+/// Poll [`stall_verdict`] until it trips or we shut down.
+///
+/// Returns the report rather than acting on it, so the decision is testable and the
+/// process-ending part lives at exactly one call site (see [`run`]).
+async fn watchdog_task(
+    hb: Arc<Heartbeat>,
+    stall_after: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<StallReport> {
+    // Check often enough to react promptly, rarely enough to be free.
+    let every = (stall_after / 10).clamp(Duration::from_millis(50), Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return None,
+            _ = tokio::time::sleep(every) => {}
+        }
+        if *shutdown.borrow() {
+            return None;
+        }
+        if let Some(report) = stall_verdict(&hb.progress(), TokioInstant::now(), stall_after) {
+            return Some(report);
+        }
+    }
+}
+
 struct Daemon {
     cfg: Arc<Config>,
     http: Arc<HttpClient>,
@@ -225,9 +560,8 @@ struct Daemon {
     shutdown: watch::Receiver<bool>,
     trackers: JoinSet<()>,
     last_summary_day: Option<NaiveDate>,
-    /// M7: republished to `runtime_status` every [`STATUS_PUBLISH_SECS`].
-    status: DaemonStatus,
-    last_status_publish: Option<Instant>,
+    /// M7/M7.1: the shared state a separate task republishes to `runtime_status`.
+    hb: Arc<Heartbeat>,
     /// token id → index into `universe.events`. Rebuilt on every universe refresh; this is
     /// what turns "this book moved" into "re-evaluate exactly this event".
     token_events: HashMap<TokenId, usize>,
@@ -302,9 +636,9 @@ impl Daemon {
         } else {
             None
         };
-        // First publication: from here the dashboard can tell a running daemon from a
-        // stopped one, and does so by this row's age.
-        self.publish_status(stream.as_ref(), true);
+        // From here the dashboard can tell a running daemon from a stopped one — by the
+        // row's age for the process, and by `last_progress_at` for the loop.
+        self.transport_changed(stream.as_ref());
 
         let mut ticker =
             tokio::time::interval(Duration::from_secs(self.cfg.daemon.scan_interval_secs));
@@ -336,8 +670,8 @@ impl Daemon {
                         tracing::warn!("the market stream pool stopped — polling REST until a re-probe succeeds");
                         stream = None;
                         fallback_since = Some(Instant::now());
-                        self.status.stream_rest_only = true;
-                        self.publish_status(None, true);
+                        self.hb.update(|s| s.stream_rest_only = true);
+                        self.transport_changed(None);
                         continue;
                     }
                 },
@@ -345,7 +679,6 @@ impl Daemon {
             if *self.shutdown.borrow() {
                 break;
             }
-            self.publish_status(stream.as_ref(), false);
 
             if let Some(batch) = batch {
                 stream_passes += 1;
@@ -364,6 +697,8 @@ impl Daemon {
                         if let Some(manager) = stream.as_mut() {
                             manager.update_universe(&universe.token_ids());
                         }
+                        // A re-plan can change the shard count, which the heartbeat reports.
+                        self.transport_changed(stream.as_ref());
                     }
                     Err(err) => {
                         // Keep scanning the last known universe rather than going blind — and
@@ -417,8 +752,8 @@ impl Daemon {
                 }
                 last_pulse = None;
                 fallback_since = Some(Instant::now());
-                self.status.stream_rest_only = true;
-                self.publish_status(None, true);
+                self.hb.update(|s| s.stream_rest_only = true);
+                self.transport_changed(None);
                 // Take over immediately rather than leaving one scan interval unscanned:
                 // from here on REST *is* the detector.
                 self.scan_cycle(&universe).await;
@@ -445,8 +780,8 @@ impl Daemon {
                                 stream = Some(manager);
                                 fallback_since = None;
                                 last_sweep = Instant::now();
-                                self.status.stream_rest_only = false;
-                                self.publish_status(stream.as_ref(), true);
+                                self.hb.update(|s| s.stream_rest_only = false);
+                                self.transport_changed(stream.as_ref());
                             }
                             Err(err) => tracing::info!(
                                 %err,
@@ -459,6 +794,8 @@ impl Daemon {
                 }
             }
             self.maybe_daily_summary(summary_time).await;
+            // One full iteration behind us: the loop is not merely alive, it is round-tripping.
+            self.hb.note_tick();
 
             cycles += 1;
             if max_cycles.is_some_and(|max| cycles >= max) {
@@ -475,6 +812,7 @@ impl Daemon {
                 deltas = stats.deltas,
                 unknown_frames = stats.unknown_frames,
                 malformed_frames = stats.malformed_frames,
+                trade_prints = stats.trade_prints,
                 orphan_deltas = stats.orphan_deltas,
                 out_of_order = stats.out_of_order,
                 hash_contradictions = stats.hash_contradictions,
@@ -538,7 +876,7 @@ impl Daemon {
                     // Publish before sleeping: a daemon stuck here has no universe at all,
                     // and that is precisely the state the dashboard must take the page over
                     // for rather than render as a quiet market.
-                    self.publish_status(None, true);
+                    self.hb.publish(Utc::now());
                     let wait = discovery_backoff(self.cfg.daemon.scan_interval_secs, attempt);
                     tracing::error!(
                         err = %error_chain(&err),
@@ -563,75 +901,39 @@ impl Daemon {
     /// the dashboard has to answer (M7). Mirrors what [`crate::ws::StreamHealth`] already
     /// records for the fallback decision; this side is only ever read, never acted on.
     fn note_rest(&mut self, ok: bool) {
-        self.status.rest_ok = ok;
-        self.status.rest_failure_streak = if ok {
-            0
-        } else {
-            self.status.rest_failure_streak.saturating_add(1)
-        };
+        self.hb.update(|s| {
+            s.rest_ok = ok;
+            s.rest_failure_streak = if ok {
+                0
+            } else {
+                s.rest_failure_streak.saturating_add(1)
+            };
+        });
     }
 
-    /// Republish [`RuntimeStatus`] if it is due (or `force`d by a state change).
+    /// Point the heartbeat at the current stream pool (or at none) and publish at once.
     ///
-    /// Best-effort by design: a failed status write is logged at debug and nothing else —
-    /// losing a dashboard refresh must never disturb the scan loop.
-    fn publish_status(&mut self, stream: Option<&StreamManager>, force: bool) {
-        let now = Instant::now();
-        let due = self.last_status_publish.is_none_or(|last| {
-            now.duration_since(last) >= Duration::from_secs(STATUS_PUBLISH_SECS)
-        });
-        if !force && !due {
-            return;
-        }
-        self.last_status_publish = Some(now);
+    /// Called on every transport state change, so the dashboard never waits out a heartbeat
+    /// interval to learn about one. The periodic publication is the task's job.
+    fn transport_changed(&self, stream: Option<&StreamManager>) {
+        self.hb.set_stream(stream.map(stream_refs));
+        self.hb.publish(Utc::now());
+    }
 
-        let stats = stream
-            .map(|m| m.books().stats.snapshot())
-            .unwrap_or_default();
-        let alerts = self.alerter.stats();
-        let status = RuntimeStatus {
-            mode: self.cfg.mode.clone(),
-            started_at: crate::store::now_str(self.status.started_at),
-            universe_events: self.status.universe_events,
-            universe_markets: self.status.universe_markets,
-            universe_tokens: self.status.universe_tokens,
-            universe_refreshed_at: self.status.universe_refreshed_at.map(crate::store::now_str),
-            universe_refresh_secs: self.cfg.daemon.universe_refresh_secs,
-            scan_interval_secs: self.cfg.daemon.scan_interval_secs,
-            last_good_discovery_at: self
-                .status
-                .last_good_discovery_at
-                .map(crate::store::now_str),
-            discovery_empty_streak: self.status.discovery_empty_streak,
-            discovery_error: self.status.discovery_error.clone(),
-            stream_enabled: self.cfg.stream.enabled,
-            stream_shards: stream.map(|m| m.shard_count() as i64).unwrap_or(0),
-            stream_shards_connected: stream
-                .map(|m| i64::from(m.health().live_connections()))
-                .unwrap_or(0),
-            stream_rest_only: self.status.stream_rest_only,
-            books_total: stream.map(|m| m.books().len() as i64).unwrap_or(0),
-            books_stale: stream.map(|m| m.books().stale_count() as i64).unwrap_or(0),
-            frames: stats.messages,
-            delta_entries_applied: stats.delta_entries_applied,
-            frames_unrecognized: stats.frames_unrecognized,
-            rest_ok: self.status.rest_ok,
-            rest_failure_streak: self.status.rest_failure_streak,
-            fee_fallback_markets: self.status.fee_fallback_markets,
-            fee_unsupported_formula: self.status.fee_unsupported_formula,
-            markets_with_api_fee: self.status.markets_with_api_fee,
-            telegram_circuit_open: alerts.circuit_open,
-            alerts_sent: alerts.sent,
-            alerts_failed: alerts.failed,
-            alerts_cooldown_held: alerts.cooldown_suppressed,
-            net_floor_default_taker: self
-                .cfg
-                .net_floor_taker(&crate::types::Category::new("default"))
-                .to_string(),
-        };
-        if let Err(err) = self.store.write_runtime_status(&status, Utc::now()) {
-            tracing::debug!(%err, "could not publish the runtime status row");
-        }
+    /// Fetch books, reporting progress on every batch that lands.
+    ///
+    /// The batch — not the sweep — is the unit of progress the watchdog counts. A full sweep
+    /// of the live universe is ~1 500 batches over ~195 s, and a watchdog that only saw
+    /// completed sweeps could not tell that from a wedge.
+    async fn fetch_books_noting_progress(
+        &self,
+        tokens: &[TokenId],
+        phase: &'static str,
+    ) -> Result<BookMap, crate::http::ApiError> {
+        let hb = self.hb.clone();
+        ClobClient::new(&self.http, &self.cfg)
+            .fetch_books_batched(tokens, move |_| hb.note(phase))
+            .await
     }
 
     async fn fetch_universe(&mut self) -> Result<Universe> {
@@ -650,29 +952,44 @@ impl Daemon {
                 // An empty-but-well-formed discovery pass is the failure the break state
                 // exists for, and it is the only one that gets a streak: everything else is
                 // an ordinary error the daemon retries with its previous universe intact.
-                if is_empty_discovery(&err) {
-                    self.status.discovery_empty_streak =
-                        self.status.discovery_empty_streak.saturating_add(1);
-                }
-                self.status.discovery_error = Some(error_chain(&err));
+                let empty = is_empty_discovery(&err);
+                let detail = error_chain(&err);
+                self.hb.update(|s| {
+                    if empty {
+                        s.discovery_empty_streak = s.discovery_empty_streak.saturating_add(1);
+                    }
+                    s.discovery_error = Some(detail);
+                });
+                // A failed pass is still a completed unit of work: the loop is alive and
+                // asking, which is exactly what the watchdog must not kill.
+                self.hb.note(PHASE_DISCOVERY);
                 return Err(err);
             }
         };
-        self.status.discovery_empty_streak = 0;
-        self.status.discovery_error = None;
-        self.status.last_good_discovery_at = Some(Utc::now());
-        self.status.universe_refreshed_at = self.status.last_good_discovery_at;
-        self.status.universe_events = universe.events.len() as i64;
-        self.status.universe_markets = universe.market_count() as i64;
-        self.status.universe_tokens = universe.token_count() as i64;
-        self.status.markets_with_api_fee = stats.markets_with_api_fee as i64;
+        let now = Utc::now();
+        let events = universe.events.len() as i64;
+        let markets = universe.market_count() as i64;
+        let tokens = universe.token_count() as i64;
+        let with_api_fee = stats.markets_with_api_fee as i64;
         // "Fell back to the category table" is everything the API did not state a usable
         // rate for — including the markets whose stated formula this build cannot price.
-        self.status.fee_fallback_markets = (stats
+        let fallback = stats
             .markets_kept
-            .saturating_sub(stats.markets_with_api_fee))
-            as i64;
-        self.status.fee_unsupported_formula = stats.markets_unsupported_fee_formula as i64;
+            .saturating_sub(stats.markets_with_api_fee) as i64;
+        let unsupported = stats.markets_unsupported_fee_formula as i64;
+        self.hb.update(|s| {
+            s.discovery_empty_streak = 0;
+            s.discovery_error = None;
+            s.last_good_discovery_at = Some(now);
+            s.universe_refreshed_at = Some(now);
+            s.universe_events = events;
+            s.universe_markets = markets;
+            s.universe_tokens = tokens;
+            s.markets_with_api_fee = with_api_fee;
+            s.fee_fallback_markets = fallback;
+            s.fee_unsupported_formula = unsupported;
+        });
+        self.hb.note(PHASE_DISCOVERY);
         let partial_negrisk = universe
             .events
             .iter()
@@ -712,8 +1029,8 @@ impl Daemon {
     async fn scan_cycle(&mut self, universe: &Universe) {
         let started = Instant::now();
         let tokens = universe.token_ids();
-        let books = match ClobClient::new(&self.http, &self.cfg)
-            .fetch_books(&tokens)
+        let books = match self
+            .fetch_books_noting_progress(&tokens, PHASE_REST_SCAN)
             .await
         {
             Ok(books) => books,
@@ -798,8 +1115,8 @@ impl Daemon {
     /// any snapshot frame has arrived.
     async fn seed_stream_books(&mut self, manager: &StreamManager, universe: &Universe) {
         let tokens = universe.token_ids();
-        match ClobClient::new(&self.http, &self.cfg)
-            .fetch_books(&tokens)
+        match self
+            .fetch_books_noting_progress(&tokens, PHASE_SEED_BOOKS)
             .await
         {
             Ok(books) => {
@@ -843,6 +1160,7 @@ impl Daemon {
             return;
         }
 
+        self.hb.note(PHASE_STREAM_DETECT);
         let subset = Universe {
             events: dirty
                 .iter()
@@ -897,8 +1215,8 @@ impl Daemon {
         if stale.is_empty() {
             return;
         }
-        match ClobClient::new(&self.http, &self.cfg)
-            .fetch_books(&stale)
+        match self
+            .fetch_books_noting_progress(&stale, PHASE_RESYNC)
             .await
         {
             Ok(books) => {
@@ -953,6 +1271,7 @@ impl Daemon {
         let mut diverged = 0usize;
         let mut sampled = 0usize;
 
+        let hb = self.hb.clone();
         let fetched = ClobClient::new(&self.http, &self.cfg)
             .fetch_books_batched(&tokens, |batch| {
                 let (d, s) =
@@ -961,6 +1280,9 @@ impl Daemon {
                         .count_divergence(batch.books, per_batch, batch.requested_at);
                 diverged += d;
                 sampled += s;
+                // ~1 500 batches over ~195 s at live scale: the sweep is progress all the
+                // way through, not a 195 s silence with a result at the end.
+                hb.note(PHASE_REST_SWEEP);
             })
             .await;
         let books = match fetched {
@@ -1178,6 +1500,9 @@ struct StreamPulse {
 ///   that motivated M6.5 ran at 8 500 frames/s with `price_changes_applied=0`.
 /// * `delta_entries_applied` / `delta_entries_skipped` — level updates that reached a book,
 ///   and those dropped for an unknown asset or an out-of-order frame.
+/// * `trade_prints` — `last_trade_price` frames: recognized, never applied to a book. They
+///   used to inflate `frames_unrecognized` (~4 000 per 5.1 M messages), which is the one
+///   counter that has to mean "the wire format drifted" and nothing else.
 /// * `frames_unrecognized` — parsed, but matched no shape we handle. Non-zero means the
 ///   channel is saying something we do not understand; the first few such payloads are also
 ///   in the log verbatim (see [`ws::BookStore::sample_unrecognized`]).
@@ -1195,6 +1520,7 @@ fn emit_stream_pulse(
             frames_total = stats.messages,
             price_changes_applied_total = stats.deltas,
             delta_entries_applied_total = stats.delta_entries_applied,
+            trade_prints_total = stats.trade_prints,
             frames_unrecognized_total = stats.frames_unrecognized,
             connections,
             "stream data-plane health (first sweep — no rate yet)"
@@ -1214,6 +1540,10 @@ fn emit_stream_pulse(
         delta_entries_skipped = stats
             .delta_entries_skipped
             .saturating_sub(since.delta_entries_skipped),
+        // Recognized and ignored on purpose. It sits next to `frames_unrecognized` so the
+        // two are read together: trade prints climbing is normal, unrecognized climbing is
+        // a wire-format break.
+        trade_prints = stats.trade_prints.saturating_sub(since.trade_prints),
         frames_unrecognized = stats
             .frames_unrecognized
             .saturating_sub(since.frames_unrecognized),

@@ -643,6 +643,7 @@ impl StreamStats {
             deltas: self.deltas.load(Ordering::Relaxed),
             unknown_frames: self.unknown_frames.load(Ordering::Relaxed),
             malformed_frames: self.malformed_frames.load(Ordering::Relaxed),
+            trade_prints: self.trade_prints.load(Ordering::Relaxed),
             frames_unrecognized: self.frames_unrecognized.load(Ordering::Relaxed),
             delta_entries_applied: self.delta_entries_applied.load(Ordering::Relaxed),
             delta_entries_skipped: self.delta_entries_skipped.load(Ordering::Relaxed),
@@ -666,6 +667,7 @@ pub struct StreamStatsSnapshot {
     pub deltas: u64,
     pub unknown_frames: u64,
     pub malformed_frames: u64,
+    pub trade_prints: u64,
     pub frames_unrecognized: u64,
     pub delta_entries_applied: u64,
     pub delta_entries_skipped: u64,
@@ -832,6 +834,12 @@ impl BookStore {
                 entry.bump(received, meta.server_ts);
                 StreamStats::bump(&self.stats.deltas);
                 Some(asset_id.clone())
+            }
+            // A trade print is news about what happened, not about what is resting: no book
+            // is touched, nothing is marked stale, and no token is reported dirty.
+            MarketFrame::TradePrint { .. } => {
+                StreamStats::bump(&self.stats.trade_prints);
+                None
             }
             MarketFrame::Unknown { .. } => {
                 StreamStats::bump(&self.stats.unknown_frames);
@@ -1779,6 +1787,13 @@ async fn handle_payload(
         books.sample_unrecognized(id, text);
     }
     for frame in &frames {
+        if let MarketFrame::TradePrint { asset_id } = frame {
+            tracing::trace!(
+                shard = id,
+                token = asset_id.as_ref().map(|t| t.as_str()).unwrap_or("?"),
+                "trade print ignored — books carry resting depth, not prints"
+            );
+        }
         if let MarketFrame::Unknown { event_type } = frame {
             tracing::debug!(shard = id, event_type, "unknown market frame type ignored");
         }

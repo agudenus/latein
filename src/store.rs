@@ -361,6 +361,30 @@ pub struct RuntimeStatus {
     pub frames: u64,
     pub delta_entries_applied: u64,
     pub frames_unrecognized: u64,
+    /// Recognized-and-ignored `last_trade_price` frames. Separate from
+    /// `frames_unrecognized` on purpose: only the latter means the wire format drifted.
+    pub trade_prints: u64,
+    /// M7.1 — loop progress, published by a heartbeat task that does **not** run inside the
+    /// scan loop. Together with the row's own `updated_at` these separate the two failures
+    /// a single timestamp used to conflate:
+    ///
+    /// * a stale row = the process is gone;
+    /// * a fresh row with an old `last_progress_at` = the process is alive and its loop is
+    ///   stuck (or merely very slow, which is why the threshold is minutes).
+    ///
+    /// `last_progress_at` moves on every finished unit of work — a discovery pass, a book
+    /// batch, a detection pass — so a 195 s REST sweep is progress, not silence.
+    pub last_progress_at: Option<String>,
+    /// What the loop last finished (`rest_sweep`, `discovery`, `stream_detect`, …). The
+    /// "last known position" the watchdog names when it gives up.
+    pub last_progress_phase: String,
+    /// Completed full loop iterations, and when the last one finished.
+    pub ticks_completed: u64,
+    pub last_tick_completed_at: Option<String>,
+    /// `daemon.watchdog_stall_secs`: after this long without progress the daemon exits for
+    /// a restart policy to revive. `0` = watchdog disabled. Carried so the dashboard can
+    /// say what is about to happen rather than guess.
+    pub watchdog_stall_secs: u64,
     /// Did the most recent REST call succeed? With the socket down too, this is what
     /// separates a fallback from a network outage.
     pub rest_ok: bool,
