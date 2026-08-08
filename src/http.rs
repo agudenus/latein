@@ -73,7 +73,12 @@ impl HttpClient {
     pub fn new(cfg: &ApiConfig) -> Result<Self, ApiError> {
         let client = reqwest::Client::builder()
             .user_agent(cfg.user_agent.clone())
+            // Two ceilings, because they bound two different failures (M7.1). `timeout`
+            // covers the whole request; `connect_timeout` covers DNS + TCP + TLS on its
+            // own, which is the phase that stretched to minutes during a live DNS outage
+            // and dragged the daemon's loop tick with it.
             .timeout(Duration::from_secs(cfg.request_timeout_secs))
+            .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
             .build()
             .map_err(|source| ApiError::Build { source })?;
         Ok(Self {

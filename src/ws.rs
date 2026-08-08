@@ -129,6 +129,16 @@ const UNRECOGNIZED_SAMPLE_CHARS: usize = 500;
 /// Keepalive cadence. TODO(verify-live): the public docs mention a client keepalive on the
 /// market channel; we send a WebSocket ping, which any compliant server answers.
 const PING_INTERVAL_SECS: u64 = 10;
+/// Ceiling on one shard's connect attempt — DNS, TCP and the WebSocket handshake together
+/// (M7.1).
+///
+/// `connect_async` has no timeout of its own, so a resolver that never answers parks the
+/// shard task forever: it neither connects nor records a failure, so the health tracker sees
+/// no streak, the daemon never considers a fallback, and the shard is simply gone. A live
+/// DNS outage is exactly that shape. Generous enough for a cold TLS handshake on a slow
+/// link with 294 shards dialling at once, short enough that a dead endpoint returns to the
+/// retry loop — where the backoff and the failure streak can do their job.
+const CONNECT_TIMEOUT_SECS: u64 = 15;
 
 // ---------------------------------------------------------------------------------
 // Frames
@@ -200,6 +210,16 @@ pub enum MarketFrame {
         changes: Vec<LevelChange>,
         meta: FrameMeta,
     },
+    /// A trade print (`last_trade_price`) — **verified live, 2026-08**: a legitimate frame
+    /// carrying `market`, `asset_id`, `price`, `size`, `fee_rate_bps`, `side`, `timestamp`
+    /// and `transaction_hash`.
+    ///
+    /// Recognized and deliberately ignored. It reports what *did* trade, not what is
+    /// resting, so applying it to a book would invent liquidity at a price nobody is
+    /// quoting. Its own counter exists because it used to land in `frames_unrecognized`
+    /// (~4 000 per 5.1 M messages in the first soak) — a permanent non-zero reading on the
+    /// one counter whose job is to say "the wire format has drifted".
+    TradePrint { asset_id: Option<TokenId> },
     /// A frame we understand the shape of but not the type (e.g. `tick_size_change`).
     /// Counted, never fatal.
     Unknown { event_type: String },
@@ -391,6 +411,8 @@ fn classify(item: Value, out: &mut Vec<MarketFrame>) {
             });
         }
         "price_change" => classify_price_change(&raw, event_type, asset_id, meta, out),
+        // Known and ignored on purpose — see [`MarketFrame::TradePrint`].
+        "last_trade_price" => out.push(MarketFrame::TradePrint { asset_id }),
         _ => out.push(MarketFrame::Unknown {
             event_type: if event_type.is_empty() {
                 "(none)".to_string()
@@ -577,6 +599,10 @@ pub struct StreamStats {
     pub deltas: AtomicU64,
     pub unknown_frames: AtomicU64,
     pub malformed_frames: AtomicU64,
+    /// `last_trade_price` frames: recognized, never applied to a book, and explicitly *not*
+    /// unrecognized. Counted so the health line can show that the channel's trade traffic is
+    /// accounted for rather than silently swallowed.
+    pub trade_prints: AtomicU64,
     /// Every frame that parsed as JSON but matched no shape we can use — the sum of
     /// `unknown_frames` and `malformed_frames`, surfaced as one number because *this* is
     /// the number that was silently 4.8 M during the first soak (see the module docs). It
@@ -1568,7 +1594,23 @@ async fn shard_task(
             continue;
         }
 
-        match tokio_tungstenite::connect_async(url.as_str()).await {
+        // A connect that never resolves would strand this shard silently; time it out and
+        // let the ordinary failure path (streak, backoff, the daemon's fallback decision)
+        // handle it like any other refusal.
+        let connect = tokio::time::timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            tokio_tungstenite::connect_async(url.as_str()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no connection within {CONNECT_TIMEOUT_SECS}s (DNS, TCP or handshake)"),
+                ),
+            ))
+        });
+        match connect {
             Ok((socket, _response)) => {
                 health.record_connected();
                 attempt = 0;

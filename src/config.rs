@@ -82,6 +82,15 @@ pub struct ApiConfig {
     pub gamma_base_url: String,
     pub clob_base_url: String,
     pub request_timeout_secs: u64,
+    /// Cap on the connect phase alone — DNS resolution plus TCP plus TLS (M7.1).
+    ///
+    /// `request_timeout_secs` bounds a request that is *making progress badly*; this bounds
+    /// one that has not started at all. A live DNS outage stretched the daemon's loop tick
+    /// to many minutes because every one of ~1 500 book batches sat in resolution before
+    /// failing, and a request that will never connect should give up in seconds, not in
+    /// however long the resolver takes to admit defeat.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
     pub max_retries: u32,
     /// Client-side throttle between HTTP requests to one host.
     pub min_request_interval_ms: u64,
@@ -219,11 +228,17 @@ impl Default for ActivityFloor {
     fn default() -> Self {
         Self {
             enabled: true,
-            // $100 of reported CLOB liquidity. Deliberately low: it is a dust cutoff, not a
-            // tradability test (that is the depth walker's job, on the real book). The
-            // per-trade cap is $50, so a market under $100 reported liquidity is not going
-            // to fill both legs of anything.
-            min_liquidity_usd: Decimal::new(100, 0),
+            // $500 of reported CLOB liquidity (raised from $100, 2026-08).
+            //
+            // It is still a dust cutoff, not a tradability test — that is the depth
+            // walker's job, on the real book. The raise is a scale decision, from live
+            // evidence: at $100 discovery kept 73 450 markets / 146 900 tokens / 294 WS
+            // shards, a full REST sweep of those books took 195 s, and startup opened 294
+            // sockets at once. That is past what a home PC on a domestic connection can
+            // sweep comfortably, and the overhead lands precisely on the markets that can
+            // be traded. The per-trade cap is $50, so nothing under $500 reported liquidity
+            // was going to fill both legs of a reportable construction anyway.
+            min_liquidity_usd: Decimal::new(500, 0),
             // Off by default: liquidity alone is the cleaner signal, and volume is the
             // figure the research says is inflated. Raise it to rescue markets that trade
             // in bursts without resting depth.
@@ -287,6 +302,18 @@ pub struct DaemonConfig {
     pub universe_refresh_secs: u64,
     /// UTC wall-clock time (`HH:MM`) at which the daily summary is generated and alerted.
     pub daily_summary_utc: String,
+    /// Progress watchdog (M7.1): seconds of **no loop progress at all** before the daemon
+    /// logs its last known position at ERROR and exits with
+    /// [`crate::dryrun::WATCHDOG_EXIT_CODE`], so a restart policy can revive it clean. `0`
+    /// disables the watchdog.
+    ///
+    /// "Progress" is any finished unit of work — a discovery pass, a book batch, a
+    /// detection pass, a loop iteration — not a completed tick, so a slow-but-working loop
+    /// (a full REST sweep of 147 000 books takes ~195 s) never trips it. The watchdog is
+    /// also **unarmed until the first unit of work completes**, so the long first
+    /// discovery-and-seed at startup cannot be mistaken for a wedge.
+    #[serde(default = "default_watchdog_stall_secs")]
+    pub watchdog_stall_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +462,20 @@ pub struct DashboardConfig {
     /// Planned soak length, for the "day n of m" eyebrow. Evidence-gathering runs for a
     /// fixed window and the header says how far through it is.
     pub soak_days: u32,
+    /// Seconds without loop progress before the page reports the daemon as *alive but
+    /// stalled* (M7.1). `0` switches that break state off.
+    ///
+    /// It is a different question from `runtime_status` staleness: the heartbeat publishes
+    /// from its own task, so a fresh status row now proves only that the **process** is
+    /// alive. This threshold is what turns "the loop has not finished anything since T"
+    /// into a takeover.
+    ///
+    /// Shipped at half of `daemon.watchdog_stall_secs`, deliberately: a stall is visible on
+    /// the page for ~5 minutes before the watchdog restarts the process, and it sits well
+    /// above the ~195 s a full REST sweep takes at live scale, so a slow-but-progressing
+    /// loop never reaches it.
+    #[serde(default = "default_loop_stall_secs")]
+    pub loop_stall_secs: u64,
 }
 
 impl Default for DashboardConfig {
@@ -445,6 +486,7 @@ impl Default for DashboardConfig {
             window_hours: 24,
             max_rows: 40,
             soak_days: 7,
+            loop_stall_secs: default_loop_stall_secs(),
         }
     }
 }
@@ -490,6 +532,26 @@ fn default_reprobe_interval_secs() -> u64 {
     3_600
 }
 
+/// Ten seconds for DNS + TCP + TLS. Well above a healthy handshake, far below the
+/// request timeout, so a resolver that has stopped answering fails fast instead of
+/// stretching one book batch — and with it the whole loop tick — into minutes.
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+/// Ten minutes of *no progress whatsoever*. A full REST sweep at the live universe scale
+/// (147 000 books) takes ~195 s and reports progress on every batch, so this is roughly
+/// three sweeps' worth of silence: long past "slow", squarely "wedged".
+fn default_watchdog_stall_secs() -> u64 {
+    600
+}
+
+/// Five minutes: half the watchdog's threshold, so the dashboard shows the stall before the
+/// watchdog restarts the process, and still far above a healthy sweep.
+fn default_loop_stall_secs() -> u64 {
+    300
+}
+
 /// 30 minutes: the same slow-moving opportunity is worth one message per half hour.
 fn default_per_event_cooldown_secs() -> u64 {
     1_800
@@ -526,6 +588,7 @@ impl Default for ApiConfig {
             gamma_base_url: "https://gamma-api.polymarket.com".to_string(),
             clob_base_url: "https://clob.polymarket.com".to_string(),
             request_timeout_secs: 20,
+            connect_timeout_secs: default_connect_timeout_secs(),
             max_retries: 3,
             min_request_interval_ms: 120,
             books_batch_size: 100,
@@ -589,6 +652,7 @@ impl Default for DaemonConfig {
             scan_interval_secs: 5,
             universe_refresh_secs: 600,
             daily_summary_utc: "23:55".to_string(),
+            watchdog_stall_secs: default_watchdog_stall_secs(),
         }
     }
 }
@@ -821,11 +885,28 @@ impl Config {
             ));
         }
 
+        if self.api.request_timeout_secs == 0 || self.api.connect_timeout_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "api.request_timeout_secs and api.connect_timeout_secs must be > 0 (a request \
+                 with no ceiling can hang the scan loop indefinitely)"
+                    .into(),
+            ));
+        }
+
         // ---- M3 daemon ---------------------------------------------------------------
         if self.daemon.scan_interval_secs == 0 || self.daemon.universe_refresh_secs == 0 {
             return Err(ConfigError::Invalid(
                 "daemon.scan_interval_secs and daemon.universe_refresh_secs must be > 0".into(),
             ));
+        }
+        // 0 disables the watchdog; anything positive has to leave room for one full REST
+        // sweep, or the watchdog restarts a daemon that was merely busy.
+        if self.daemon.watchdog_stall_secs > 0 && self.daemon.watchdog_stall_secs < 60 {
+            return Err(ConfigError::Invalid(format!(
+                "daemon.watchdog_stall_secs must be 0 (disabled) or >= 60 (got {}); a shorter \
+                 threshold restarts a daemon that is merely slow",
+                self.daemon.watchdog_stall_secs
+            )));
         }
         self.daily_summary_time()?;
         if self.lifecycle.repoll_interval_secs == 0 || self.lifecycle.repoll_window_secs == 0 {
@@ -962,6 +1043,17 @@ impl Config {
                  m\")"
                     .into(),
             ));
+        }
+        // 0 switches the stall break state off. A positive value below the scan interval
+        // would report every ordinary tick as a stall.
+        if self.dashboard.loop_stall_secs > 0
+            && self.dashboard.loop_stall_secs <= self.daemon.scan_interval_secs
+        {
+            return Err(ConfigError::Invalid(format!(
+                "dashboard.loop_stall_secs ({}) must be 0 (off) or well above \
+                 daemon.scan_interval_secs ({}); otherwise a healthy loop reads as stalled",
+                self.dashboard.loop_stall_secs, self.daemon.scan_interval_secs
+            )));
         }
         Ok(())
     }
