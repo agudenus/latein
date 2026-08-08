@@ -12,6 +12,7 @@ mod detect;
 mod dryrun;
 mod gamma;
 mod http;
+mod makersim;
 mod risk;
 mod store;
 #[cfg(test)]

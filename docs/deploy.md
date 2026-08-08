@@ -707,14 +707,44 @@ from arbitrage you could have taken.
       on a biased subsample and understates or overstates accordingly.
 - [ ] **unresolved** should be small. It counts rows orphaned by a restart.
 
-**Simulated P&L — both views.** From `## Simulated P&L`.
+**Simulated P&L — three views, three bases.** From `## Simulated P&L`.
 
 - [ ] **Taker P&L** — credited only where the fills genuinely survived. Treat this as the
       realistic ceiling of what Phase A would have earned, minus execution slippage and
       failures that a dry run cannot simulate.
+- [ ] **Maker P&L, simulated lower bound** (M8) — maker-only constructions whose every
+      leg's queue *demonstrably* traded through, us included, assuming we were last in that
+      queue. See the next block. This is the floor.
 - [ ] **Maker P&L (hypothetical)** — assumes every resting quote gets crossed, which is
       optimistic by construction. It is an upper bound on a *different* strategy, not a
       better estimate of the same one. Never compare it directly against the taker figure.
+
+The report prints the ordering explicitly: **lower bound ≤ the real maker P&L ≤ if always
+filled.** Two of those three numbers are bounds; none of them is a forecast.
+
+**Maker fills (simulated, last-in-queue).** From `## Maker fills`, and the reason M8 exists:
+the hypothetical alone cannot answer the Phase B question, because a maker number that
+assumes perfect fills is a number about a market we have not tested.
+
+- [ ] **Fill rate.** Expect it to be *low* — the rule refuses cancels ahead of us, refuses
+      partial fills, and assumes the worst queue position available. A fill rate of **zero**
+      across a whole week is itself a clean result: it says our quotes would sit at prices
+      the market never traded through, and the maker strategy is a theory with no fills.
+- [ ] **Maker P&L lower bound vs. the hypothetical.** The ratio is the honest discount on
+      the headline maker number. If the bound is a rounding error against the hypothetical,
+      the maker case rests entirely on fills nobody has evidence for.
+- [ ] **Legging exposure from partials.** Capital that would have sat in half-built
+      positions. In a *live* maker bot this is the risk that has to be managed, and this is
+      the first measurement of how often it would occur.
+- [ ] **`no_print_feed` sims** must be ~0. Those windows had no trade-print feed (REST-only
+      fallback), so their `maker_unfilled` verdicts are holes in the measurement, not
+      evidence. A week with many of them measured the network, not the market.
+- [ ] **`untracked` sims** must be ~0, for the same reason as the lifecycle's: a
+      `maker_sim.max_concurrent` eviction means the fill rate is measured on a subsample.
+- [ ] Read the bound knowing what it still cannot see: **our own order would have changed
+      the queue** it is queued in, partial fills count as no fill, and the window
+      (`maker_sim.window_secs`, 1 h) is far longer than a live quote would rest — which
+      cuts *against* pessimism and is the one assumption here that flatters the number.
 
 **Capital.** From `## Capital`.
 
@@ -745,8 +775,9 @@ abort-and-unwind on partial fills, a full risk manager, and real money in a hot 
 
 - Persistence p50 is in the low seconds — fix the data path (WebSocket) before building
   execution, or you will build a bot that is always late.
-- Nearly everything is maker-only — that is a different, harder project than the one
-  scoped.
+- Nearly everything is maker-only **and** the simulated maker fill rate is at or near zero
+  — that is a different, harder project than the one scoped, and the one measurement we
+  have says the quotes would not have been hit.
 - Opportunities are near zero on a demonstrably healthy scanner — the honest answer is
   that this edge has been competed away, and the week cost you a few euros to find out.
 - Part B turned up a broken assumption — re-run the soak after fixing it. Do not make a

@@ -100,7 +100,17 @@ pub struct Hero {
     /// Opportunities whose walked fills were still there at the first re-poll.
     pub survivors: i64,
     /// Simulated net edge at walked size, **maker basis**. Never added to a taker figure.
+    ///
+    /// This is the *ceiling*: it assumes every resting leg is crossed. It sits next to
+    /// [`Hero::maker_lower_bound`] with both labels visible, because the pair is the finding
+    /// and either number alone is a misreading.
     pub net_edge_maker: String,
+    /// M8 — the *floor*: maker P&L from simulations whose every leg's queue demonstrably
+    /// traded through, last-in-queue, from trade prints only.
+    pub maker_lower_bound: String,
+    /// `filled / (filled + partial + unfilled)` over the window's closed simulations.
+    /// `None` when nothing has closed yet — which is not a zero.
+    pub maker_fill_rate_pct: Option<String>,
     pub median_net_maker_bps: Option<String>,
     pub median_net_taker_bps: Option<String>,
     pub latency_p50_ms: Option<i64>,
@@ -375,6 +385,7 @@ pub fn build(
     let window = Duration::hours(cfg.dashboard.window_hours as i64);
     let from = now - window;
     let rows = store.opportunities_since(from, MAX_WINDOW_ROWS)?;
+    let sims = store.maker_sims_since(from, MAX_WINDOW_ROWS)?;
     let scan = store.scan_totals_since(from)?;
     let stored_rows = store.opportunity_row_count()?;
     let first_hour = store.first_scan_hour()?;
@@ -397,6 +408,14 @@ pub fn build(
                 .filter_map(|r| r.simulated_pnl_maker)
                 .sum::<Decimal>(),
         ),
+        // M8. Summed from the simulator's own credited column — never re-derived from a
+        // status here, because the daemon decided what each simulation pays exactly once.
+        maker_lower_bound: money(
+            sims.iter()
+                .filter_map(|s| s.pnl_lower_bound)
+                .sum::<Decimal>(),
+        ),
+        maker_fill_rate_pct: maker_fill_rate(&sims),
         median_net_maker_bps: median_bps(&rows, |r| r.net_maker).map(signed),
         median_net_taker_bps: median_bps(&rows, |r| Some(r.net_taker)).map(signed),
         latency_p50_ms: percentile_i64(&latencies(&rows), 50),
@@ -451,7 +470,13 @@ pub fn build(
         opportunities,
         opportunity_note,
         net_floor_pct: floor_pct(status),
-        pipeline: pipeline(status, stored_rows, now, cfg.dashboard.loop_stall_secs),
+        pipeline: pipeline(
+            status,
+            stored_rows,
+            now,
+            cfg.dashboard.loop_stall_secs,
+            maker_fill_rate(&sims).as_deref(),
+        ),
         categories,
         crypto_zero,
         log: log_lines(&rows),
@@ -630,11 +655,26 @@ fn verdict_display(status: &str) -> &str {
 
 // ---- rail ------------------------------------------------------------------------
 
+/// Share of closed simulations in which **every** leg filled.
+///
+/// `maker_untracked` is in neither the numerator nor the denominator: it is a simulation the
+/// concurrency cap threw away before it could answer, and counting it as a non-fill would
+/// turn a capacity limit into a finding about the market.
+fn maker_fill_rate(sims: &[crate::store::MakerSimRow]) -> Option<String> {
+    let resolved = sims
+        .iter()
+        .filter(|s| s.status != "maker_untracked")
+        .count() as i64;
+    let filled = sims.iter().filter(|s| s.status == "maker_filled").count() as i64;
+    (resolved > 0).then(|| pct_of(filled, resolved))
+}
+
 fn pipeline(
     status: Option<&RuntimeStatus>,
     stored_rows: i64,
     now: DateTime<Utc>,
     loop_stall_secs: u64,
+    maker_fill_rate_pct: Option<&str>,
 ) -> Vec<PipelineRow> {
     let Some(s) = status else {
         return vec![PipelineRow {
@@ -731,6 +771,32 @@ fn pipeline(
         },
         name: "Fee model fallback",
         value: format!("{} markets → table", thousands(s.fee_fallback_markets)),
+    });
+
+    // M8. Open simulations live only in the daemon's memory (the table holds closed ones),
+    // so the count comes from `runtime_status` and the rate from the window's closed rows.
+    // A `warn` dot means the simulator is tracking queues while no print feed is running —
+    // it can only ever conclude "unfilled" in that state, which is not a measurement.
+    rows.push(if s.maker_sim_enabled {
+        PipelineRow {
+            dot: if s.maker_sims_open > 0 && !s.maker_sim_print_feed_live {
+                "warn"
+            } else {
+                "ok"
+            },
+            name: "Maker sims",
+            value: format!(
+                "{} open · fill rate {}",
+                thousands(s.maker_sims_open),
+                maker_fill_rate_pct.unwrap_or("n/a")
+            ),
+        }
+    } else {
+        PipelineRow {
+            dot: "warn",
+            name: "Maker sims",
+            value: "disabled in config".into(),
+        }
     });
 
     rows.push(PipelineRow {

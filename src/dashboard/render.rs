@@ -161,9 +161,9 @@ fn hero(s: &DashboardState) -> String {
   </div>
   <div class="vrule"></div>
   <div class="stat">
-    <div class="kpil">Simulated net edge</div>
-    <div class="stat-v num" data-key="hero.net_edge_maker">{edge}</div>
-    <div class="stat-n">at walked size · maker basis, hypothetical</div>
+    <div class="kpil">Simulated maker P&amp;L</div>
+    <div class="stat-v num" data-key="hero.maker_lower_bound">{lower}</div>
+    <div class="stat-n">sim lower bound (last in queue) · <span class="num" data-key="hero.net_edge_maker">{edge}</span> if always filled</div>
   </div>
   <div class="stat">
     <div class="kpil">Median net maker</div>
@@ -179,6 +179,7 @@ fn hero(s: &DashboardState) -> String {
         day = h.soak_day,
         days = h.soak_days,
         survivors = h.survivors,
+        lower = esc(&h.maker_lower_bound),
         edge = esc(&h.net_edge_maker),
         maker = opt(&h.median_net_maker_bps),
         taker = opt(&h.median_net_taker_bps),

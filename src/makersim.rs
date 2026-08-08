@@ -78,6 +78,13 @@ use crate::ws::{PrintObserver, TradePrint, TradeSide};
 /// How a simulation ended. Written once, at close, and never revised — the same discipline
 /// the opportunity lifecycle follows, and for the same reason: a verdict that can improve
 /// with hindsight is not a measurement.
+///
+/// The `Maker` prefix is kept on every variant deliberately (hence the `allow`): these names
+/// are written to the database and read back by the report and the dashboard, and
+/// `maker_filled` next to `filled_simulated` is the whole point — one is a simulated maker
+/// fill, the other a taker construction that was still on the book. A bare `Filled` would
+/// invite exactly the conflation this milestone exists to prevent.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SimStatus {
@@ -195,8 +202,13 @@ impl Sim {
         // P&L is credited on exactly one status, and legging exposure on exactly one other.
         // Anything else reports the counts and no money at all.
         let pnl_lower_bound = (status == SimStatus::MakerFilled).then_some(self.net_maker_total);
-        let legging_exposure = (status == SimStatus::MakerPartial)
-            .then(|| self.legs.iter().filter(|l| l.is_filled()).map(PlacedLeg::cost).sum());
+        let legging_exposure = (status == SimStatus::MakerPartial).then(|| {
+            self.legs
+                .iter()
+                .filter(|l| l.is_filled())
+                .map(PlacedLeg::cost)
+                .sum()
+        });
         let time_to_fill_ms = (status == SimStatus::MakerFilled)
             .then(|| self.legs.iter().filter_map(|l| l.fill_ms).max())
             .flatten();
@@ -458,7 +470,8 @@ impl MakerSimulator {
             let Some(oldest) = inner.sims.keys().next().copied() else {
                 break;
             };
-            if let Some(closed) = Self::remove(&mut inner, oldest, now, Some(SimStatus::MakerUntracked))
+            if let Some(closed) =
+                Self::remove(&mut inner, oldest, now, Some(SimStatus::MakerUntracked))
             {
                 self.untracked.fetch_add(1, Ordering::Relaxed);
                 evicted = Some(Box::new(closed));
@@ -468,7 +481,11 @@ impl MakerSimulator {
         let id = inner.next_id;
         inner.next_id += 1;
         for leg in &sim.legs {
-            inner.index.entry(leg.token_id.clone()).or_default().push(id);
+            inner
+                .index
+                .entry(leg.token_id.clone())
+                .or_default()
+                .push(id);
         }
         inner.sims.insert(id, sim);
         drop(inner);
@@ -835,8 +852,9 @@ mod tests {
     fn a_partial_credits_nothing_and_records_its_legging_exposure() {
         let sim = MakerSimulator::new(&cfg(600, 200));
         live(&sim);
-        sim.open(7, &maker_only_op(), &books(dec!(0), dec!(50)), t(0));
-        sim.observe_at(&sell("1001", dec!(0.47), dec!(100)), t(5));
+        sim.open(7, &maker_only_op(), &books(dec!(10), dec!(50)), t(0));
+        // 10 ahead + our 100 = 110 through the level, so leg 1001 fills; 1002 never trades.
+        sim.observe_at(&sell("1001", dec!(0.47), dec!(110)), t(5));
 
         sim.expire(t(601));
         let closed = sim.drain_closed();
@@ -999,6 +1017,39 @@ mod tests {
             Opened::No(NotOpened::Disabled)
         );
         assert_eq!(off.open_count(), 0);
+    }
+
+    /// The seam, end to end: a raw `last_trade_price` payload off the wire, through the
+    /// frame parser and the book store, into a fill.
+    ///
+    /// Every other test here calls [`MakerSimulator::observe_at`] directly, which proves the
+    /// rule but not the plumbing — and the plumbing is where M6.5 went wrong (4.8 M frames
+    /// parsed, zero applied). One leg, 10 resting ahead of us, our 100: the 110-share print
+    /// below completes the queue exactly.
+    #[test]
+    fn a_raw_wire_payload_reaches_the_simulator_and_fills_a_leg() {
+        let sim = std::sync::Arc::new(MakerSimulator::new(&cfg(3_600, 200)));
+        live(&sim);
+        let mut op = maker_only_op();
+        op.legs.truncate(1);
+        op.net_maker_total = Some(dec!(5.30));
+        sim.open(1, &op, &books(dec!(10), dec!(10)), Utc::now());
+
+        let store = crate::ws::BookStore::new();
+        store.set_print_observer(Some(sim.clone()));
+        let payload = r#"{"event_type":"last_trade_price","market":"0x5f65","asset_id":"1001",
+             "price":"0.47","size":"110","side":"SELL","timestamp":"1757908892351",
+             "transaction_hash":"0xfeed"}"#;
+        for frame in crate::ws::parse_frames(payload).expect("parse") {
+            store.apply_frame(&frame, Instant::now());
+        }
+
+        let closed = sim.drain_closed();
+        assert_eq!(closed.len(), 1, "the print must have closed the simulation");
+        assert_eq!(closed[0].status, SimStatus::MakerFilled);
+        assert_eq!(closed[0].pnl_lower_bound, Some(dec!(5.30)));
+        assert_eq!(closed[0].legs[0].volume_through, dec!(110));
+        assert_eq!(store.stats.snapshot().trade_prints_usable, 1);
     }
 
     /// A vanished event closes its simulations where they stand, rather than waiting out a

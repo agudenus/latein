@@ -65,8 +65,10 @@ use crate::config::{Config, REPORTED_CATEGORIES};
 use crate::detect;
 use crate::gamma::{GammaClient, PaginationState};
 use crate::http::HttpClient;
+use crate::makersim::{MakerSimulator, NotOpened, Opened};
 use crate::store::{
-    CycleStats, LifecycleOutcome, LifecycleStatus, OpportunityRow, RuntimeStatus, ScanTotals, Store,
+    CycleStats, LifecycleOutcome, LifecycleStatus, MakerSimRow, OpportunityRow, RuntimeStatus,
+    ScanTotals, Store,
 };
 use crate::types::{BookMap, Opportunity, Side, TokenId, Universe};
 use crate::ws::{
@@ -134,10 +136,23 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     spawn_signal_handler(shutdown_tx);
 
+    // M8. Created here, before anything else, so the simulator's `Arc` is the same one the
+    // heartbeat reads and the stream pool feeds — there is exactly one of these per process.
+    let maker_sim = Arc::new(MakerSimulator::new(&cfg.maker_sim));
+    if maker_sim.enabled() {
+        tracing::info!(
+            window_secs = cfg.maker_sim.window_secs,
+            max_concurrent = cfg.maker_sim.max_concurrent,
+            "maker-fill simulation on: maker-only opportunities are simulated as resting \
+             orders LAST in their queue, from trade prints only. No order is placed."
+        );
+    }
+
     let hb = Arc::new(Heartbeat::new(
         cfg.clone(),
         store.clone(),
         alerter.clone(),
+        maker_sim.clone(),
         DaemonStatus {
             started_at: Utc::now(),
             // Until the first REST call proves otherwise, assume nothing: `rest_ok` starts
@@ -189,6 +204,7 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
         trackers: JoinSet::new(),
         last_summary_day: None,
         hb,
+        maker_sim,
         token_events: HashMap::new(),
         gamma: Arc::new(PaginationState::default()),
     };
@@ -347,6 +363,9 @@ struct Heartbeat {
     cfg: Arc<Config>,
     store: Arc<Store>,
     alerter: Arc<Alerter>,
+    /// M8. Read-only from here: the heartbeat publishes the simulator's live counts so the
+    /// dashboard can show open simulations, which exist only in this process's memory.
+    maker_sim: Arc<MakerSimulator>,
     /// Slow-moving daemon state. A `std` mutex, held for a clone and never across an await.
     status: Mutex<DaemonStatus>,
     stream: Mutex<Option<StreamRefs>>,
@@ -358,12 +377,14 @@ impl Heartbeat {
         cfg: Arc<Config>,
         store: Arc<Store>,
         alerter: Arc<Alerter>,
+        maker_sim: Arc<MakerSimulator>,
         status: DaemonStatus,
     ) -> Self {
         Self {
             cfg,
             store,
             alerter,
+            maker_sim,
             status: Mutex::new(status),
             stream: Mutex::new(None),
             progress: Mutex::new(LoopProgress::default()),
@@ -432,6 +453,7 @@ impl Heartbeat {
             .map(|s| s.books.stats.snapshot())
             .unwrap_or_default();
         let alerts = self.alerter.stats();
+        let sims = self.maker_sim.stats();
         let row = RuntimeStatus {
             mode: self.cfg.mode.clone(),
             started_at: crate::store::now_str(status.started_at),
@@ -474,6 +496,16 @@ impl Heartbeat {
             alerts_sent: alerts.sent,
             alerts_failed: alerts.failed,
             alerts_cooldown_held: alerts.cooldown_suppressed,
+            maker_sim_enabled: self.maker_sim.enabled(),
+            maker_sim_window_secs: self.maker_sim.window_secs(),
+            maker_sims_open: sims.open_now as i64,
+            maker_sims_opened: sims.opened,
+            maker_sims_filled: sims.filled,
+            maker_sims_partial: sims.partial,
+            maker_sims_unfilled: sims.unfilled,
+            maker_sims_untracked: sims.untracked,
+            maker_sim_prints_matched: sims.prints_matched,
+            maker_sim_print_feed_live: self.maker_sim.print_feed_live(),
             net_floor_default_taker: self
                 .cfg
                 .net_floor_taker(&crate::types::Category::new("default"))
@@ -569,6 +601,9 @@ struct Daemon {
     last_summary_day: Option<NaiveDate>,
     /// M7/M7.1: the shared state a separate task republishes to `runtime_status`.
     hb: Arc<Heartbeat>,
+    /// M8: the maker-fill simulator. The daemon opens simulations and persists closed ones;
+    /// the stream's socket tasks feed it prints through [`ws::PrintObserver`].
+    maker_sim: Arc<MakerSimulator>,
     /// token id → index into `universe.events`. Rebuilt on every universe refresh; this is
     /// what turns "this book moved" into "re-evaluate exactly this event".
     token_events: HashMap<TokenId, usize>,
@@ -701,6 +736,13 @@ impl Daemon {
                     Ok(fresh) => {
                         universe = fresh;
                         self.index_universe(&universe);
+                        // A simulation whose book left the universe can never be resolved by
+                        // a print again: close it where it stands (M8).
+                        if self.maker_sim.enabled() {
+                            let live: std::collections::HashSet<TokenId> =
+                                universe.token_ids().into_iter().collect();
+                            self.maker_sim.retain_tokens(&live, Utc::now());
+                        }
                         if let Some(manager) = stream.as_mut() {
                             manager.update_universe(&universe.token_ids());
                         }
@@ -726,6 +768,10 @@ impl Daemon {
             let mut hand_over = false;
             match stream.as_ref() {
                 Some(manager) => {
+                    // A pool with no live connection is not a print feed, whatever the
+                    // transport pill says: no socket, no prints, no evidence (M8).
+                    self.maker_sim
+                        .set_print_feed(manager.health().live_connections() > 0);
                     // Cheap every tick: anything explicitly stale or behind a shard gap.
                     self.resync_stale(manager, &universe, stale_after).await;
                     // Slow and thorough: the whole universe over REST, a divergence
@@ -800,6 +846,9 @@ impl Daemon {
                     }
                 }
             }
+            // Close and persist whatever the maker simulator finished with this tick. Before
+            // the summary, so a verdict reached in this tick is in the day it belongs to.
+            self.maker_sim_tick(Utc::now()).await;
             self.maybe_daily_summary(summary_time).await;
             // One full iteration behind us: the loop is not merely alive, it is round-tripping.
             self.hb.note_tick();
@@ -830,6 +879,25 @@ impl Daemon {
                 "market stream stopping"
             );
             manager.stop().await;
+        }
+
+        // Every simulation still open gets its verdict written from what the tape had shown
+        // by now — usually `maker_unfilled`. Losing them silently would quietly delete the
+        // denominator of the fill rate.
+        if self.maker_sim.enabled() {
+            self.maker_sim.set_print_feed(false);
+            self.maker_sim.close_all(Utc::now());
+            self.persist_closed_sims().await;
+            let sims = self.maker_sim.stats();
+            tracing::info!(
+                opened = sims.opened,
+                filled = sims.filled,
+                partial = sims.partial,
+                unfilled = sims.unfilled,
+                untracked = sims.untracked,
+                prints_matched = sims.prints_matched,
+                "maker-fill simulation stopping"
+            );
         }
 
         self.drain_trackers().await;
@@ -923,8 +991,120 @@ impl Daemon {
     /// Called on every transport state change, so the dashboard never waits out a heartbeat
     /// interval to learn about one. The periodic publication is the task's job.
     fn transport_changed(&self, stream: Option<&StreamManager>) {
+        // M8. The simulator eats trade prints, and trade prints only exist on the socket. A
+        // pool that is (re)built gets the observer installed on its fresh `BookStore`;
+        // handing detection to REST turns the feed off, which flags every open simulation as
+        // having a hole in its window rather than letting it close as an honest non-fill.
+        match stream {
+            Some(manager) => {
+                manager
+                    .books()
+                    .set_print_observer(Some(self.maker_sim.clone()));
+                self.maker_sim.set_print_feed(true);
+            }
+            None => self.maker_sim.set_print_feed(false),
+        }
         self.hb.set_stream(stream.map(stream_refs));
         self.hb.publish(Utc::now());
+    }
+
+    /// Close whatever the maker simulator has finished with, and persist it.
+    ///
+    /// Called from the loop, never from a socket task: prints are applied where they arrive
+    /// (cheaply, under one mutex), and the SQLite writes their verdicts imply happen here.
+    async fn maker_sim_tick(&mut self, now: chrono::DateTime<Utc>) {
+        if !self.maker_sim.enabled() {
+            return;
+        }
+        self.maker_sim.expire(now);
+        self.persist_closed_sims().await;
+    }
+
+    async fn persist_closed_sims(&mut self) {
+        for sim in self.maker_sim.drain_closed() {
+            match self.store.record_maker_sim(&sim) {
+                Ok(id) => tracing::info!(
+                    maker_sim_id = id,
+                    opportunity_id = sim.opportunity_id,
+                    status = sim.status.as_str(),
+                    legs = format!("{}/{}", sim.legs_filled, sim.legs_total),
+                    prints_observed = sim.prints_observed,
+                    pnl_lower_bound = %sim.pnl_lower_bound.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
+                    no_print_feed = sim.no_print_feed,
+                    "maker-fill simulation closed (simulated — no order was ever placed)"
+                ),
+                Err(err) => tracing::warn!(
+                    %err,
+                    opportunity_id = sim.opportunity_id,
+                    "could not persist a maker-fill simulation"
+                ),
+            }
+            self.alerter.events().append(
+                "maker_sim_close",
+                json!({
+                    "opportunity_id": sim.opportunity_id,
+                    "status": sim.status.as_str(),
+                    "legs_total": sim.legs_total,
+                    "legs_filled": sim.legs_filled,
+                    "net_maker_total": sim.net_maker_total,
+                    "pnl_lower_bound": sim.pnl_lower_bound,
+                    "legging_exposure": sim.legging_exposure,
+                    "prints_observed": sim.prints_observed,
+                    "time_to_fill_ms": sim.time_to_fill_ms,
+                    "no_print_feed": sim.no_print_feed,
+                    "event_slug": sim.event_slug,
+                    "kind": sim.kind,
+                    "category": sim.category,
+                    "opened_at": crate::store::now_str(sim.opened_at),
+                    "closed_at": crate::store::now_str(sim.closed_at),
+                    "legs": sim.legs,
+                }),
+            );
+        }
+    }
+
+    /// Start a maker-fill simulation for a newly detected maker-only opportunity.
+    fn open_maker_sim(
+        &self,
+        id: i64,
+        op: &Opportunity,
+        books: &BookMap,
+        now: chrono::DateTime<Utc>,
+    ) {
+        match self.maker_sim.open(id, op, books, now) {
+            Opened::Yes { legs, evicted } => {
+                if let Some(evicted) = &evicted {
+                    tracing::warn!(
+                        opportunity_id = evicted.opportunity_id,
+                        limit = self.cfg.maker_sim.max_concurrent,
+                        "maker-sim capacity reached — evicting the oldest simulation as \
+                         untracked (a missing measurement, not a non-fill)"
+                    );
+                }
+                self.alerter.events().append(
+                    "maker_sim_open",
+                    json!({
+                        "opportunity_id": id,
+                        "legs": legs,
+                        "window_secs": self.cfg.maker_sim.window_secs,
+                        "net_maker_total": op.net_maker_total,
+                        "event_slug": op.event_slug,
+                        "kind": op.kind.as_str(),
+                        "category": op.category.as_str(),
+                        "print_feed_live": self.maker_sim.print_feed_live(),
+                    }),
+                );
+            }
+            // Nothing here is an error; each is a reason a construction is not the kind of
+            // thing this measurement applies to. `NoVisibleLevel` is the one worth a line:
+            // it means the book moved between detection and this call.
+            Opened::No(NotOpened::NoVisibleLevel) => tracing::debug!(
+                opportunity_id = id,
+                "no maker simulation: the bid level we would have joined is not in the book \
+                 we detected on"
+            ),
+            Opened::No(_) => {}
+        }
     }
 
     /// Fetch books, reporting progress on every batch that lands.
@@ -1105,6 +1285,9 @@ impl Daemon {
             match self.store.record_opportunity(op, books, now, latency) {
                 Ok(recorded) if recorded.is_new() => {
                     new_opportunities += 1;
+                    // M8: one simulation per *row*, so a construction re-detected at the same
+                    // quotes does not open a second phantom order at the same price.
+                    self.open_maker_sim(recorded.id(), op, books, now);
                     self.on_new_opportunity(recorded.id(), op, latency).await;
                 }
                 Ok(recorded) => {
@@ -1525,6 +1708,7 @@ fn emit_stream_pulse(
             price_changes_applied_total = stats.deltas,
             delta_entries_applied_total = stats.delta_entries_applied,
             trade_prints_total = stats.trade_prints,
+            trade_prints_usable_total = stats.trade_prints_usable,
             frames_unrecognized_total = stats.frames_unrecognized,
             connections,
             "stream data-plane health (first sweep — no rate yet)"
@@ -1544,10 +1728,15 @@ fn emit_stream_pulse(
         delta_entries_skipped = stats
             .delta_entries_skipped
             .saturating_sub(since.delta_entries_skipped),
-        // Recognized and ignored on purpose. It sits next to `frames_unrecognized` so the
-        // two are read together: trade prints climbing is normal, unrecognized climbing is
-        // a wire-format break.
+        // Applied to no book on purpose. It sits next to `frames_unrecognized` so the two
+        // are read together: trade prints climbing is normal, unrecognized climbing is a
+        // wire-format break. `trade_prints_usable` is the subset carrying a token, a price
+        // and a size — the only prints the maker simulator can treat as evidence, so a gap
+        // between the two is a gap in that measurement (M8).
         trade_prints = stats.trade_prints.saturating_sub(since.trade_prints),
+        trade_prints_usable = stats
+            .trade_prints_usable
+            .saturating_sub(since.trade_prints_usable),
         frames_unrecognized = stats
             .frames_unrecognized
             .saturating_sub(since.frames_unrecognized),
@@ -1787,6 +1976,84 @@ pub struct DailySummary {
     pub capped_rows: usize,
     pub scan: ScanTotals,
     pub alerts: Option<AlertStats>,
+    /// M8 — the simulated maker fills. Kept as its own struct, and rendered in its own
+    /// section, because merging it into either P&L number above would destroy the one thing
+    /// it is for: the three figures have three different bases.
+    pub maker_sim: MakerSimSummary,
+}
+
+/// The maker-fill simulator's day, aggregated (M8).
+///
+/// Read this next to [`DailySummary::pnl_taker`] and
+/// [`DailySummary::pnl_maker_hypothetical`] and never inside them:
+///
+/// * `pnl_taker` — opportunities we sized as a **taker** whose fills were still on the book
+///   at the first re-poll. Observed in the book, not in the tape.
+/// * `pnl_lower_bound` — maker-only constructions whose every leg's queue *demonstrably*
+///   traded through, us included, from trade prints. A floor.
+/// * `pnl_maker_hypothetical` — the same maker constructions assuming every resting leg is
+///   crossed. A ceiling.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MakerSimSummary {
+    /// Whether the simulator ran at all. `false` = the section reports "not measured", which
+    /// is not the same statement as a 0% fill rate.
+    pub enabled: bool,
+    /// Simulations opened on this day that reached a verdict.
+    pub opened: usize,
+    pub filled: usize,
+    pub partial: usize,
+    pub unfilled: usize,
+    pub untracked: usize,
+    /// `filled / (filled + partial + unfilled)`. Untracked rows are excluded from both parts
+    /// — a capacity eviction is a missing measurement, not a non-fill.
+    pub fill_rate_pct: Option<Decimal>,
+    /// **The lower bound.** Sum of `net_maker_total` over fully filled simulations only.
+    pub pnl_lower_bound: Decimal,
+    /// Capital the partials would have left sitting in half-built positions.
+    pub legging_exposure: Decimal,
+    pub median_time_to_fill_ms: Option<i64>,
+    /// Verdicts reached in a window that contained no trade-print feed (REST-only). These
+    /// are holes in the measurement, and the report says so rather than counting them as
+    /// evidence that quotes do not fill.
+    pub no_print_feed: usize,
+    /// Trade prints that touched a level we were queued at.
+    pub prints_observed: i64,
+}
+
+/// Aggregate the day's closed simulations. Pure, so the arithmetic is unit-testable.
+pub fn summarize_maker_sims(enabled: bool, rows: &[MakerSimRow]) -> MakerSimSummary {
+    let mut out = MakerSimSummary {
+        enabled,
+        opened: rows.len(),
+        ..MakerSimSummary::default()
+    };
+    let mut fill_times: Vec<i64> = Vec::new();
+    for row in rows {
+        match row.status.as_str() {
+            "maker_filled" => out.filled += 1,
+            "maker_partial" => out.partial += 1,
+            "maker_untracked" => out.untracked += 1,
+            _ => out.unfilled += 1,
+        }
+        // Money is credited from the row's own column, never re-derived from the status: the
+        // daemon decided what this simulation pays, once, and this only adds it up.
+        out.pnl_lower_bound += row.pnl_lower_bound.unwrap_or(Decimal::ZERO);
+        out.legging_exposure += row.legging_exposure.unwrap_or(Decimal::ZERO);
+        out.prints_observed += row.prints_observed;
+        if row.no_print_feed {
+            out.no_print_feed += 1;
+        }
+        if let Some(ms) = row.time_to_fill_ms {
+            fill_times.push(ms);
+        }
+    }
+    fill_times.sort_unstable();
+    out.median_time_to_fill_ms = quantile(&fill_times, 50);
+    let resolved = out.filled + out.partial + out.unfilled;
+    out.fill_rate_pct = (resolved > 0).then(|| {
+        (Decimal::from(out.filled) * Decimal::ONE_HUNDRED / Decimal::from(resolved)).round_dp(1)
+    });
+    out
 }
 
 /// Build the summary. Pure over its inputs, so the arithmetic is unit-testable.
@@ -1893,6 +2160,7 @@ pub fn summarize(
         capped_rows,
         scan,
         alerts: None,
+        maker_sim: MakerSimSummary::default(),
     }
 }
 
@@ -1946,6 +2214,75 @@ impl DailySummary {
             self.vanished,
             usd(self.pnl_taker)
         )
+    }
+
+    /// The M8 section. Its own heading, its own numbers, and a statement of what the rule
+    /// refuses to credit — because a fill rate is only meaningful next to the assumption
+    /// that produced it.
+    fn maker_sim_markdown(&self) -> String {
+        let m = &self.maker_sim;
+        let mut out = String::from("\n## Maker fills (simulated, last-in-queue)\n\n");
+        if !m.enabled {
+            out.push_str(
+                "- **not measured**: `maker_sim.enabled = false`. This is an absence of \
+                 measurement, not a fill rate of zero, and no lower bound is claimed below.\n",
+            );
+            return out;
+        }
+        if m.opened == 0 {
+            out.push_str(
+                "- no maker-only opportunity reached a verdict today, so there is nothing to \
+                 bound. A day with no maker-only rows produces no simulations.\n",
+            );
+            return out;
+        }
+        out.push_str(&format!(
+            "- sims opened: **{}** · filled: {} · partial: {} · unfilled: {} · untracked: {}\n",
+            m.opened, m.filled, m.partial, m.unfilled, m.untracked
+        ));
+        out.push_str(&format!(
+            "- fill rate: {} (untracked sims are excluded from both sides — a capacity \
+             eviction is a missing measurement, not a non-fill)\n",
+            m.fill_rate_pct
+                .map(|p| format!("{p}%"))
+                .unwrap_or_else(|| "n/a".into())
+        ));
+        out.push_str(&format!(
+            "- **maker P&L lower bound (filled sims only): ${:.2}**\n",
+            usd(m.pnl_lower_bound)
+        ));
+        out.push_str(&format!(
+            "- legging exposure from partials: ${:.2} — capital the filled legs would have \
+             committed to positions whose remaining legs never came\n",
+            usd(m.legging_exposure)
+        ));
+        out.push_str(&format!(
+            "- median time to fill: {}\n- trade prints observed at a level we were queued at: {}\n",
+            fmt_opt_ms(m.median_time_to_fill_ms),
+            m.prints_observed
+        ));
+        if m.no_print_feed > 0 {
+            out.push_str(&format!(
+                "- **{} sim(s) closed with no trade-print feed** (REST-only fallback for part \
+                 or all of the window). Those windows contain no evidence either way and \
+                 should not be read as non-fills.\n",
+                m.no_print_feed
+            ));
+        }
+        out.push_str(
+            "\nThe rule: when a maker-only opportunity is detected we record the resting buy \
+             each leg implies, at the best bid the maker economics were computed from, and \
+             assume we are **last in that queue** — behind the entire size visible at that \
+             price. A leg fills only once subsequent SELL prints at or through our price \
+             total that whole queue *plus* our own size. Cancels ahead of us are never \
+             credited, and a book improving past our level without prints is not a fill. \
+             Every one of those refusals pushes the number down, which is why it is a lower \
+             bound and not an estimate. What it still cannot see: our own order would itself \
+             have changed the queue (it is information, and it can attract, deter or be \
+             stepped in front of), partial fills are counted as no fill at all, and no order \
+             was ever placed — this is arithmetic over prints that arrived anyway.\n",
+        );
+        out
     }
 
     pub fn to_markdown(&self) -> String {
@@ -2051,15 +2388,44 @@ impl DailySummary {
                 .unwrap_or_else(|| "n/a".into())
         ));
 
+        out.push_str(&self.maker_sim_markdown());
+
         out.push_str("\n## Simulated P&L\n\n");
         out.push_str(&format!(
             "- taker (credited only for taker-sized fills): **${:.2}**\n",
             usd(self.pnl_taker)
         ));
+        if self.maker_sim.enabled {
+            out.push_str(&format!(
+                "- maker, simulated lower bound (last-in-queue, filled sims only): **${:.2}**\n",
+                usd(self.maker_sim.pnl_lower_bound)
+            ));
+        } else {
+            out.push_str(
+                "- maker, simulated lower bound: not measured (`maker_sim.enabled = false`)\n",
+            );
+        }
         out.push_str(&format!(
             "- maker view (hypothetical — assumes every resting leg is crossed): ${:.2}\n",
             usd(self.pnl_maker_hypothetical)
         ));
+        if self.maker_sim.enabled {
+            out.push_str(&format!(
+                "\nThree numbers, three bases, never added together. The maker truth lies \
+                 between the other two: **${:.2} (lower bound) ≤ the real maker P&L ≤ ${:.2} \
+                 (if always filled)** — the bound is what the tape proves, the hypothetical is \
+                 what perfect fills would pay, and the taker figure (${:.2}) is a different \
+                 construction entirely.\n",
+                usd(self.maker_sim.pnl_lower_bound),
+                usd(self.pnl_maker_hypothetical),
+                usd(self.pnl_taker),
+            ));
+        } else {
+            out.push_str(
+                "\nWith the simulator off there is only a ceiling here: the maker view assumes \
+                 every resting leg is crossed and nothing bounds it from below.\n",
+            );
+        }
 
         out.push_str("\n## Capital\n\n");
         out.push_str(&format!(
@@ -2130,7 +2496,11 @@ pub async fn emit_daily_summary(
     let scan = store
         .scan_totals_for_day(day)
         .context("could not read the day's scan stats")?;
+    let sims = store
+        .maker_sims_for_day(day)
+        .context("could not read the day's maker-fill simulations")?;
     let mut summary = summarize(day, &rows, scan, cfg.risk.per_trade_cap_usd);
+    summary.maker_sim = summarize_maker_sims(cfg.maker_sim.enabled, &sims);
     summary.alerts = Some(alerter.stats());
     let markdown = summary.to_markdown();
 
@@ -2146,7 +2516,11 @@ pub async fn emit_daily_summary(
         "filled": summary.filled,
         "vanished": summary.vanished,
         "pnl_taker": summary.pnl_taker,
+        "pnl_maker_lower_bound": summary.maker_sim.pnl_lower_bound,
         "pnl_maker_hypothetical": summary.pnl_maker_hypothetical,
+        "maker_sims_opened": summary.maker_sim.opened,
+        "maker_sims_filled": summary.maker_sim.filled,
+        "maker_sim_fill_rate_pct": summary.maker_sim.fill_rate_pct,
         "report_path": path.display().to_string(),
     });
     if send {
@@ -2215,10 +2589,12 @@ mod tests {
         let store = Arc::new(Store::open(Path::new(&cfg.storage.database_path)).expect("store"));
         let events = Arc::new(EventLog::open(Path::new(&cfg.storage.log_dir)).expect("log"));
         let alerter = Arc::new(Alerter::new(&cfg.alerts, events));
+        let maker_sim = Arc::new(MakerSimulator::new(&cfg.maker_sim));
         let hb = Arc::new(Heartbeat::new(
             Arc::new(cfg),
             store.clone(),
             alerter,
+            maker_sim,
             DaemonStatus {
                 started_at: Utc::now(),
                 rest_ok: true,
@@ -2657,6 +3033,135 @@ mod tests {
         assert!(md.contains("hypothetical"));
         assert!(md.contains("| binary_yes_no | politics | 1 |"));
         assert!(md.contains("taker (credited only for taker-sized fills): **$1.00**"));
+    }
+
+    // -- M8: the maker-fill section --------------------------------------------------
+
+    fn sim_row(
+        id: i64,
+        status: &str,
+        pnl: Option<Decimal>,
+        exposure: Option<Decimal>,
+    ) -> MakerSimRow {
+        MakerSimRow {
+            id,
+            opportunity_id: id,
+            event_slug: format!("e{id}"),
+            kind: "binary_yes_no".into(),
+            category: "politics".into(),
+            legs_total: 2,
+            legs_filled: match status {
+                "maker_filled" => 2,
+                "maker_partial" => 1,
+                _ => 0,
+            },
+            net_maker_total: dec!(7.00),
+            pnl_lower_bound: pnl,
+            legging_exposure: exposure,
+            prints_observed: 4,
+            time_to_fill_ms: (status == "maker_filled").then_some(12_000 * id),
+            status: status.into(),
+            no_print_feed: false,
+            opened_at: "2026-07-26T09:00:00.000Z".into(),
+            closed_at: "2026-07-26T10:00:00.000Z".into(),
+        }
+    }
+
+    /// The aggregation, hand-computed.
+    ///
+    /// Two filled at $7.00 each → **$14.00** lower bound. One partial → $47.00 exposure and
+    /// nothing credited. Fill rate is 2 of 4 *resolved* — the untracked eviction is in
+    /// neither part — so **50%**. Fill times 12 000 and 24 000 ms → nearest-rank p50 = 12 000.
+    #[test]
+    fn the_maker_sim_summary_counts_credits_and_excludes_untracked() {
+        let rows = vec![
+            sim_row(1, "maker_filled", Some(dec!(7.00)), None),
+            sim_row(2, "maker_filled", Some(dec!(7.00)), None),
+            sim_row(3, "maker_partial", None, Some(dec!(47.00))),
+            sim_row(4, "maker_unfilled", None, None),
+            sim_row(5, "maker_untracked", None, None),
+        ];
+        let m = summarize_maker_sims(true, &rows);
+        assert_eq!(m.opened, 5);
+        assert_eq!((m.filled, m.partial, m.unfilled, m.untracked), (2, 1, 1, 1));
+        assert_eq!(m.pnl_lower_bound, dec!(14.00));
+        assert_eq!(m.legging_exposure, dec!(47.00));
+        assert_eq!(m.fill_rate_pct, Some(dec!(50.0)));
+        assert_eq!(m.median_time_to_fill_ms, Some(12_000));
+        assert_eq!(m.prints_observed, 20);
+
+        // Off is not zero: a disabled simulator claims no bound at all.
+        let off = summarize_maker_sims(false, &[]);
+        assert!(!off.enabled);
+        assert_eq!(off.fill_rate_pct, None);
+        assert_eq!(off.pnl_lower_bound, Decimal::ZERO);
+    }
+
+    /// (h) The report shows three P&L numbers with three labels, never merged, plus the one
+    /// sentence that orders them.
+    #[test]
+    fn the_report_keeps_the_lower_bound_the_truth_and_the_hypothetical_apart() {
+        let rows = vec![row(
+            1,
+            "binary_yes_no",
+            "politics",
+            dec!(0.01),
+            "filled_simulated",
+            Some(1_000),
+            dec!(50),
+        )];
+        let mut s = summarize(day(), &rows, ScanTotals::default(), dec!(50));
+        s.maker_sim = summarize_maker_sims(
+            true,
+            &[
+                sim_row(1, "maker_filled", Some(dec!(7.00)), None),
+                sim_row(2, "maker_partial", None, Some(dec!(47.00))),
+                sim_row(3, "maker_unfilled", None, None),
+            ],
+        );
+        let md = s.to_markdown();
+
+        // The section, with its counts and its money.
+        assert!(md.contains("## Maker fills (simulated, last-in-queue)"));
+        assert!(md.contains("sims opened: **3** · filled: 1 · partial: 1 · unfilled: 1"));
+        assert!(md.contains("fill rate: 33.3%"));
+        assert!(md.contains("**maker P&L lower bound (filled sims only): $7.00**"));
+        assert!(md.contains("legging exposure from partials: $47.00"));
+        assert!(md.contains("median time to fill: 12.0s"));
+
+        // Three numbers, three labels, in the one place they appear together.
+        assert!(md.contains("taker (credited only for taker-sized fills): **$1.00**"));
+        assert!(md
+            .contains("maker, simulated lower bound (last-in-queue, filled sims only): **$7.00**"));
+        assert!(
+            md.contains("maker view (hypothetical — assumes every resting leg is crossed): $2.00")
+        );
+        assert!(
+            md.contains("**$7.00 (lower bound) ≤ the real maker P&L ≤ $2.00 (if always filled)**")
+        );
+        // The assumption that produced the bound is stated wherever the bound is.
+        assert!(md.contains("last in that queue"));
+        assert!(md.contains("Cancels ahead of us are never credited"));
+
+        // A day with the simulator off says so instead of reporting a 0% fill rate.
+        let mut off = summarize(day(), &rows, ScanTotals::default(), dec!(50));
+        off.maker_sim = summarize_maker_sims(false, &[]);
+        let md = off.to_markdown();
+        assert!(md.contains("**not measured**: `maker_sim.enabled = false`"));
+        assert!(
+            !md.contains("**maker P&L lower bound (filled sims only)"),
+            "a simulator that never ran must not report a bound of $0.00"
+        );
+
+        // A window with no print feed is flagged in the report rather than counted as
+        // evidence that quotes do not fill.
+        let mut blind = summarize(day(), &rows, ScanTotals::default(), dec!(50));
+        let mut sim = sim_row(1, "maker_unfilled", None, None);
+        sim.no_print_feed = true;
+        blind.maker_sim = summarize_maker_sims(true, &[sim]);
+        assert!(blind
+            .to_markdown()
+            .contains("**1 sim(s) closed with no trade-print feed**"));
     }
 
     /// A category that saw nothing is still a finding. Crypto in particular must appear at
@@ -3115,6 +3620,7 @@ mod tests {
                 delta_entries_applied: 40,
                 delta_entries_skipped: 1,
                 trade_prints: 500,
+                trade_prints_usable: 480,
                 frames_unrecognized: 2,
                 delta_top_mismatch: 3,
                 ..StreamStatsSnapshot::default()
@@ -3127,6 +3633,7 @@ mod tests {
             delta_entries_applied: 240,
             delta_entries_skipped: 8,
             trade_prints: 1_500,
+            trade_prints_usable: 1_460,
             frames_unrecognized: 11,
             delta_top_mismatch: 4,
             ..StreamStatsSnapshot::default()
@@ -3146,8 +3653,10 @@ mod tests {
             "snapshots_applied=4",
             "delta_entries_applied=200",
             "delta_entries_skipped=7",
-            // Recognized-and-ignored trade prints, next to the counter they used to inflate.
+            // Trade prints, next to the counter they used to inflate — and the subset the
+            // maker simulator can actually use as evidence of a fill.
             "trade_prints=1000",
+            "trade_prints_usable=980",
             "frames_unrecognized=9",
             "delta_top_mismatch=1",
             "connections=177",
@@ -3161,6 +3670,7 @@ mod tests {
         // are landing at all — that is the whole point of it.
         assert!(log.contains("delta_entries_applied_total=240"), "{log}");
         assert!(log.contains("trade_prints_total=1500"), "{log}");
+        assert!(log.contains("trade_prints_usable_total=1460"), "{log}");
         assert!(log.contains("frames_unrecognized_total=11"), "{log}");
     }
 

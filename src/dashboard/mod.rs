@@ -95,7 +95,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
     anyhow::ensure!(
         version >= DASHBOARD_MIN_SCHEMA,
         "{} is at schema v{version}, but the dashboard needs v{DASHBOARD_MIN_SCHEMA} \
-         (runtime_status + funnel counters). Run `polyarb run` once to migrate it — the \
+         (runtime_status + funnel counters + maker_sims). Run `polyarb run` once to \
+         migrate it — the \
          dashboard opens the file read-only and cannot migrate anything itself.",
         path.display()
     );

@@ -142,15 +142,58 @@ ALTER TABLE scan_stats ADD COLUMN gaps_detected INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE scan_stats ADD COLUMN fee_survivors INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// M8 — the maker-fill simulator's measurement rows.
+///
+/// One row per *closed* simulation, and only per closed one: a simulation in flight has no
+/// verdict, and a row that could be revised is not the kind of evidence this table exists to
+/// hold. (The live count of open simulations travels in `runtime_status`, which is
+/// explicitly the daemon's volatile memory.) A process killed mid-window therefore loses its
+/// open simulations — the honest outcome, since none of them ever reached a verdict.
+///
+/// `legs_json` carries the whole placement snapshot per leg — price, the size visible ahead
+/// of us at placement, our own size — plus that leg's fill state and the number of prints
+/// that touched it. It is what makes the verdict re-derivable, and what would let a future
+/// run re-score the same soak under a *different* queue assumption without re-collecting
+/// anything.
+///
+/// Money is TEXT here as everywhere: `pnl_lower_bound` is credited only on `maker_filled`,
+/// `legging_exposure` only on `maker_partial`, and both are NULL otherwise rather than 0 —
+/// "not applicable" and "zero" are different facts.
+const SCHEMA_V4: &str = r#"
+CREATE TABLE maker_sims (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    opportunity_id   INTEGER NOT NULL REFERENCES opportunities(id),
+    event_slug       TEXT    NOT NULL,
+    kind             TEXT    NOT NULL,
+    category         TEXT    NOT NULL,
+    legs_json        TEXT    NOT NULL,
+    legs_total       INTEGER NOT NULL,
+    legs_filled      INTEGER NOT NULL,
+    net_maker_total  TEXT    NOT NULL,
+    pnl_lower_bound  TEXT,
+    legging_exposure TEXT,
+    prints_observed  INTEGER NOT NULL,
+    time_to_fill_ms  INTEGER,
+    status           TEXT    NOT NULL,
+    no_print_feed    INTEGER NOT NULL,
+    opened_at        TEXT    NOT NULL,
+    closed_at        TEXT    NOT NULL
+);
+CREATE INDEX idx_maker_sims_opened_at ON maker_sims(opened_at);
+CREATE INDEX idx_maker_sims_status    ON maker_sims(status);
+"#;
+
 /// `(version, name, ddl)`. Append-only: never edit a shipped migration.
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial schema", SCHEMA_V1),
     (2, "detection latency", SCHEMA_V2),
     (3, "runtime status and funnel counters", SCHEMA_V3),
+    (4, "maker fill simulations", SCHEMA_V4),
 ];
 
-/// The schema version the dashboard needs to read (`runtime_status` + funnel counters).
-pub const DASHBOARD_MIN_SCHEMA: i64 = 3;
+/// The schema version the dashboard needs to read (`runtime_status` + funnel counters, and
+/// since M8 the `maker_sims` table it reads the maker lower bound from).
+pub const DASHBOARD_MIN_SCHEMA: i64 = 4;
 
 // ---------------------------------------------------------------------------------
 // Lifecycle
@@ -315,6 +358,35 @@ pub struct DashboardRow {
     pub simulated_pnl_maker: Option<Decimal>,
 }
 
+/// One closed maker-fill simulation, read back for the report and the dashboard (M8).
+///
+/// The per-leg placement snapshot stays in the database as JSON; nothing that aggregates
+/// these rows needs it, and re-parsing it here would put a re-derivable detail in front of
+/// every reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MakerSimRow {
+    pub id: i64,
+    pub opportunity_id: i64,
+    pub event_slug: String,
+    pub kind: String,
+    pub category: String,
+    pub legs_total: i64,
+    pub legs_filled: i64,
+    pub net_maker_total: Decimal,
+    /// Credited only on `maker_filled`. This — summed — is the maker P&L lower bound.
+    pub pnl_lower_bound: Option<Decimal>,
+    /// Only on `maker_partial`: what the legs that *did* fill would have cost.
+    pub legging_exposure: Option<Decimal>,
+    pub prints_observed: i64,
+    pub time_to_fill_ms: Option<i64>,
+    pub status: String,
+    /// The window contained time with no trade-print feed, so an unfilled verdict on this
+    /// row is an absence of evidence, not evidence of absence.
+    pub no_print_feed: bool,
+    pub opened_at: String,
+    pub closed_at: String,
+}
+
 /// Scan telemetry summed over an arbitrary window of hourly buckets (dashboard funnel).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WindowScanTotals {
@@ -397,6 +469,24 @@ pub struct RuntimeStatus {
     pub alerts_sent: u64,
     pub alerts_failed: u64,
     pub alerts_cooldown_held: u64,
+    /// M8 — the maker-fill simulator's live state. Simulations in flight exist only in the
+    /// daemon's memory (only closed ones reach `maker_sims`), so this is the only way a
+    /// reader can see them at all.
+    pub maker_sim_enabled: bool,
+    pub maker_sim_window_secs: u64,
+    pub maker_sims_open: i64,
+    pub maker_sims_opened: u64,
+    pub maker_sims_filled: u64,
+    pub maker_sims_partial: u64,
+    pub maker_sims_unfilled: u64,
+    pub maker_sims_untracked: u64,
+    /// Trade prints that moved a tracked queue. Zero while the simulator is tracking
+    /// something is the signal that the prints are not arriving — which is a different
+    /// finding from "our quotes do not fill".
+    pub maker_sim_prints_matched: u64,
+    /// Whether a trade-print feed is running at all. False in REST-only fallback, where no
+    /// simulation can fill and every verdict is flagged `no_print_feed`.
+    pub maker_sim_print_feed_live: bool,
     /// `scan.floors.default.taker` as an exact decimal string — the "net floor" the
     /// opportunity table's note quotes. A string, because it is money.
     pub net_floor_default_taker: String,
@@ -707,6 +797,128 @@ impl Store {
         )
         .map_err(|e| self.err(e))?;
         Ok(())
+    }
+
+    /// Persist one **closed** maker-fill simulation (M8).
+    ///
+    /// Insert-only, by design: there is no update path, so a verdict cannot be revised by
+    /// any code that exists. The row is written once, when the window closed.
+    pub fn record_maker_sim(&self, sim: &crate::makersim::ClosedSim) -> Result<i64> {
+        let legs_json = serde_json::to_string(&sim.legs).unwrap_or_else(|_| "[]".to_string());
+        let conn = self.lock();
+        conn.query_row(
+            "INSERT INTO maker_sims (
+                 opportunity_id, event_slug, kind, category, legs_json, legs_total,
+                 legs_filled, net_maker_total, pnl_lower_bound, legging_exposure,
+                 prints_observed, time_to_fill_ms, status, no_print_feed, opened_at, closed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             RETURNING id",
+            params![
+                sim.opportunity_id,
+                sim.event_slug,
+                sim.kind,
+                sim.category,
+                legs_json,
+                sim.legs_total as i64,
+                sim.legs_filled as i64,
+                dec(sim.net_maker_total),
+                sim.pnl_lower_bound.map(dec),
+                sim.legging_exposure.map(dec),
+                sim.prints_observed as i64,
+                sim.time_to_fill_ms,
+                sim.status.as_str(),
+                sim.no_print_feed as i64,
+                now_str(sim.opened_at),
+                now_str(sim.closed_at),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|e| self.err(e))
+    }
+
+    /// Closed simulations opened on `day` (UTC), oldest first — the daily summary's basis.
+    ///
+    /// Keyed on `opened_at`, not `closed_at`, so a simulation belongs to the day whose
+    /// market conditions produced it. A window that straddles midnight is therefore counted
+    /// on the day it started, which is also the day its opportunity row is on.
+    pub fn maker_sims_for_day(&self, day: NaiveDate) -> Result<Vec<MakerSimRow>> {
+        let (from, to) = day_bounds(day);
+        self.maker_sims_where(
+            "opened_at >= ?1 AND opened_at < ?2 ORDER BY opened_at ASC, id ASC",
+            params![from, to],
+        )
+    }
+
+    /// Closed simulations opened at or after `from`, newest first (the dashboard window).
+    pub fn maker_sims_since(&self, from: DateTime<Utc>, limit: usize) -> Result<Vec<MakerSimRow>> {
+        self.maker_sims_where(
+            "opened_at >= ?1 ORDER BY opened_at DESC, id DESC LIMIT ?2",
+            params![now_str(from), limit as i64],
+        )
+    }
+
+    fn maker_sims_where(
+        &self,
+        predicate: &str,
+        args: impl rusqlite::Params,
+    ) -> Result<Vec<MakerSimRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, opportunity_id, event_slug, kind, category, legs_total,
+                        legs_filled, net_maker_total, pnl_lower_bound, legging_exposure,
+                        prints_observed, time_to_fill_ms, status, no_print_feed,
+                        opened_at, closed_at
+                 FROM maker_sims WHERE {predicate}"
+            ))
+            .map_err(|e| self.err(e))?;
+        let raw = stmt
+            .query_map(args, |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, i64>(13)? != 0,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
+                ))
+            })
+            .map_err(|e| self.err(e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| self.err(e))?;
+
+        raw.into_iter()
+            .map(|r| {
+                Ok(MakerSimRow {
+                    id: r.0,
+                    opportunity_id: r.1,
+                    event_slug: r.2,
+                    kind: r.3,
+                    category: r.4,
+                    legs_total: r.5,
+                    legs_filled: r.6,
+                    net_maker_total: parse_dec("net_maker_total", &r.7)?,
+                    pnl_lower_bound: parse_opt_dec("pnl_lower_bound", r.8.as_deref())?,
+                    legging_exposure: parse_opt_dec("legging_exposure", r.9.as_deref())?,
+                    prints_observed: r.10,
+                    time_to_fill_ms: r.11,
+                    status: r.12,
+                    no_print_feed: r.13,
+                    opened_at: r.14,
+                    closed_at: r.15,
+                })
+            })
+            .collect()
     }
 
     /// Fold one scan cycle into its UTC-hour bucket (low cardinality: 24 rows/day).
@@ -1437,6 +1649,121 @@ pub(crate) mod tests {
             )
             .expect("pragma");
         assert_eq!(columns, 1);
+    }
+
+    /// (g) M8 — migration v4 is idempotent, and a closed simulation round-trips with its
+    /// money intact as exact decimal strings.
+    #[test]
+    fn maker_sims_migrate_idempotently_and_round_trip() {
+        use crate::makersim::{ClosedSim, PlacedLeg, SimStatus};
+        use crate::types::TokenId;
+        use chrono::{Duration, TimeZone};
+
+        let store = Store::in_memory().expect("db");
+        store.migrate().expect("second migrate");
+        store.migrate().expect("third migrate");
+        assert_eq!(store.schema_version().expect("version"), 4);
+
+        // The FK is real: a simulation belongs to an opportunity row.
+        let opportunity_id = store
+            .record_opportunity(&sample_opportunity(), &sample_books(), Utc::now(), None)
+            .expect("insert")
+            .id();
+
+        let opened = Utc.with_ymd_and_hms(2026, 8, 8, 9, 0, 0).unwrap();
+        let leg = |token: &str, price, visible, filled| PlacedLeg {
+            token_id: TokenId::new(token),
+            price,
+            visible_size: visible,
+            our_size: d!(100),
+            volume_through: if filled { visible + d!(100) } else { d!(3) },
+            prints_observed: if filled { 2 } else { 1 },
+            filled_at: filled.then_some(opened + Duration::seconds(12)),
+            fill_ms: filled.then_some(12_000),
+        };
+        let sim = ClosedSim {
+            opportunity_id,
+            event_slug: "an-event".into(),
+            kind: "binary_yes_no".into(),
+            category: "politics".into(),
+            legs: vec![
+                leg("1001", d!(0.47), d!(250), true),
+                leg("1002", d!(0.46), d!(80), false),
+            ],
+            legs_total: 2,
+            legs_filled: 1,
+            net_maker_total: d!(7.00),
+            pnl_lower_bound: None,
+            legging_exposure: Some(d!(47.00)),
+            prints_observed: 3,
+            time_to_fill_ms: None,
+            status: SimStatus::MakerPartial,
+            no_print_feed: false,
+            opened_at: opened,
+            closed_at: opened + Duration::seconds(3_600),
+        };
+        let id = store.record_maker_sim(&sim).expect("insert sim");
+        assert!(id > 0);
+
+        let rows = store
+            .maker_sims_for_day(opened.date_naive())
+            .expect("read back");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.opportunity_id, opportunity_id);
+        assert_eq!(row.status, "maker_partial");
+        assert_eq!(row.legs_filled, 1);
+        assert_eq!(row.legs_total, 2);
+        assert_eq!(row.net_maker_total, d!(7.00));
+        assert_eq!(row.pnl_lower_bound, None, "a partial credits nothing");
+        assert_eq!(row.legging_exposure, Some(d!(47.00)));
+        assert_eq!(row.prints_observed, 3);
+        assert!(!row.no_print_feed);
+
+        // Money is TEXT, never REAL: an f64 round trip is exactly how 47.00 becomes
+        // 46.999999999999996.
+        {
+            let conn = store.lock();
+            let stored: String = conn
+                .query_row(
+                    "SELECT legging_exposure FROM maker_sims WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .expect("raw");
+            assert_eq!(stored, "47.00");
+            let kind: String = conn
+                .query_row(
+                    "SELECT typeof(net_maker_total) FROM maker_sims WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .expect("typeof");
+            assert_eq!(kind, "text");
+        }
+
+        // The placement snapshot survives: it is what makes the verdict re-derivable, and
+        // what would let a later run re-score the soak under a different queue assumption.
+        let legs_json: String = {
+            let conn = store.lock();
+            conn.query_row(
+                "SELECT legs_json FROM maker_sims WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .expect("legs")
+        };
+        let legs: Vec<crate::makersim::PlacedLeg> =
+            serde_json::from_str(&legs_json).expect("legs round-trip");
+        assert_eq!(legs, sim.legs);
+        assert_eq!(legs[0].visible_size, d!(250));
+        assert_eq!(legs[0].threshold(), d!(350));
+
+        // A different day sees none of it.
+        assert!(store
+            .maker_sims_for_day(opened.date_naive().succ_opt().unwrap())
+            .expect("other day")
+            .is_empty());
     }
 
     /// A v1 database (no latency column) must migrate in place, keeping its rows.

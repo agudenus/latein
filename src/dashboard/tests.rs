@@ -71,6 +71,17 @@ fn healthy_status() -> RuntimeStatus {
         alerts_sent: 41,
         alerts_failed: 0,
         alerts_cooldown_held: 2,
+        // M8: a simulator that is running, tracking a handful of queues, with a live feed.
+        maker_sim_enabled: true,
+        maker_sim_window_secs: 3_600,
+        maker_sims_open: 6,
+        maker_sims_opened: 51,
+        maker_sims_filled: 3,
+        maker_sims_partial: 4,
+        maker_sims_unfilled: 38,
+        maker_sims_untracked: 0,
+        maker_sim_prints_matched: 219,
+        maker_sim_print_feed_live: true,
         net_floor_default_taker: "0.005".into(),
     }
 }
@@ -192,6 +203,57 @@ fn seeded_app(tag: &str) -> (TempDir, Arc<App>) {
         store
             .record_opportunity(&third, &books, now - Duration::minutes(10), Some(610))
             .expect("insert");
+
+        // M8: two closed maker-fill simulations against the maker-only row — one whose every
+        // leg's queue traded through (credited, $0.74) and one that never filled a leg
+        // (credited nothing). The lower bound the hero shows is the first alone, and it is
+        // deliberately a different number from the $1.18 hypothetical above: the two must
+        // never be able to pass for each other.
+        let sim = |status: crate::makersim::SimStatus,
+                   pnl: Option<rust_decimal::Decimal>,
+                   opened: chrono::DateTime<Utc>| {
+            crate::makersim::ClosedSim {
+                opportunity_id: id,
+                event_slug: "epl-title-26".into(),
+                kind: "neg_risk_no_side".into(),
+                category: "sports".into(),
+                legs: vec![crate::makersim::PlacedLeg {
+                    token_id: crate::types::TokenId::new("1001"),
+                    price: d!(0.41),
+                    visible_size: d!(120),
+                    our_size: d!(100),
+                    volume_through: d!(220),
+                    prints_observed: 3,
+                    filled_at: pnl.map(|_| opened + Duration::seconds(90)),
+                    fill_ms: pnl.map(|_| 90_000),
+                }],
+                legs_total: 1,
+                legs_filled: usize::from(pnl.is_some()),
+                net_maker_total: d!(0.74),
+                pnl_lower_bound: pnl,
+                legging_exposure: None,
+                prints_observed: 3,
+                time_to_fill_ms: pnl.map(|_| 90_000),
+                status,
+                no_print_feed: false,
+                opened_at: opened,
+                closed_at: opened + Duration::minutes(60),
+            }
+        };
+        store
+            .record_maker_sim(&sim(
+                crate::makersim::SimStatus::MakerFilled,
+                Some(d!(0.74)),
+                now - Duration::minutes(20),
+            ))
+            .expect("filled sim");
+        store
+            .record_maker_sim(&sim(
+                crate::makersim::SimStatus::MakerUnfilled,
+                None,
+                now - Duration::minutes(18),
+            ))
+            .expect("unfilled sim");
 
         store
             .record_cycle(
@@ -666,6 +728,49 @@ async fn the_page_renders_the_evidence_console() {
     assert!(html.contains("negrisk-yes") && html.contains("negrisk-no"));
     // The label the repo insists on not forgetting.
     assert!(html.contains("true-arb") && html.contains("rel-value"));
+}
+
+/// (i) M8 — the simulated lower bound reaches the page as a *string*, next to the
+/// hypothetical it bounds, with both labels visible; and the rail says how many simulations
+/// are in flight.
+#[tokio::test]
+async fn the_maker_lower_bound_travels_as_a_string_and_is_labelled_apart() {
+    let (_dir, app) = seeded_app("makersim");
+    let (_, body) = get(app.clone(), "/api/state").await;
+    let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+    // Money, so a string — never a JSON number, and never parsed back in the page.
+    assert!(json["hero"]["maker_lower_bound"].is_string());
+    assert_eq!(json["hero"]["maker_lower_bound"], "$0.74");
+    assert!(json["hero"]["maker_fill_rate_pct"].is_string());
+    assert_eq!(json["hero"]["maker_fill_rate_pct"], "50%");
+    // The hypothetical is still its own field: the two are never merged into one number.
+    assert!(json["hero"]["net_edge_maker"].is_string());
+    assert_ne!(
+        json["hero"]["maker_lower_bound"],
+        json["hero"]["net_edge_maker"]
+    );
+
+    let sims = json["pipeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Maker sims")
+        .expect("the rail names the simulator");
+    assert_eq!(sims["value"], "6 open · fill rate 50%");
+    assert_eq!(sims["dot"], "ok");
+
+    let (_, html) = get(app, "/").await;
+    assert!(html.contains("Simulated maker P&amp;L"));
+    assert!(
+        html.contains("sim lower bound (last in queue)"),
+        "the bound must say what assumption produced it"
+    );
+    assert!(
+        html.contains("if always filled"),
+        "the hypothetical must keep its own label right beside it"
+    );
+    assert!(html.contains("Maker sims"));
 }
 
 #[tokio::test]
