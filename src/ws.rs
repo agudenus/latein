@@ -214,12 +214,16 @@ pub enum MarketFrame {
     /// carrying `market`, `asset_id`, `price`, `size`, `fee_rate_bps`, `side`, `timestamp`
     /// and `transaction_hash`.
     ///
-    /// Recognized and deliberately ignored. It reports what *did* trade, not what is
-    /// resting, so applying it to a book would invent liquidity at a price nobody is
-    /// quoting. Its own counter exists because it used to land in `frames_unrecognized`
-    /// (~4 000 per 5.1 M messages in the first soak) — a permanent non-zero reading on the
-    /// one counter whose job is to say "the wire format has drifted".
-    TradePrint { asset_id: Option<TokenId> },
+    /// Applied to no book: it reports what *did* trade, not what is resting, so writing it
+    /// into a book would invent liquidity at a price nobody is quoting. Its own counter
+    /// exists because it used to land in `frames_unrecognized` (~4 000 per 5.1 M messages in
+    /// the first soak) — a permanent non-zero reading on the one counter whose job is to say
+    /// "the wire format has drifted".
+    ///
+    /// M8 gives it a *reader* without giving it a book: a print is the only public evidence
+    /// that a price level actually traded, which is what the maker-fill simulator's
+    /// last-in-queue rule consumes (see [`PrintObserver`]).
+    TradePrint(TradePrint),
     /// A frame we understand the shape of but not the type (e.g. `tick_size_change`).
     /// Counted, never fatal.
     Unknown { event_type: String },
@@ -230,6 +234,80 @@ pub enum MarketFrame {
         event_type: String,
         reason: &'static str,
     },
+}
+
+/// Which side of the trade the venue labelled the print with.
+///
+/// Deliberately **not** [`Side`]. `Side` names a side of the *book* (where liquidity is
+/// resting); this names the side of a *trade* that already happened, and the two
+/// vocabularies coincide only by accident. Keeping them apart is what stops the maker
+/// simulator from silently reading "someone bought" as "someone hit a bid".
+///
+/// TODO(verify-live): on the `last_trade_price` frame we read `SELL` as *the aggressor sold
+/// into the bid side*, i.e. the print consumed resting buy orders — which is exactly the
+/// flow a resting buy of ours would have to queue behind. A print whose side is absent or
+/// unreadable is [`TradeSide::Unknown`] and is credited to nothing, because guessing here
+/// would manufacture fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeSide {
+    Buy,
+    Sell,
+    Unknown,
+}
+
+impl TradeSide {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("buy") => Self::Buy,
+            Some("sell") => Self::Sell,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "BUY",
+            Self::Sell => "SELL",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One `last_trade_price` frame, parsed as far as it is usable and no further.
+///
+/// Every field but the side is optional because the parser refuses to invent one: a print
+/// missing its price or size is still counted as a print (the wire format has not drifted),
+/// it simply cannot be evidence of anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradePrint {
+    pub asset_id: Option<TokenId>,
+    pub price: Option<Decimal>,
+    pub size: Option<Decimal>,
+    pub side: TradeSide,
+    pub server_ts: Option<DateTime<Utc>>,
+    pub transaction_hash: Option<String>,
+}
+
+impl TradePrint {
+    /// The token, price and size together — everything a queue-position rule needs. `None`
+    /// when any of them is missing.
+    pub fn usable(&self) -> Option<(&TokenId, Decimal, Decimal)> {
+        match (self.asset_id.as_ref(), self.price, self.size) {
+            (Some(token), Some(price), Some(size)) => Some((token, price, size)),
+            _ => None,
+        }
+    }
+}
+
+/// A reader of trade prints, installed on a [`BookStore`] by whoever wants them (M8: the
+/// maker-fill simulator).
+///
+/// The contract is deliberately narrow. It is called on the socket read task, so an
+/// implementation must be quick and must never block or take a lock the daemon holds across
+/// an await; and it is called for **every** print, so its per-print cost has to be O(work
+/// actually attached to that asset) — the live universe prints on 147 000 tokens.
+pub trait PrintObserver: Send + Sync {
+    fn observe(&self, print: &TradePrint, received: Instant);
 }
 
 /// Wire form. Every field is optional: the parser decides what a frame is, not serde.
@@ -280,6 +358,10 @@ struct RawFrame {
     timestamp: Option<Value>,
     #[serde(default)]
     hash: Option<String>,
+    /// Present on `last_trade_price` frames only. Carried so a print can be identified in a
+    /// log or a stored simulation without re-reading the socket.
+    #[serde(default)]
+    transaction_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,8 +493,18 @@ fn classify(item: Value, out: &mut Vec<MarketFrame>) {
             });
         }
         "price_change" => classify_price_change(&raw, event_type, asset_id, meta, out),
-        // Known and ignored on purpose — see [`MarketFrame::TradePrint`].
-        "last_trade_price" => out.push(MarketFrame::TradePrint { asset_id }),
+        // Applied to no book, read by the maker simulator — see [`MarketFrame::TradePrint`].
+        "last_trade_price" => out.push(MarketFrame::TradePrint(TradePrint {
+            asset_id,
+            price: raw.price.as_ref().and_then(as_decimal),
+            size: raw.size.as_ref().and_then(as_decimal),
+            side: TradeSide::parse(raw.side.as_deref()),
+            server_ts: meta.server_ts,
+            transaction_hash: raw
+                .transaction_hash
+                .clone()
+                .filter(|h| !h.trim().is_empty()),
+        })),
         _ => out.push(MarketFrame::Unknown {
             event_type: if event_type.is_empty() {
                 "(none)".to_string()
@@ -603,6 +695,11 @@ pub struct StreamStats {
     /// unrecognized. Counted so the health line can show that the channel's trade traffic is
     /// accounted for rather than silently swallowed.
     pub trade_prints: AtomicU64,
+    /// Prints that reached the [`PrintObserver`] with a token, a price and a size — the
+    /// subset that can be evidence of a fill. The gap between this and `trade_prints` is
+    /// prints we recognized but could not use, and it must stay near zero or the maker
+    /// simulator is measuring a fraction of the flow without saying so.
+    pub trade_prints_usable: AtomicU64,
     /// Every frame that parsed as JSON but matched no shape we can use — the sum of
     /// `unknown_frames` and `malformed_frames`, surfaced as one number because *this* is
     /// the number that was silently 4.8 M during the first soak (see the module docs). It
@@ -644,6 +741,7 @@ impl StreamStats {
             unknown_frames: self.unknown_frames.load(Ordering::Relaxed),
             malformed_frames: self.malformed_frames.load(Ordering::Relaxed),
             trade_prints: self.trade_prints.load(Ordering::Relaxed),
+            trade_prints_usable: self.trade_prints_usable.load(Ordering::Relaxed),
             frames_unrecognized: self.frames_unrecognized.load(Ordering::Relaxed),
             delta_entries_applied: self.delta_entries_applied.load(Ordering::Relaxed),
             delta_entries_skipped: self.delta_entries_skipped.load(Ordering::Relaxed),
@@ -668,6 +766,7 @@ pub struct StreamStatsSnapshot {
     pub unknown_frames: u64,
     pub malformed_frames: u64,
     pub trade_prints: u64,
+    pub trade_prints_usable: u64,
     pub frames_unrecognized: u64,
     pub delta_entries_applied: u64,
     pub delta_entries_skipped: u64,
@@ -683,18 +782,59 @@ pub struct StreamStatsSnapshot {
 
 /// The locally maintained order books, shared by the sockets, the resync sweep and the
 /// detector.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct BookStore {
     books: Mutex<HashMap<TokenId, LiveBook>>,
     /// shard index → when that connection last dropped. The only thing that can turn a
     /// *quiet* book into a suspect one.
     shard_disconnects: Mutex<HashMap<usize, Instant>>,
+    /// Optional reader of trade prints (M8). A `Mutex` rather than something lock-free
+    /// because it is written once per stream pool and read a few thousand times per five
+    /// million frames — and the guard is dropped *before* the callback runs, so an observer
+    /// can never be holding this lock while it does its own work.
+    print_observer: Mutex<Option<Arc<dyn PrintObserver>>>,
     pub stats: StreamStats,
+}
+
+/// Hand-written because a [`PrintObserver`] is a trait object with no `Debug` bound — and
+/// requiring one would push a formatting concern onto the simulator. The fields that matter
+/// for a log line are the counts and the sizes.
+impl std::fmt::Debug for BookStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BookStore")
+            .field("books", &self.len())
+            .field("stats", &self.stats.snapshot())
+            .field(
+                "print_observer",
+                &Self::with_observer(&self.print_observer, |o| o.is_some()),
+            )
+            .finish()
+    }
 }
 
 impl BookStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn with_observer<T>(
+        slot: &Mutex<Option<Arc<dyn PrintObserver>>>,
+        f: impl FnOnce(&Option<Arc<dyn PrintObserver>>) -> T,
+    ) -> T {
+        f(&slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    /// Install (or clear, with `None`) the reader of trade prints.
+    ///
+    /// One observer, replaced wholesale: this is a single-consumer hook, not a broadcast.
+    /// The daemon re-installs it whenever it rebuilds the stream pool after a fallback, so
+    /// a restored socket resumes feeding the simulator without any other coordination.
+    pub fn set_print_observer(&self, observer: Option<Arc<dyn PrintObserver>>) {
+        let mut slot = self
+            .print_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = observer;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<TokenId, LiveBook>> {
@@ -836,9 +976,21 @@ impl BookStore {
                 Some(asset_id.clone())
             }
             // A trade print is news about what happened, not about what is resting: no book
-            // is touched, nothing is marked stale, and no token is reported dirty.
-            MarketFrame::TradePrint { .. } => {
+            // is touched, nothing is marked stale, and no token is reported dirty. It is
+            // handed to the observer instead, because "this level actually traded" is the
+            // one thing a book snapshot can never tell us — and it is the whole basis of the
+            // last-in-queue fill rule (M8).
+            MarketFrame::TradePrint(print) => {
                 StreamStats::bump(&self.stats.trade_prints);
+                if print.usable().is_some() {
+                    StreamStats::bump(&self.stats.trade_prints_usable);
+                }
+                // The guard is released before the callback: an observer must never be able
+                // to deadlock the socket read loop against this lock.
+                let observer = Self::with_observer(&self.print_observer, Clone::clone);
+                if let Some(observer) = observer {
+                    observer.observe(print, received);
+                }
                 None
             }
             MarketFrame::Unknown { .. } => {
@@ -1787,11 +1939,12 @@ async fn handle_payload(
         books.sample_unrecognized(id, text);
     }
     for frame in &frames {
-        if let MarketFrame::TradePrint { asset_id } = frame {
+        if let MarketFrame::TradePrint(print) = frame {
             tracing::trace!(
                 shard = id,
-                token = asset_id.as_ref().map(|t| t.as_str()).unwrap_or("?"),
-                "trade print ignored — books carry resting depth, not prints"
+                token = print.asset_id.as_ref().map(|t| t.as_str()).unwrap_or("?"),
+                side = print.side.as_str(),
+                "trade print — applied to no book; offered to the maker-fill simulator"
             );
         }
         if let MarketFrame::Unknown { event_type } = frame {
@@ -2033,17 +2186,23 @@ mod tests {
   "transaction_hash": "0xdeadbeef"
 }"#;
 
-    /// M7.1. A trade print is a legitimate frame we have no use for: it reports what *did*
-    /// trade, and our books carry what is *resting*. It must therefore be recognized (so it
-    /// stops inflating `frames_unrecognized`, the one counter whose job is to say the wire
-    /// format drifted), counted on its own, and applied to nothing.
+    /// M7.1. A trade print reports what *did* trade, and our books carry what is *resting*.
+    /// It must therefore be recognized (so it stops inflating `frames_unrecognized`, the one
+    /// counter whose job is to say the wire format drifted), counted on its own, and applied
+    /// to no book. M8 adds the fields the maker simulator reads off it — without giving it a
+    /// path into a book.
     #[test]
     fn a_trade_print_is_recognized_counted_and_changes_no_book() {
         let frames = frames_of(LIVE_TRADE_PRINT);
         assert_eq!(frames.len(), 1);
         match &frames[0] {
-            MarketFrame::TradePrint { asset_id } => {
-                assert_eq!(asset_id.as_ref().map(TokenId::as_str), Some("1001"))
+            MarketFrame::TradePrint(print) => {
+                assert_eq!(print.asset_id.as_ref().map(TokenId::as_str), Some("1001"));
+                assert_eq!(print.price, Some(dec!(0.52)));
+                assert_eq!(print.size, Some(dec!(40)));
+                assert_eq!(print.side, TradeSide::Buy);
+                assert_eq!(print.transaction_hash.as_deref(), Some("0xdeadbeef"));
+                assert!(print.usable().is_some());
             }
             other => panic!("a trade print must not be {other:?}"),
         }
@@ -2079,6 +2238,10 @@ mod tests {
         let stats = store.stats.snapshot();
         assert_eq!(stats.trade_prints, 1);
         assert_eq!(
+            stats.trade_prints_usable, 1,
+            "a print carrying token, price and size is evidence the simulator can use"
+        );
+        assert_eq!(
             stats.frames_unrecognized, 0,
             "~4 000 of these per 5.1 M messages used to read as a wire-format break"
         );
@@ -2097,6 +2260,64 @@ mod tests {
         assert_eq!(stats.trade_prints, 1);
         assert_eq!(stats.unknown_frames, 1);
         assert_eq!(stats.frames_unrecognized, 1);
+    }
+
+    /// M8. The print observer sees every print and nothing else: a snapshot and a delta must
+    /// not reach it, and an unreadable print must arrive marked unusable rather than as a
+    /// guessed price.
+    #[test]
+    fn the_print_observer_sees_prints_and_only_prints() {
+        #[derive(Default)]
+        struct Spy(Mutex<Vec<TradePrint>>);
+        impl PrintObserver for Spy {
+            fn observe(&self, print: &TradePrint, _received: Instant) {
+                self.0.lock().unwrap().push(print.clone());
+            }
+        }
+
+        let store = BookStore::new();
+        let spy = Arc::new(Spy::default());
+        store.set_print_observer(Some(spy.clone()));
+        let now = Instant::now();
+
+        for frame in frames_of(&snapshot_for(
+            "1001",
+            r#"{"price":"0.49","size":"100"}"#,
+            r#"{"price":"0.52","size":"50"}"#,
+            1_757_908_892_000i64,
+        )) {
+            store.apply_frame(&frame, now);
+        }
+        for frame in frames_of(LIVE_TRADE_PRINT) {
+            store.apply_frame(&frame, now);
+        }
+        // A print with no size: recognized, counted, and explicitly not usable.
+        let sizeless = r#"{"event_type":"last_trade_price","asset_id":"1001","price":"0.51"}"#;
+        for frame in frames_of(sizeless) {
+            store.apply_frame(&frame, now);
+        }
+
+        let seen = spy.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "only the two prints, never the snapshot");
+        assert_eq!(seen[0].price, Some(dec!(0.52)));
+        assert_eq!(seen[0].side, TradeSide::Buy);
+        assert!(seen[1].usable().is_none(), "no size = no evidence");
+        assert_eq!(
+            seen[1].side,
+            TradeSide::Unknown,
+            "an absent side is never guessed into one"
+        );
+
+        let stats = store.stats.snapshot();
+        assert_eq!(stats.trade_prints, 2);
+        assert_eq!(stats.trade_prints_usable, 1);
+
+        // Detaching is complete: nothing further reaches the old observer.
+        store.set_print_observer(None);
+        for frame in frames_of(LIVE_TRADE_PRINT) {
+            store.apply_frame(&frame, now);
+        }
+        assert_eq!(spy.0.lock().unwrap().len(), 2);
     }
 
     /// The cross-check earns its keep only if it can fire. It counts and stops there — the
