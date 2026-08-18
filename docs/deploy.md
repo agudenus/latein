@@ -122,7 +122,7 @@ Both must print a version. If `docker compose version` fails, you have the old s
 ## 4. Get the code
 
 ```bash
-cd /opt
+cd /opt   # example location; the actual soak deployment (Raspberry Pi 5 "poolyarb") lives in ~/polyarb
 git clone https://github.com/YOUR_GITHUB_USER/latein.git polyarb
 cd polyarb
 ```
@@ -406,7 +406,7 @@ docker stats --no-stream polyarb
 ## 10. Updating
 
 ```bash
-cd /opt/polyarb
+cd ~/polyarb   # wherever you cloned it — the production Pi uses ~/polyarb, not this guide's /opt example
 git pull
 docker compose up -d --build
 ```
