@@ -1,0 +1,63 @@
+[
+  {
+    "_comment": "TODO(verify-live): recorded shape of GET /markets?condition_ids=… including CLOSED markets, which discovery filters out. Unreachable from this dev container. R2 reads outcomePrices (double-encoded, index-aligned with outcomes) and umaResolutionStatus; everything else is here to prove the parser ignores what it does not need.",
+    "id": "701001",
+    "conditionId": "0xres0000000000000000000000000000000000000000000000000000000000w1",
+    "question": "Did the resolved outcome happen?",
+    "clobTokenIds": "[\"6001\",\"6002\"]",
+    "outcomes": "[\"Yes\",\"No\"]",
+    "outcomePrices": "[\"1\",\"0\"]",
+    "active": false,
+    "closed": true,
+    "enableOrderBook": true,
+    "umaResolutionStatus": "resolved",
+    "endDate": "2026-08-30T12:00:00Z"
+  },
+  {
+    "id": "701002",
+    "conditionId": "0xres0000000000000000000000000000000000000000000000000000000000l1",
+    "question": "Did the other resolved outcome happen?",
+    "clobTokenIds": "[\"6003\",\"6004\"]",
+    "outcomes": "[\"Yes\",\"No\"]",
+    "outcomePrices": "[\"0\",\"1\"]",
+    "active": false,
+    "closed": true,
+    "umaResolutionStatus": "resolved",
+    "endDate": "2026-08-30T12:00:00Z"
+  },
+  {
+    "id": "701003",
+    "conditionId": "0xres00000000000000000000000000000000000000000000000000000000d1sp",
+    "question": "A market whose resolution was disputed at UMA",
+    "clobTokenIds": "[\"6005\",\"6006\"]",
+    "outcomes": "[\"Yes\",\"No\"]",
+    "outcomePrices": "[\"0\",\"1\"]",
+    "active": false,
+    "closed": true,
+    "umaResolutionStatus": "disputed",
+    "endDate": "2026-08-29T12:00:00Z"
+  },
+  {
+    "id": "701004",
+    "conditionId": "0xres0000000000000000000000000000000000000000000000000000000open1",
+    "question": "A market that is still trading — prices here are quotes, not payouts",
+    "clobTokenIds": "[\"6007\",\"6008\"]",
+    "outcomes": "[\"Yes\",\"No\"]",
+    "outcomePrices": "[\"0.97\",\"0.03\"]",
+    "active": true,
+    "closed": false,
+    "umaResolutionStatus": null,
+    "endDate": "2026-09-30T12:00:00Z"
+  },
+  {
+    "id": "701005",
+    "conditionId": "0xres00000000000000000000000000000000000000000000000000000000hole",
+    "question": "A closed market whose payout vector the API does not give us",
+    "clobTokenIds": "[\"6009\",\"6010\"]",
+    "outcomes": "[\"Yes\",\"No\"]",
+    "outcomePrices": "[]",
+    "active": false,
+    "closed": true,
+    "endDate": "2026-08-28T12:00:00Z"
+  }
+]

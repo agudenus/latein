@@ -642,17 +642,17 @@ fn classify_market(m: &RawMarket) -> Result<TrackedMarket, DropReason> {
 /// candidate filter treats as *not eligible* rather than as a zero pool. A zero-rate array is
 /// a real zero and is returned as such.
 fn rewards_daily_rate(m: &RawMarket) -> Option<rust_decimal::Decimal> {
+    // Present-but-empty is a real zero (the market is listed, nothing is funded); absent is
+    // unknown. The same rule as the CLOB `/sampling-markets` parser, deliberately — the two
+    // sources must not disagree about what silence means.
     let rates = m.clob_rewards.as_ref()?;
-    let mut total = None;
-    for entry in rates {
-        if let Some(rate) = entry
-            .rewards_daily_rate
-            .filter(|r| *r >= rust_decimal::Decimal::ZERO)
-        {
-            total = Some(total.unwrap_or(rust_decimal::Decimal::ZERO) + rate);
-        }
-    }
-    total
+    Some(
+        rates
+            .iter()
+            .filter_map(|entry| entry.rewards_daily_rate)
+            .filter(|rate| *rate >= rust_decimal::Decimal::ZERO)
+            .sum(),
+    )
 }
 
 /// Fold the three fee fields into the domain type. A missing `feeSchedule` leaves the rate
@@ -1305,6 +1305,92 @@ mod tests {
         assert_eq!(universe.events[0].category.as_str(), "politics");
         assert!(universe.events[0].coverage_complete());
         assert_eq!(universe.events[0].markets[0].yes_token().as_str(), "7001");
+    }
+
+    /// R1 — the reward parameters and the funded pool, from the fixture, in their published
+    /// units: `rewardsMaxSpread` in **cents**, `rewardsMinSize` in **shares**, and the pool
+    /// as the sum of every funded `clobRewards[]` entry.
+    #[test]
+    fn per_market_reward_parameters_and_the_summed_daily_pool_are_parsed() {
+        let (universe, _) = build_universe(
+            &parse_events_page("test", KEYSET).expect("fixture"),
+            &no_floor(),
+        );
+
+        let funded = &universe.events[0].markets[0].trading;
+        assert_eq!(funded.rewards_min_size, Some(dec!(50)));
+        assert_eq!(funded.rewards_max_spread, Some(dec!(3.5)));
+        // Two funded configs on one market: 30 + 20 = 50 USD/day of *configured* pool.
+        assert_eq!(funded.rewards_daily_rate, Some(dec!(50)));
+        assert!(funded.reward_eligible());
+
+        // An empty `clobRewards` array is a real zero — the market is listed but nothing is
+        // funded, so it is not a candidate.
+        let unfunded = &universe.events[0].markets[1].trading;
+        assert_eq!(unfunded.rewards_daily_rate, Some(Decimal::ZERO));
+        assert!(!unfunded.reward_eligible());
+
+        // Absent altogether = "the API said nothing", which is not a zero pool.
+        let silent = &universe.events[1].markets[0].trading;
+        assert_eq!(silent.rewards_daily_rate, None);
+        assert!(!silent.reward_eligible());
+
+        // The legacy payload carries no reward fields at all, and must keep parsing: every
+        // one of them stays unknown rather than defaulting to a number.
+        let (legacy, _) = build_universe(&parsed(), &no_floor());
+        let legacy = &legacy.events[0].markets[0].trading;
+        assert_eq!(legacy.rewards_min_size, None);
+        assert_eq!(legacy.rewards_max_spread, None);
+        assert_eq!(legacy.rewards_daily_rate, None);
+        assert!(!legacy.reward_eligible());
+    }
+
+    /// R2 — the resolution lookup: a payout vector is only read when it is complete and adds
+    /// up, and a market still trading is never mistaken for a resolved one.
+    #[test]
+    fn the_markets_lookup_parses_resolutions_and_refuses_the_rest() {
+        const MARKETS: &str = include_str!("../tests/fixtures/gamma_markets_resolution.json");
+        let markets = parse_markets_page("test", MARKETS).expect("fixture must parse");
+        assert_eq!(markets.len(), 5);
+
+        let facts: Vec<crate::nearres::ResolutionFacts> = markets
+            .iter()
+            .filter_map(crate::nearres::resolution_facts)
+            .collect();
+        assert_eq!(facts.len(), 5);
+
+        // Resolved YES: the payout vector is index-aligned with `outcomes`.
+        assert_eq!(facts[0].payouts, Some(vec![Decimal::ONE, Decimal::ZERO]));
+        assert!(facts[0].closed);
+        assert!(!facts[0].disputed);
+        assert_eq!(facts[0].uma_status.as_deref(), Some("resolved"));
+
+        // Resolved NO.
+        assert_eq!(facts[1].payouts, Some(vec![Decimal::ZERO, Decimal::ONE]));
+
+        // A dispute is only ever reported when the API says so.
+        assert!(facts[2].disputed);
+        assert_eq!(facts[2].uma_status.as_deref(), Some("disputed"));
+
+        // Still trading: the prices sum to 1 but they are quotes, and `closed` is what stops
+        // them being read as a settlement.
+        assert!(!facts[3].closed);
+        assert!(facts[3].payouts.is_some());
+
+        // Closed with no readable vector: a hole, and the caller records `undetermined`.
+        assert!(facts[4].closed);
+        assert_eq!(facts[4].payouts, None);
+
+        // The `{data: [...]}` wrapper is accepted too.
+        let wrapped = format!("{{\"data\": {MARKETS}}}");
+        assert_eq!(
+            parse_markets_page("test", &wrapped).expect("wrapped").len(),
+            5
+        );
+        assert!(parse_markets_page("https://gamma/markets", "{oops")
+            .expect_err("malformed")
+            .to_string()
+            .contains("https://gamma/markets"));
     }
 
     /// The per-market fee data on the live response, and every case the resolver has to

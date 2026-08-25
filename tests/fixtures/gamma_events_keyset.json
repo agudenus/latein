@@ -35,6 +35,26 @@
           "orderMinSize": 5,
           "rewardsMinSize": 50,
           "rewardsMaxSpread": 3.5,
+          "clobRewards": [
+            {
+              "id": "5001",
+              "conditionId": "0xa11ce0000000000000000000000000000000000000000000000000000000d001",
+              "assetAddress": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+              "rewardsAmount": 0,
+              "rewardsDailyRate": 30,
+              "startDate": "2026-08-01",
+              "endDate": "2026-12-31"
+            },
+            {
+              "id": "5002",
+              "conditionId": "0xa11ce0000000000000000000000000000000000000000000000000000000d001",
+              "assetAddress": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+              "rewardsAmount": 0,
+              "rewardsDailyRate": 20,
+              "startDate": "2026-08-15",
+              "endDate": "2026-09-15"
+            }
+          ],
           "feesEnabled": true,
           "feeType": "politics_fees",
           "feeSchedule": {
@@ -62,6 +82,7 @@
           "orderMinSize": 5,
           "rewardsMinSize": 50,
           "rewardsMaxSpread": 3.5,
+          "clobRewards": [],
           "feesEnabled": true,
           "feeType": "politics_fees",
           "feeSchedule": {
