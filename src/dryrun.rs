@@ -258,6 +258,7 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
         rewardsim,
         nearres: nearres_observer,
         reward_selected_day: None,
+        last_reward_attempt: None,
         last_nearres_lookup: None,
         token_events: HashMap::new(),
         gamma: Arc::new(PaginationState::default()),
@@ -682,6 +683,10 @@ struct Daemon {
     /// The UTC day the reward portfolio was last chosen for. Selection is a daily decision,
     /// which is also the epoch's period.
     reward_selected_day: Option<NaiveDate>,
+    /// When the last selection *attempt* was made, successful or not. A selection that fails
+    /// on a book fetch must not be retried on every 5-second tick: that would re-page
+    /// `/sampling-markets` against an API that is already refusing us.
+    last_reward_attempt: Option<Instant>,
     last_nearres_lookup: Option<Instant>,
     /// token id → index into `universe.events`. Rebuilt on every universe refresh; this is
     /// what turns "this book moved" into "re-evaluate exactly this event".
@@ -1244,7 +1249,10 @@ impl Daemon {
         if rolled {
             self.persist_reward_rows().await;
         }
-        if rolled || self.reward_selected_day != Some(now.date_naive()) {
+        if (rolled || self.reward_selected_day != Some(now.date_naive()))
+            && self.reward_selection_allowed()
+        {
+            self.last_reward_attempt = Some(Instant::now());
             self.reselect_reward_portfolio(universe, now).await;
         }
         if self.rewardsim.sample_due(now) {
@@ -1262,6 +1270,20 @@ impl Daemon {
             }
         }
         self.persist_reward_rows().await;
+    }
+
+    /// May a selection pass run now?
+    ///
+    /// Selection is a once-a-day decision, but it can *fail* (no books, a rewards endpoint
+    /// that will not answer) and a failure leaves `reward_selected_day` unset so it is
+    /// retried. Without this it would be retried on every tick — five seconds apart — which
+    /// is precisely the behaviour that turns a transient API refusal into a rate-limit ban.
+    /// One attempt per sampling interval (and never faster than a minute) is plenty for a
+    /// decision whose period is a day.
+    fn reward_selection_allowed(&self) -> bool {
+        let spacing = Duration::from_secs(self.cfg.rewardsim.sample_interval_secs.max(60));
+        self.last_reward_attempt
+            .is_none_or(|last| last.elapsed() >= spacing)
     }
 
     /// Books for a handful of tokens: the stream's own state when it has all of them,
