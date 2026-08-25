@@ -1,0 +1,72 @@
+{
+  "_comment": "TODO(verify-live): recorded shape of GET /sampling-markets, reconstructed from the archived Polymarket/clob-client types and a mirrored CLOB OpenAPI spec. This dev container cannot reach clob.polymarket.com. Units: rewards.max_spread is CENTS from the adjusted midpoint; rewards.min_size is SHARES (and is not minimum_order_size).",
+  "limit": 100,
+  "count": 4,
+  "next_cursor": "MTAw",
+  "data": [
+    {
+      "condition_id": "0xa11ce0000000000000000000000000000000000000000000000000000000d001",
+      "question_id": "0xq001",
+      "question": "Will the Democratic Party win the 2028 presidential election?",
+      "active": true,
+      "closed": false,
+      "neg_risk": true,
+      "minimum_order_size": "5",
+      "minimum_tick_size": "0.01",
+      "rewards": {
+        "rates": [
+          { "asset_address": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174", "rewards_daily_rate": 30 }
+        ],
+        "min_size": 50,
+        "max_spread": 3.5
+      },
+      "tokens": [
+        { "token_id": "7001", "outcome": "Yes", "price": 0.41 },
+        { "token_id": "7002", "outcome": "No", "price": 0.59 }
+      ]
+    },
+    {
+      "condition_id": "0xb0b0000000000000000000000000000000000000000000000000000000000002",
+      "question": "Will the Fed cut rates in September?",
+      "active": true,
+      "closed": false,
+      "neg_risk": false,
+      "minimum_order_size": "5",
+      "minimum_tick_size": "0.01",
+      "rewards": {
+        "rates": [
+          { "asset_address": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174", "rewards_daily_rate": 100 },
+          { "asset_address": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174", "rewards_daily_rate": 50 }
+        ],
+        "min_size": 100,
+        "max_spread": 1.5
+      },
+      "tokens": [
+        { "token_id": "8001", "outcome": "Yes", "price": 0.62 },
+        { "token_id": "8002", "outcome": "No", "price": 0.38 }
+      ]
+    },
+    {
+      "condition_id": "0xc0ffee0000000000000000000000000000000000000000000000000000000003",
+      "question": "A market listed in the sampling set with no funded pool",
+      "active": true,
+      "closed": false,
+      "neg_risk": false,
+      "rewards": {
+        "rates": null,
+        "min_size": 20,
+        "max_spread": 5.5
+      },
+      "tokens": [
+        { "token_id": "9001", "outcome": "Yes", "price": 0.5 },
+        { "token_id": "9002", "outcome": "No", "price": 0.5 }
+      ]
+    },
+    {
+      "condition_id": "",
+      "question": "A market with no condition id at all — must be dropped, never guessed",
+      "rewards": { "rates": [{ "rewards_daily_rate": 5 }], "min_size": 20, "max_spread": 3 },
+      "tokens": []
+    }
+  ]
+}

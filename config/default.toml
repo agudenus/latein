@@ -291,6 +291,78 @@ window_secs = 3600
 # `maker_untracked` — a missing measurement, deliberately not counted as a non-fill.
 max_concurrent = 200
 
+# ---------------------------------------------------------------------------------
+# Measurement Phase R ("Soak 2") — two instruments, both dry-run, both with their
+# kill-lines written down before the measurement started
+# (research/strategy-pivot-2026-08.md).
+# ---------------------------------------------------------------------------------
+
+# R1 — liquidity-rewards farming, simulated NET of adverse selection.
+#
+# The trap this exists to avoid: reward scoring only credits quotes within max_spread
+# (1.5–5.5 CENTS) of the adjusted midpoint, so a competitive reward quote sits at the
+# touch and DOES get filled. Rewards are approximately the market price of that adverse
+# selection, which is why nothing here reports a gross number on its own.
+[rewardsim]
+enabled = true
+# Total simulated quoting capital. Paired YES-bid + NO-bid quoting commits about $1 per
+# share whatever the market's price, so this is very nearly a share count. The
+# pre-committed kill-line is stated at $2,000 — this is what it means.
+capital_cap_usd = 2000
+# Our distance from the adjusted midpoint, in CENTS (not dollars — the 100x confusion
+# between the two is a documented bug class). Clamped per market to half that market's
+# max_spread: at s = v the score is exactly zero.
+quote_spread_cents = 1.0
+# Shares per side, raised per market to that market's rewards_min_size (below it an order
+# is perfectly legal and scores nothing).
+quote_size_shares = 100
+# The venue samples about once a minute. Sampling faster would not improve the estimate.
+sample_interval_secs = 60
+# Markets quoted at once. The $1/day/market payout floor already pushes towards
+# concentration; this stops a wide, thin portfolio being chosen by rounding.
+max_markets = 20
+# Candidates evaluated per selection pass (each costs a book), and the pagination backstop
+# on /sampling-markets.
+max_candidates = 150
+max_candidate_pages = 5
+# Markout horizons on a simulated fill. The SHORT one is what `net` uses; the long one is
+# reported beside it and never merged into it.
+markout_short_secs = 300
+markout_long_secs = 3600
+# PRE-COMMITTED KILL-LINE: 14-day mean portfolio net at or below $1/day at $2,000 = dead.
+# The daily report states pass/fail against this plainly.
+kill_line_net_usd_per_day = 1.0
+kill_line_window_days = 14
+
+# R2 — near-resolution capture, observed only. Nothing here simulates our own orders:
+# it records the executable ask that was really on the book and follows the market to
+# resolution.
+[nearres]
+enabled = true
+# The qualifying band on the EXECUTABLE ask (never mid, never last), inclusive at both
+# ends: exactly 0.96 and exactly 0.99 are in the study.
+min_ask = 0.96
+max_ask = 0.99
+# Only markets whose event end date is known and inside this horizon. An unknown end date
+# never qualifies — we do not guess a resolution time.
+max_hours_to_resolution = 72
+max_tracked = 2000
+# How often to look up the observations whose end date has passed, and how many condition
+# ids per /markets call.
+resolution_poll_secs = 3600
+resolution_batch_size = 50
+# Hours of capital idle between a payout and the next position. The annualised yield is
+# computed at the observed time-to-payout PLUS this; zero would assume instant
+# redeployment at the same terms, which nobody achieves.
+recycle_overhead_hours = 12
+# PRE-COMMITTED KILL-LINE: a realised loss rate worse than 1-in-40, or an annualised net
+# yield under 15%/yr, kills the strategy. Below min_resolutions_for_verdict the report
+# prints the count and a Wilson interval instead of a verdict — a 1-in-40 rate cannot be
+# judged on a handful of outcomes.
+kill_line_loss_one_in = 40
+kill_line_annual_yield_pct = 15
+min_resolutions_for_verdict = 40
+
 [alerts]
 enabled = true
 # Minimum net profit per share before an opportunity is alerted (maker net is used for

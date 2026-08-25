@@ -65,6 +65,13 @@ pub struct Config {
     /// `config/default.toml` keeps loading with the shipped defaults.
     #[serde(default)]
     pub maker_sim: MakerSimConfig,
+    /// R1 liquidity-rewards farming simulation (Measurement Phase R). `#[serde(default)]`
+    /// so an operator's older `config/default.toml` keeps loading with the shipped defaults.
+    #[serde(default)]
+    pub rewardsim: RewardSimConfig,
+    /// R2 near-resolution observation study (Measurement Phase R).
+    #[serde(default)]
+    pub nearres: NearResConfig,
     /// M3 alerting. Credentials are *never* here — only in the environment.
     #[serde(default)]
     pub alerts: AlertConfig,
@@ -425,6 +432,129 @@ impl Default for MakerSimConfig {
     }
 }
 
+/// R1 — the liquidity-rewards farming simulator (`src/rewardsim.rs`).
+///
+/// It quotes nothing. It picks a portfolio of reward-eligible markets, scores the two-sided
+/// quote it *would* have resting on each, and measures what those quotes would have been
+/// filled with from the trade tape. The output is a daily **net** figure — gross Q-score pool
+/// share minus print-measured markout — because gross rewards are approximately the market
+/// price of the adverse selection they pay for, and a gross-only number would repeat the
+/// Phase A mistake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewardSimConfig {
+    /// Master switch. `false` = nothing is sampled, and the report says the measurement is
+    /// off rather than printing a net of zero.
+    pub enabled: bool,
+    /// Total simulated quoting capital, USD. Paired YES-bid + NO-bid quoting commits about
+    /// $1 per share regardless of the market's price, so this is very nearly a share count.
+    /// The pre-committed kill-line is stated at $2 000, so this is what it means.
+    pub capital_cap_usd: Decimal,
+    /// Our quote's distance from the adjusted midpoint, in **cents**. Clamped per market to
+    /// half of that market's `max_spread`: at `s = v` the score is exactly zero, and the
+    /// research's own sizing assumption is `s ≈ v/2 … v/3`.
+    pub quote_spread_cents: Decimal,
+    /// Shares per side, raised per market to that market's `rewards_min_size` (below it an
+    /// order is legal and scores nothing).
+    pub quote_size_shares: Decimal,
+    /// Seconds between scoring samples. The venue samples about once a minute; sampling
+    /// faster would not improve the estimate, it would just over-weight the current minute.
+    pub sample_interval_secs: u64,
+    /// Cap on markets quoted at once. The $1/day/market payout floor already pushes towards
+    /// concentration; this stops a wide, thin portfolio being chosen by rounding.
+    pub max_markets: usize,
+    /// Cap on candidates evaluated per selection pass (each costs a book).
+    pub max_candidates: usize,
+    /// Rate-limit backstop on `/sampling-markets` pagination. When it stops discovery the
+    /// candidate set is incomplete, and that is logged.
+    pub max_candidate_pages: usize,
+    /// Short markout horizon, seconds: the adverse-selection number the net uses.
+    pub markout_short_secs: u64,
+    /// Long markout horizon, seconds. Reported beside the short one, never merged into it.
+    pub markout_long_secs: u64,
+    /// The **pre-committed kill-line**: if the 14-day mean portfolio net is at or below this
+    /// many dollars per day at `capital_cap_usd`, the strategy is dead. Written down before
+    /// the measurement started, and the daily report states pass/fail against it plainly.
+    pub kill_line_net_usd_per_day: Decimal,
+    /// How many days the running mean covers.
+    pub kill_line_window_days: u32,
+}
+
+impl Default for RewardSimConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capital_cap_usd: Decimal::new(2_000, 0),
+            quote_spread_cents: Decimal::ONE,
+            quote_size_shares: Decimal::new(100, 0),
+            sample_interval_secs: 60,
+            max_markets: 20,
+            max_candidates: 150,
+            max_candidate_pages: 5,
+            markout_short_secs: 300,
+            markout_long_secs: 3_600,
+            kill_line_net_usd_per_day: Decimal::ONE,
+            kill_line_window_days: 14,
+        }
+    }
+}
+
+/// R2 — the near-resolution observation study (`src/nearres.rs`).
+///
+/// Pure observation of other people's markets: what a 96–99¢ ask with less than ~72 h to run
+/// actually settled at, how long the capital was locked, and whether the resolution was
+/// disputed. Nothing about our own orders, so there is nothing to size and no capital knob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NearResConfig {
+    pub enabled: bool,
+    /// Qualifying band on the **executable ask** (never mid, never last): inclusive at both
+    /// ends, so exactly 0.96 and exactly 0.99 qualify.
+    pub min_ask: Decimal,
+    pub max_ask: Decimal,
+    /// Only markets whose event end date is known and within this many hours. An unknown end
+    /// date never qualifies: we do not guess a resolution time.
+    pub max_hours_to_resolution: i64,
+    /// Cap on observations tracked at once, so a bad day cannot fill the database.
+    pub max_tracked: usize,
+    /// Seconds between resolution-lookup passes over the observations whose end date has
+    /// passed.
+    pub resolution_poll_secs: u64,
+    /// Condition ids per `/markets` lookup.
+    pub resolution_batch_size: usize,
+    /// Hours of capital idle between a payout and the next position — the "realistic
+    /// recycling" the annualised yield is computed at. Zero would assume instant redeployment
+    /// at the same terms, which nobody achieves.
+    pub recycle_overhead_hours: i64,
+    /// **Pre-committed kill-line**, part one: a realised loss rate worse than one in this
+    /// many resolutions kills the strategy.
+    pub kill_line_loss_one_in: u32,
+    /// **Pre-committed kill-line**, part two: an annualised net yield below this percentage
+    /// kills it.
+    pub kill_line_annual_yield_pct: Decimal,
+    /// Below this many resolutions the loss-rate kill-line cannot mean anything, and the
+    /// report says so instead of pretending to a verdict.
+    pub min_resolutions_for_verdict: u32,
+}
+
+impl Default for NearResConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_ask: Decimal::new(96, 2),
+            max_ask: Decimal::new(99, 2),
+            max_hours_to_resolution: 72,
+            max_tracked: 2_000,
+            resolution_poll_secs: 3_600,
+            resolution_batch_size: 50,
+            recycle_overhead_hours: 12,
+            kill_line_loss_one_in: 40,
+            kill_line_annual_yield_pct: Decimal::new(15, 0),
+            min_resolutions_for_verdict: 40,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertConfig {
@@ -760,6 +890,8 @@ impl Default for Config {
             lifecycle: LifecycleConfig::default(),
             stream: StreamConfig::default(),
             maker_sim: MakerSimConfig::default(),
+            rewardsim: RewardSimConfig::default(),
+            nearres: NearResConfig::default(),
             alerts: AlertConfig::default(),
             storage: StorageConfig::default(),
             dashboard: DashboardConfig::default(),
@@ -1025,6 +1157,118 @@ impl Config {
             if self.maker_sim.max_concurrent == 0 {
                 return Err(ConfigError::Invalid(
                     "maker_sim.max_concurrent must be > 0".into(),
+                ));
+            }
+        }
+
+        // ---- R1 rewards farming simulation --------------------------------------------
+        if self.rewardsim.enabled {
+            if self.rewardsim.capital_cap_usd <= Decimal::ZERO {
+                return Err(ConfigError::Invalid(
+                    "rewardsim.capital_cap_usd must be > 0 (it is the denominator of the \
+                     kill-line: \"net ≤ $1/day at $2 000\")"
+                        .into(),
+                ));
+            }
+            if self.rewardsim.quote_spread_cents <= Decimal::ZERO {
+                return Err(ConfigError::Invalid(
+                    "rewardsim.quote_spread_cents must be > 0 and is in CENTS (e.g. 1.0 = one \
+                     cent from the adjusted midpoint); a zero distance quotes at the midpoint \
+                     itself, which no maker does"
+                        .into(),
+                ));
+            }
+            if self.rewardsim.quote_size_shares <= Decimal::ZERO {
+                return Err(ConfigError::Invalid(
+                    "rewardsim.quote_size_shares must be > 0 (SHARES, not dollars)".into(),
+                ));
+            }
+            if self.rewardsim.sample_interval_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "rewardsim.sample_interval_secs must be > 0 (the venue samples about once \
+                     a minute)"
+                        .into(),
+                ));
+            }
+            if self.rewardsim.max_markets == 0
+                || self.rewardsim.max_candidates == 0
+                || self.rewardsim.max_candidate_pages == 0
+            {
+                return Err(ConfigError::Invalid(
+                    "rewardsim.max_markets, .max_candidates and .max_candidate_pages must be > 0"
+                        .into(),
+                ));
+            }
+            if self.rewardsim.markout_short_secs == 0 || self.rewardsim.markout_long_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "rewardsim.markout_short_secs and .markout_long_secs must be > 0".into(),
+                ));
+            }
+            if self.rewardsim.markout_short_secs >= self.rewardsim.markout_long_secs {
+                return Err(ConfigError::Invalid(format!(
+                    "rewardsim.markout_short_secs ({}) must be below .markout_long_secs ({}); \
+                     they are two horizons on the same fill, not two names for one",
+                    self.rewardsim.markout_short_secs, self.rewardsim.markout_long_secs
+                )));
+            }
+            if self.rewardsim.kill_line_window_days == 0 {
+                return Err(ConfigError::Invalid(
+                    "rewardsim.kill_line_window_days must be > 0".into(),
+                ));
+            }
+            if self.rewardsim.kill_line_net_usd_per_day < Decimal::ZERO {
+                return Err(ConfigError::Invalid(
+                    "rewardsim.kill_line_net_usd_per_day must be >= 0".into(),
+                ));
+            }
+        }
+
+        // ---- R2 near-resolution observation --------------------------------------------
+        if self.nearres.enabled {
+            if self.nearres.min_ask <= Decimal::ZERO || self.nearres.max_ask >= Decimal::ONE {
+                return Err(ConfigError::Invalid(
+                    "nearres.min_ask must be > 0 and nearres.max_ask < 1 (they are executable \
+                     ask prices in dollars, e.g. 0.96 and 0.99)"
+                        .into(),
+                ));
+            }
+            if self.nearres.min_ask > self.nearres.max_ask {
+                return Err(ConfigError::Invalid(
+                    "nearres.min_ask must not exceed nearres.max_ask".into(),
+                ));
+            }
+            if self.nearres.max_hours_to_resolution <= 0 {
+                return Err(ConfigError::Invalid(
+                    "nearres.max_hours_to_resolution must be > 0".into(),
+                ));
+            }
+            if self.nearres.max_tracked == 0 || self.nearres.resolution_batch_size == 0 {
+                return Err(ConfigError::Invalid(
+                    "nearres.max_tracked and nearres.resolution_batch_size must be > 0".into(),
+                ));
+            }
+            if self.nearres.resolution_poll_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "nearres.resolution_poll_secs must be > 0".into(),
+                ));
+            }
+            if self.nearres.recycle_overhead_hours < 0 {
+                return Err(ConfigError::Invalid(
+                    "nearres.recycle_overhead_hours must be >= 0".into(),
+                ));
+            }
+            if self.nearres.kill_line_loss_one_in == 0 {
+                return Err(ConfigError::Invalid(
+                    "nearres.kill_line_loss_one_in must be > 0 (it is the denominator of the \
+                     pre-committed \"worse than 1-in-40\" loss-rate kill-line)"
+                        .into(),
+                ));
+            }
+            if self.nearres.min_resolutions_for_verdict == 0 {
+                return Err(ConfigError::Invalid(
+                    "nearres.min_resolutions_for_verdict must be > 0 (a loss-rate kill-line \
+                     with no minimum sample size is a coin flip with a threshold)"
+                        .into(),
                 ));
             }
         }
@@ -1495,6 +1739,90 @@ mod tests {
             SHIPPED.contains("TODO(verify-live)"),
             "the stream section must keep its unverified-API warning"
         );
+    }
+
+    /// Measurement Phase R: both sections ship, agree with the compiled defaults, carry the
+    /// pre-committed kill-lines, and keep loading when an older config has neither.
+    #[test]
+    fn shipped_config_carries_the_phase_r_sections_and_their_kill_lines() {
+        let cfg = Config::from_toml_str(SHIPPED).expect("parse");
+        cfg.validate().expect("validate");
+
+        assert_eq!(cfg.rewardsim, RewardSimConfig::default());
+        assert_eq!(cfg.nearres, NearResConfig::default());
+        // The two numbers the go/no-go is decided against, as written down in the pivot doc
+        // before the measurement started.
+        assert_eq!(cfg.rewardsim.capital_cap_usd, dec!(2000));
+        assert_eq!(cfg.rewardsim.kill_line_net_usd_per_day, dec!(1));
+        assert_eq!(cfg.rewardsim.kill_line_window_days, 14);
+        assert_eq!(cfg.nearres.kill_line_loss_one_in, 40);
+        assert_eq!(cfg.nearres.kill_line_annual_yield_pct, dec!(15));
+        // The band is 96–99¢ on the executable ask, inclusive.
+        assert_eq!(cfg.nearres.min_ask, dec!(0.96));
+        assert_eq!(cfg.nearres.max_ask, dec!(0.99));
+        assert_eq!(cfg.nearres.max_hours_to_resolution, 72);
+        // Units, spelled out in the file itself where an operator will read them.
+        assert!(
+            SHIPPED.contains("CENTS"),
+            "the rewardsim section must keep its cents-not-dollars warning"
+        );
+
+        // A config written before Phase R keeps loading and gets the shipped defaults.
+        let older: String = SHIPPED
+            .lines()
+            .take_while(|line| !line.starts_with("[rewardsim]"))
+            .chain(
+                SHIPPED
+                    .lines()
+                    .skip_while(|line| !line.starts_with("[alerts]")),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!older.contains("[rewardsim]") && !older.contains("[nearres]"));
+        let older = Config::from_toml_str(&older).expect("a config without the sections loads");
+        older.validate().expect("validate");
+        assert_eq!(older.rewardsim, RewardSimConfig::default());
+        assert_eq!(older.nearres, NearResConfig::default());
+
+        // A typo is refused rather than silently ignored.
+        assert!(Config::from_toml_str("[rewardsim]\ncapital_cap = 2000\n").is_err());
+        assert!(Config::from_toml_str("[nearres]\nmin_askk = 0.96\n").is_err());
+    }
+
+    /// The Phase R validation rules that would otherwise produce a meaningless measurement.
+    #[test]
+    fn phase_r_settings_are_validated() {
+        let base = Config::default();
+
+        let mut cfg = base.clone();
+        cfg.rewardsim.quote_spread_cents = Decimal::ZERO;
+        assert!(cfg.validate().is_err(), "quoting at the midpoint is not a quote");
+
+        let mut cfg = base.clone();
+        cfg.rewardsim.markout_short_secs = cfg.rewardsim.markout_long_secs;
+        assert!(
+            cfg.validate().is_err(),
+            "two horizons on one fill must be two different horizons"
+        );
+
+        let mut cfg = base.clone();
+        cfg.nearres.min_ask = dec!(0.995);
+        assert!(cfg.validate().is_err(), "min_ask above max_ask is not a band");
+
+        let mut cfg = base.clone();
+        cfg.nearres.min_resolutions_for_verdict = 0;
+        assert!(
+            cfg.validate().is_err(),
+            "a loss-rate kill-line with no minimum sample size is a coin flip"
+        );
+
+        // Both sections disabled: nothing in them is validated, because nothing runs.
+        let mut cfg = base;
+        cfg.rewardsim.enabled = false;
+        cfg.rewardsim.quote_spread_cents = Decimal::ZERO;
+        cfg.nearres.enabled = false;
+        cfg.nearres.min_resolutions_for_verdict = 0;
+        cfg.validate().expect("a disabled instrument needs no knobs");
     }
 
     /// The four M6.1 knobs, each one the fix for something a live overnight run did wrong.

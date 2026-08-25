@@ -183,17 +183,133 @@ CREATE INDEX idx_maker_sims_opened_at ON maker_sims(opened_at);
 CREATE INDEX idx_maker_sims_status    ON maker_sims(status);
 "#;
 
+/// Measurement Phase R — the two instruments of Soak 2.
+///
+/// Four tables, and the shape of each one enforces the discipline the soak verdict asked for:
+///
+/// * `reward_epochs` — **one row per market per UTC day**, inserted when the epoch closes at
+///   00:00 UTC. `UNIQUE(day, condition_id)` makes a second verdict for the same epoch
+///   impossible at the schema level rather than by convention. Both `gross_paid_usd` and
+///   `net_usd` are stored, because the whole point of R1 is that the two are different
+///   numbers and the second is the one that decides.
+/// * `reward_fills` — the adverse-selection evidence: one row per simulated fill, with its
+///   signed markout at each horizon. A fill whose markout never matured is *not* here (it is
+///   counted as `fills_pending` on its epoch), so nothing in this table is a placeholder.
+/// * `nearres_observations` / `nearres_resolutions` — R2, deliberately **two** tables. A
+///   qualification is one fact ("this ask was executable at this moment") and a resolution is
+///   another ("this is how it settled"); writing the second into the first would be an update
+///   of a measurement, which this repo does not do. `token_id` is UNIQUE in both, so a market
+///   qualifies once and settles once.
+///
+/// Money is TEXT everywhere, as everywhere else. `payout` is NULL for an undetermined
+/// resolution: "we could not see it" and "it paid zero" are different facts and the loss rate
+/// depends on the difference.
+const SCHEMA_V5: &str = r#"
+CREATE TABLE reward_epochs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    day                 TEXT    NOT NULL,
+    condition_id        TEXT    NOT NULL,
+    event_slug          TEXT    NOT NULL,
+    question            TEXT    NOT NULL,
+    category            TEXT    NOT NULL,
+    max_spread_cents    TEXT    NOT NULL,
+    min_size            TEXT    NOT NULL,
+    pool_daily          TEXT    NOT NULL,
+    quote_spread_cents  TEXT    NOT NULL,
+    quote_shares        TEXT    NOT NULL,
+    capital             TEXT    NOT NULL,
+    samples_scored      INTEGER NOT NULL,
+    samples_expected    INTEGER NOT NULL,
+    samples_lost        INTEGER NOT NULL,
+    share_sum           TEXT    NOT NULL,
+    our_score_sum       TEXT    NOT NULL,
+    competing_score_sum TEXT    NOT NULL,
+    gross_usd           TEXT    NOT NULL,
+    gross_paid_usd      TEXT    NOT NULL,
+    fills               INTEGER NOT NULL,
+    fill_shares         TEXT    NOT NULL,
+    markout_short_usd   TEXT    NOT NULL,
+    markout_long_usd    TEXT    NOT NULL,
+    fills_marked_short  INTEGER NOT NULL,
+    fills_marked_long   INTEGER NOT NULL,
+    fills_pending       INTEGER NOT NULL,
+    net_usd             TEXT    NOT NULL,
+    no_print_feed       INTEGER NOT NULL,
+    opened_at           TEXT    NOT NULL,
+    closed_at           TEXT    NOT NULL,
+    UNIQUE(day, condition_id)
+);
+CREATE INDEX idx_reward_epochs_day ON reward_epochs(day);
+
+CREATE TABLE reward_fills (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_id  TEXT    NOT NULL,
+    token_id      TEXT    NOT NULL,
+    yes_side      INTEGER NOT NULL,
+    price         TEXT    NOT NULL,
+    size          TEXT    NOT NULL,
+    mid_at_fill   TEXT    NOT NULL,
+    markout_short TEXT,
+    markout_long  TEXT,
+    filled_at     TEXT    NOT NULL,
+    recorded_at   TEXT    NOT NULL
+);
+CREATE INDEX idx_reward_fills_filled_at ON reward_fills(filled_at);
+
+CREATE TABLE nearres_observations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id            TEXT    NOT NULL UNIQUE,
+    condition_id        TEXT    NOT NULL,
+    event_slug          TEXT    NOT NULL,
+    question            TEXT    NOT NULL,
+    outcome             TEXT    NOT NULL,
+    outcome_index       INTEGER NOT NULL,
+    category            TEXT    NOT NULL,
+    ask                 TEXT    NOT NULL,
+    ask_size            TEXT    NOT NULL,
+    ask_depth           TEXT    NOT NULL,
+    best_bid            TEXT,
+    fee_rate            TEXT    NOT NULL,
+    fee_per_share       TEXT    NOT NULL,
+    end_date            TEXT    NOT NULL,
+    hours_to_resolution TEXT    NOT NULL,
+    qualified_at        TEXT    NOT NULL
+);
+CREATE INDEX idx_nearres_observations_qualified_at ON nearres_observations(qualified_at);
+
+CREATE TABLE nearres_resolutions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id        TEXT    NOT NULL UNIQUE,
+    condition_id    TEXT    NOT NULL,
+    outcome         TEXT    NOT NULL,
+    payout          TEXT,
+    hours_to_payout TEXT    NOT NULL,
+    uma_status      TEXT,
+    disputed        INTEGER NOT NULL,
+    resolved_at     TEXT    NOT NULL
+);
+CREATE INDEX idx_nearres_resolutions_resolved_at ON nearres_resolutions(resolved_at);
+"#;
+
 /// `(version, name, ddl)`. Append-only: never edit a shipped migration.
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial schema", SCHEMA_V1),
     (2, "detection latency", SCHEMA_V2),
     (3, "runtime status and funnel counters", SCHEMA_V3),
     (4, "maker fill simulations", SCHEMA_V4),
+    (5, "measurement phase R: rewards farming and near-resolution study", SCHEMA_V5),
 ];
 
 /// The schema version the dashboard needs to read (`runtime_status` + funnel counters, and
 /// since M8 the `maker_sims` table it reads the maker lower bound from).
+///
+/// Deliberately **not** raised to 5 by Measurement Phase R: the dashboard reads none of the
+/// R1/R2 tables, and a minimum it does not need would only lock an operator out of a page
+/// that would have rendered perfectly.
 pub const DASHBOARD_MIN_SCHEMA: i64 = 4;
+
+/// The newest migration this build ships. `schema_version()` reaches it after `open`.
+pub const CURRENT_SCHEMA: i64 = MIGRATIONS.len() as i64;
 
 // ---------------------------------------------------------------------------------
 // Lifecycle
@@ -385,6 +501,43 @@ pub struct MakerSimRow {
     pub no_print_feed: bool,
     pub opened_at: String,
     pub closed_at: String,
+}
+
+/// One closed reward epoch, read back for the report (R1).
+///
+/// A projection, not the whole row: the score sums and the placement snapshot stay in the
+/// database, because nothing that aggregates these needs them and re-deriving a verdict in
+/// the reader is exactly what insert-only rows exist to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewardEpochRow {
+    pub day: NaiveDate,
+    pub condition_id: String,
+    pub event_slug: String,
+    pub question: String,
+    pub category: String,
+    pub pool_daily: Decimal,
+    pub max_spread_cents: Decimal,
+    pub min_size: Decimal,
+    pub quote_spread_cents: Decimal,
+    pub quote_shares: Decimal,
+    pub capital: Decimal,
+    pub samples_scored: i64,
+    pub samples_expected: i64,
+    pub samples_lost: i64,
+    /// What the Q-score share would have paid before the $1/day/market floor.
+    pub gross_usd: Decimal,
+    /// …and after it. Below $1 a market pays nothing at all.
+    pub gross_paid_usd: Decimal,
+    pub fills: i64,
+    pub fill_shares: Decimal,
+    pub markout_short_usd: Decimal,
+    pub markout_long_usd: Decimal,
+    pub fills_pending: i64,
+    /// `gross_paid_usd + markout_short_usd` — the number the kill-line reads.
+    pub net_usd: Decimal,
+    /// The epoch's window contained time with no trade-print feed: its markout is an absence
+    /// of measurement, not a measurement of no adverse selection.
+    pub no_print_feed: bool,
 }
 
 /// Scan telemetry summed over an arbitrary window of hourly buckets (dashboard funnel).
@@ -921,6 +1074,389 @@ impl Store {
             .collect()
     }
 
+    // -----------------------------------------------------------------------------
+    // R1 — rewards farming
+    // -----------------------------------------------------------------------------
+
+    /// Persist one **closed** reward epoch. Insert-only, and `INSERT OR IGNORE` against the
+    /// `(day, condition_id)` unique index: a second attempt at the same epoch is refused by
+    /// the schema rather than overwriting the verdict. Returns whether a row was written.
+    pub fn record_reward_epoch(&self, epoch: &crate::rewardsim::ClosedEpoch) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO reward_epochs (
+                     day, condition_id, event_slug, question, category, max_spread_cents,
+                     min_size, pool_daily, quote_spread_cents, quote_shares, capital,
+                     samples_scored, samples_expected, samples_lost, share_sum, our_score_sum,
+                     competing_score_sum, gross_usd, gross_paid_usd, fills, fill_shares,
+                     markout_short_usd, markout_long_usd, fills_marked_short,
+                     fills_marked_long, fills_pending, net_usd, no_print_feed, opened_at,
+                     closed_at
+                 ) VALUES (
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
+                 )",
+                params![
+                    epoch.day.to_string(),
+                    epoch.condition_id,
+                    epoch.event_slug,
+                    epoch.question,
+                    epoch.category,
+                    dec(epoch.params.max_spread_cents),
+                    dec(epoch.params.min_size),
+                    dec(epoch.params.pool_daily),
+                    dec(epoch.s_cents),
+                    dec(epoch.shares),
+                    dec(epoch.capital),
+                    epoch.samples_scored,
+                    epoch.samples_expected,
+                    epoch.samples_lost,
+                    dec(epoch.share_sum),
+                    dec(epoch.our_score_sum),
+                    dec(epoch.competing_score_sum),
+                    dec(epoch.gross_usd),
+                    dec(epoch.gross_paid_usd),
+                    epoch.fills,
+                    dec(epoch.fill_shares),
+                    dec(epoch.markout_short_usd),
+                    dec(epoch.markout_long_usd),
+                    epoch.fills_marked_short,
+                    epoch.fills_marked_long,
+                    epoch.fills_pending,
+                    dec(epoch.net_usd),
+                    epoch.no_print_feed as i64,
+                    now_str(epoch.opened_at),
+                    now_str(epoch.closed_at),
+                ],
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(n > 0)
+    }
+
+    /// Persist one simulated fill whose markout matured. Insert-only.
+    pub fn record_reward_fill(
+        &self,
+        fill: &crate::rewardsim::SimulatedFill,
+        now: DateTime<Utc>,
+    ) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "INSERT INTO reward_fills (
+                 condition_id, token_id, yes_side, price, size, mid_at_fill, markout_short,
+                 markout_long, filled_at, recorded_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             RETURNING id",
+            params![
+                fill.condition_id,
+                fill.token_id.as_str(),
+                fill.yes_side as i64,
+                dec(fill.price),
+                dec(fill.size),
+                dec(fill.mid_at_fill),
+                fill.markout_short.map(dec),
+                fill.markout_long.map(dec),
+                now_str(fill.filled_at),
+                now_str(now),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|e| self.err(e))
+    }
+
+    /// Closed reward epochs for one UTC day.
+    pub fn reward_epochs_for_day(&self, day: NaiveDate) -> Result<Vec<RewardEpochRow>> {
+        self.reward_epochs_where("day = ?1 ORDER BY net_usd DESC, condition_id ASC",
+            params![day.to_string()])
+    }
+
+    /// Closed reward epochs on or after `from`, oldest first — the kill-line's window.
+    pub fn reward_epochs_since(&self, from: NaiveDate) -> Result<Vec<RewardEpochRow>> {
+        self.reward_epochs_where(
+            "day >= ?1 ORDER BY day ASC, condition_id ASC",
+            params![from.to_string()],
+        )
+    }
+
+    fn reward_epochs_where(
+        &self,
+        predicate: &str,
+        args: impl rusqlite::Params,
+    ) -> Result<Vec<RewardEpochRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT day, condition_id, event_slug, question, category, pool_daily,
+                        max_spread_cents, min_size, quote_spread_cents, quote_shares, capital,
+                        samples_scored, samples_expected, samples_lost, gross_usd,
+                        gross_paid_usd, fills, fill_shares, markout_short_usd,
+                        markout_long_usd, fills_pending, net_usd, no_print_feed
+                 FROM reward_epochs WHERE {predicate}"
+            ))
+            .map_err(|e| self.err(e))?;
+        let raw = stmt
+            .query_map(args, |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, String>(18)?,
+                    row.get::<_, String>(19)?,
+                    row.get::<_, i64>(20)?,
+                    row.get::<_, String>(21)?,
+                    row.get::<_, i64>(22)? != 0,
+                ))
+            })
+            .map_err(|e| self.err(e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| self.err(e))?;
+
+        raw.into_iter()
+            .map(|r| {
+                Ok(RewardEpochRow {
+                    day: NaiveDate::parse_from_str(&r.0, "%Y-%m-%d").map_err(|_| {
+                        StoreError::Value {
+                            column: "reward_epochs.day",
+                            value: r.0.clone(),
+                        }
+                    })?,
+                    condition_id: r.1,
+                    event_slug: r.2,
+                    question: r.3,
+                    category: r.4,
+                    pool_daily: parse_dec("pool_daily", &r.5)?,
+                    max_spread_cents: parse_dec("max_spread_cents", &r.6)?,
+                    min_size: parse_dec("min_size", &r.7)?,
+                    quote_spread_cents: parse_dec("quote_spread_cents", &r.8)?,
+                    quote_shares: parse_dec("quote_shares", &r.9)?,
+                    capital: parse_dec("capital", &r.10)?,
+                    samples_scored: r.11,
+                    samples_expected: r.12,
+                    samples_lost: r.13,
+                    gross_usd: parse_dec("gross_usd", &r.14)?,
+                    gross_paid_usd: parse_dec("gross_paid_usd", &r.15)?,
+                    fills: r.16,
+                    fill_shares: parse_dec("fill_shares", &r.17)?,
+                    markout_short_usd: parse_dec("markout_short_usd", &r.18)?,
+                    markout_long_usd: parse_dec("markout_long_usd", &r.19)?,
+                    fills_pending: r.20,
+                    net_usd: parse_dec("net_usd", &r.21)?,
+                    no_print_feed: r.22,
+                })
+            })
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------------
+    // R2 — near-resolution observation
+    // -----------------------------------------------------------------------------
+
+    /// Record one qualification. Insert-only, `token_id` UNIQUE: a market qualifies once, at
+    /// the first moment its ask was in band. Returns whether a row was written.
+    pub fn record_nearres_observation(&self, q: &crate::nearres::Qualification) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO nearres_observations (
+                     token_id, condition_id, event_slug, question, outcome, outcome_index,
+                     category, ask, ask_size, ask_depth, best_bid, fee_rate, fee_per_share,
+                     end_date, hours_to_resolution, qualified_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    q.token_id.as_str(),
+                    q.condition_id,
+                    q.event_slug,
+                    q.question,
+                    q.outcome,
+                    q.outcome_index as i64,
+                    q.category,
+                    dec(q.ask),
+                    dec(q.ask_size),
+                    dec(q.ask_depth),
+                    q.best_bid.map(dec),
+                    dec(q.fee_rate),
+                    dec(q.fee_per_share),
+                    now_str(q.end_date),
+                    dec(q.hours_to_resolution),
+                    now_str(q.qualified_at),
+                ],
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(n > 0)
+    }
+
+    /// Record one resolution verdict. Insert-only, `token_id` UNIQUE.
+    pub fn record_nearres_resolution(&self, r: &crate::nearres::Resolution) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO nearres_resolutions (
+                     token_id, condition_id, outcome, payout, hours_to_payout, uma_status,
+                     disputed, resolved_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    r.token_id.as_str(),
+                    r.condition_id,
+                    r.outcome.as_str(),
+                    r.payout.map(dec),
+                    dec(r.hours_to_payout),
+                    r.uma_status,
+                    r.disputed as i64,
+                    now_str(r.resolved_at),
+                ],
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(n > 0)
+    }
+
+    /// Observations with no resolution row yet — what a restarted daemon has to keep
+    /// following.
+    pub fn nearres_open_observations(&self) -> Result<Vec<crate::nearres::Qualification>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.token_id, o.condition_id, o.event_slug, o.question, o.outcome,
+                        o.outcome_index, o.category, o.ask, o.ask_size, o.ask_depth,
+                        o.best_bid, o.fee_rate, o.fee_per_share, o.end_date,
+                        o.hours_to_resolution, o.qualified_at
+                 FROM nearres_observations o
+                 LEFT JOIN nearres_resolutions r ON r.token_id = o.token_id
+                 WHERE r.token_id IS NULL
+                 ORDER BY o.qualified_at ASC",
+            )
+            .map_err(|e| self.err(e))?;
+        let raw = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
+                ))
+            })
+            .map_err(|e| self.err(e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| self.err(e))?;
+
+        raw.into_iter()
+            .map(|r| {
+                Ok(crate::nearres::Qualification {
+                    token_id: crate::types::TokenId::new(r.0),
+                    condition_id: r.1,
+                    event_slug: r.2,
+                    question: r.3,
+                    outcome: r.4,
+                    outcome_index: r.5.max(0) as usize,
+                    category: r.6,
+                    ask: parse_dec("ask", &r.7)?,
+                    ask_size: parse_dec("ask_size", &r.8)?,
+                    ask_depth: parse_dec("ask_depth", &r.9)?,
+                    best_bid: parse_opt_dec("best_bid", r.10.as_deref())?,
+                    fee_rate: parse_dec("fee_rate", &r.11)?,
+                    fee_per_share: parse_dec("fee_per_share", &r.12)?,
+                    end_date: parse_ts("nearres_observations.end_date", &r.13)?,
+                    hours_to_resolution: parse_dec("hours_to_resolution", &r.14)?,
+                    qualified_at: parse_ts("nearres_observations.qualified_at", &r.15)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Tokens that already have a verdict — so a restart never re-qualifies them.
+    pub fn nearres_resolved_tokens(&self) -> Result<Vec<crate::types::TokenId>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT token_id FROM nearres_resolutions")
+            .map_err(|e| self.err(e))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| self.err(e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| self.err(e))?;
+        Ok(rows.into_iter().map(crate::types::TokenId::new).collect())
+    }
+
+    /// Resolved observations, joined, for the report's arithmetic.
+    pub fn nearres_resolved(&self) -> Result<Vec<crate::nearres::ResolvedObservation>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.token_id, o.event_slug, o.category, o.ask, o.fee_per_share,
+                        r.outcome, r.payout, r.hours_to_payout, r.disputed
+                 FROM nearres_resolutions r
+                 JOIN nearres_observations o ON o.token_id = r.token_id
+                 ORDER BY r.resolved_at ASC",
+            )
+            .map_err(|e| self.err(e))?;
+        let raw = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)? != 0,
+                ))
+            })
+            .map_err(|e| self.err(e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| self.err(e))?;
+
+        raw.into_iter()
+            .map(|r| {
+                Ok(crate::nearres::ResolvedObservation {
+                    token_id: r.0,
+                    event_slug: r.1,
+                    category: r.2,
+                    ask: parse_dec("ask", &r.3)?,
+                    fee_per_share: parse_dec("fee_per_share", &r.4)?,
+                    outcome: crate::nearres::ResolutionOutcome::from_str(&r.5),
+                    payout: parse_opt_dec("payout", r.6.as_deref())?,
+                    hours_to_payout: parse_dec("hours_to_payout", &r.7)?,
+                    disputed: r.8,
+                })
+            })
+            .collect()
+    }
+
+    /// How many observations exist in total (the study's denominator of qualifications).
+    pub fn nearres_observation_count(&self) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM nearres_observations", [], |r| r.get(0))
+            .map_err(|e| self.err(e))
+    }
+
     /// Fold one scan cycle into its UTC-hour bucket (low cardinality: 24 rows/day).
     pub fn record_cycle(&self, stats: &CycleStats, now: DateTime<Utc>) -> Result<()> {
         let hour = now.format("%Y-%m-%dT%H").to_string();
@@ -1355,6 +1891,16 @@ fn parse_dec(column: &'static str, raw: &str) -> Result<Decimal> {
     })
 }
 
+/// Parse a timestamp column written by [`now_str`].
+fn parse_ts(column: &'static str, raw: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|_| StoreError::Value {
+            column,
+            value: raw.to_string(),
+        })
+}
+
 fn parse_opt_dec(column: &'static str, raw: Option<&str>) -> Result<Option<Decimal>> {
     match raw {
         None => Ok(None),
@@ -1615,7 +2161,11 @@ pub(crate) mod tests {
         let latest: i64 = conn
             .query_row("SELECT MAX(version) FROM migrations", [], |r| r.get(0))
             .expect("max");
-        assert_eq!(latest, DASHBOARD_MIN_SCHEMA);
+        assert_eq!(latest, CURRENT_SCHEMA);
+        assert!(
+            CURRENT_SCHEMA >= DASHBOARD_MIN_SCHEMA,
+            "the dashboard's minimum can never exceed what the daemon migrates to"
+        );
         // v3's `runtime_status` is a single-row table by constraint, and the two funnel
         // counters default to 0 so an older bucket reads as "not measured", not as a zero
         // that means something.
@@ -1662,7 +2212,7 @@ pub(crate) mod tests {
         let store = Store::in_memory().expect("db");
         store.migrate().expect("second migrate");
         store.migrate().expect("third migrate");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.schema_version().expect("version"), CURRENT_SCHEMA);
 
         // The FK is real: a simulation belongs to an opportunity row.
         let opportunity_id = store
@@ -2013,10 +2563,7 @@ pub(crate) mod tests {
         }
 
         let reader = Store::open_read_only(&path).expect("open read-only");
-        assert_eq!(
-            reader.schema_version().expect("version"),
-            DASHBOARD_MIN_SCHEMA
-        );
+        assert_eq!(reader.schema_version().expect("version"), CURRENT_SCHEMA);
         assert_eq!(reader.opportunity_row_count().expect("count"), 1);
         // Read-only by construction: even a caller who asked for a write cannot get one.
         let write = reader.write_runtime_status(&RuntimeStatus::default(), Utc::now());

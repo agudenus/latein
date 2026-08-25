@@ -376,10 +376,36 @@ pub struct MarketTrading {
     pub min_tick_size: Option<Decimal>,
     #[serde(default)]
     pub min_order_size: Option<Decimal>,
+    /// `rewardsMinSize` — the smallest order, **in shares**, that scores at all. Distinct
+    /// from `min_order_size` (the CLOB's own 5-share floor): an order can be perfectly legal
+    /// and still score zero.
     #[serde(default)]
     pub rewards_min_size: Option<Decimal>,
+    /// `rewardsMaxSpread` — the qualifying half-band **in cents** (e.g. `3.5`), while every
+    /// book price in this codebase is a fraction of a dollar (`0.035`). The 100× confusion
+    /// between the two is a documented bug class in ported implementations, so the unit is
+    /// carried in the name of every conversion (see `rewardsim::cents_to_dollars`).
     #[serde(default)]
     pub rewards_max_spread: Option<Decimal>,
+    /// Total configured reward pool for this market, USD per day: the sum of
+    /// `clobRewards[].rewardsDailyRate` (R1).
+    ///
+    /// It is a **configured cap, not a payout** — the research is explicit that the sum of
+    /// advertised daily rates across the venue is an order of magnitude above what is
+    /// actually distributed, because a market that never reaches its LP-activity threshold
+    /// pays out less than its rate. Never model income off it without saying so.
+    #[serde(default)]
+    pub rewards_daily_rate: Option<Decimal>,
+}
+
+impl MarketTrading {
+    /// True when this market advertises a reward pool *and* both qualification parameters,
+    /// which is the minimum needed to score a quote at all.
+    pub fn reward_eligible(&self) -> bool {
+        self.rewards_daily_rate.is_some_and(|r| r > Decimal::ZERO)
+            && self.rewards_max_spread.is_some_and(|v| v > Decimal::ZERO)
+            && self.rewards_min_size.is_some_and(|s| s > Decimal::ZERO)
+    }
 }
 
 impl TrackedMarket {

@@ -279,6 +279,33 @@ pub struct RawMarket {
         deserialize_with = "de_opt_decimal"
     )]
     pub rewards_max_spread: Option<rust_decimal::Decimal>,
+    /// `clobRewards[]` — one entry per funded reward config on this market (R1).
+    ///
+    /// TODO(verify-live): the field is documented and used by the public LP dashboards
+    /// (they sum `rewardsDailyRate` across eligible markets to publish the "live pool"), but
+    /// this container cannot reach Gamma, so the shape here is fixture-verified only.
+    #[serde(default, rename = "clobRewards")]
+    pub clob_rewards: Option<Vec<RawClobReward>>,
+
+    // ---- resolution data (R2; only ever read for *closed* markets) -------------------
+    /// `outcomePrices` — double-encoded like `outcomes`, e.g. `"[\"1\",\"0\"]"`. On a
+    /// resolved market this is the payout vector, index-aligned with `outcomes`.
+    /// TODO(verify-live): fixture-verified shape only.
+    #[serde(
+        default,
+        rename = "outcomePrices",
+        deserialize_with = "de_opt_string_array"
+    )]
+    pub outcome_prices: Option<Vec<String>>,
+    /// `umaResolutionStatus` — e.g. `"resolved"`, `"proposed"`, `"disputed"`. The only
+    /// dispute indicator this build can see; absent means "the API said nothing", never
+    /// "undisputed".
+    #[serde(default, rename = "umaResolutionStatus")]
+    pub uma_resolution_status: Option<String>,
+    /// `hasReviewedDates` / `resolvedBy` and friends vary by payload; `resolvedBy` is the
+    /// one consistently present, and it is captured for the record only.
+    #[serde(default, rename = "resolvedBy")]
+    pub resolved_by: Option<String>,
 
     // ---- activity figures (M6.4) -------------------------------------------------
     // Present on live Gamma market objects in several spellings, and *all* optional: the
@@ -310,6 +337,25 @@ pub struct RawMarket {
     pub best_ask: Option<rust_decimal::Decimal>,
 }
 
+/// One entry of `clobRewards[]`: `{"rewardsDailyRate": 30, "startDate": …, "endDate": …}`.
+///
+/// Only the rate is read. The dates are captured because a configured pool can expire
+/// mid-week (`rewards_config` carries `start_date`/`end_date`), which is one of the ways a
+/// portfolio chosen this morning is worth nothing this evening.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawClobReward {
+    #[serde(
+        default,
+        rename = "rewardsDailyRate",
+        deserialize_with = "de_opt_decimal"
+    )]
+    pub rewards_daily_rate: Option<rust_decimal::Decimal>,
+    #[serde(default, rename = "startDate")]
+    pub start_date: Option<String>,
+    #[serde(default, rename = "endDate")]
+    pub end_date: Option<String>,
+}
+
 /// `{"exponent": 1, "rate": 0.04, "takerOnly": true, "rebateRate": 0.25}`.
 ///
 /// Unknown fields are ignored and every known one is optional, so a schedule that grows a
@@ -330,6 +376,27 @@ pub struct RawFeeSchedule {
 // ---------------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------------
+
+/// Parse a `/markets` response body (R2 resolution lookup).
+///
+/// Same three shapes as [`parse_events_page`], minus the keyset envelope's `events` key:
+/// a bare array, or `{data: [...]}`.
+pub fn parse_markets_page(url: &str, body: &str) -> Result<Vec<RawMarket>, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Page {
+        Bare(Vec<RawMarket>),
+        Wrapped { data: Vec<RawMarket> },
+    }
+
+    match serde_json::from_str::<Page>(body) {
+        Ok(Page::Bare(v)) | Ok(Page::Wrapped { data: v }) => Ok(v),
+        Err(source) => Err(ApiError::Decode {
+            url: url.to_string(),
+            source,
+        }),
+    }
+}
 
 /// Parse one events page.
 ///
@@ -572,8 +639,26 @@ fn classify_market(m: &RawMarket) -> Result<TrackedMarket, DropReason> {
             min_order_size: m.order_min_size,
             rewards_min_size: m.rewards_min_size,
             rewards_max_spread: m.rewards_max_spread,
+            rewards_daily_rate: rewards_daily_rate(m),
         },
     })
+}
+
+/// Total configured reward pool for a market, USD/day: `Σ clobRewards[].rewardsDailyRate`.
+///
+/// `None` when the array is absent or carries no rate — "the API said nothing", which R1's
+/// candidate filter treats as *not eligible* rather than as a zero pool. A zero-rate array is
+/// a real zero and is returned as such.
+fn rewards_daily_rate(m: &RawMarket) -> Option<rust_decimal::Decimal> {
+    let rates = m.clob_rewards.as_ref()?;
+    let mut total = None;
+    for entry in rates {
+        if let Some(rate) = entry.rewards_daily_rate.filter(|r| *r >= rust_decimal::Decimal::ZERO)
+        {
+            total = Some(total.unwrap_or(rust_decimal::Decimal::ZERO) + rate);
+        }
+    }
+    total
 }
 
 /// Fold the three fee fields into the domain type. A missing `feeSchedule` leaves the rate
@@ -946,6 +1031,37 @@ impl<'a> GammaClient<'a> {
             truncated,
             endpoint: url,
         })
+    }
+
+    /// Look markets up by `conditionId`, **including closed ones** (R2).
+    ///
+    /// This is the only call in the codebase that deliberately asks about markets that have
+    /// left the tracked universe: the near-resolution study needs to know how a 96–99¢ ask
+    /// actually settled, and discovery filters closed markets out by design.
+    ///
+    /// Anything it cannot answer stays unanswered. A market the API does not return, or
+    /// returns without a usable `outcomePrices`, produces no entry here — the caller records
+    /// `undetermined`, never a guessed outcome.
+    ///
+    /// TODO(verify-live): `GET /markets?condition_ids=` is unreachable from this container.
+    /// The query-parameter name (`condition_ids`, repeated) and the response shape (bare
+    /// array or `{data: [...]}`) are fixture-verified only.
+    pub async fn fetch_markets_by_condition(
+        &self,
+        condition_ids: &[String],
+        batch_size: usize,
+    ) -> Result<Vec<RawMarket>, ApiError> {
+        let url = format!("{}/markets", self.base_url);
+        let mut out = Vec::with_capacity(condition_ids.len());
+        for chunk in condition_ids.chunks(batch_size.max(1)) {
+            let mut query: Vec<(&str, String)> = vec![("limit", chunk.len().to_string())];
+            for id in chunk {
+                query.push(("condition_ids", id.clone()));
+            }
+            let body = self.http.get_json(&url, &query).await?;
+            out.extend(parse_markets_page(&url, &body)?);
+        }
+        Ok(out)
     }
 
     fn warn_max_events(&self, pages: usize, events: usize) {

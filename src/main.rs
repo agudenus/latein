@@ -13,6 +13,8 @@ mod dryrun;
 mod gamma;
 mod http;
 mod makersim;
+mod nearres;
+mod rewardsim;
 mod risk;
 mod store;
 #[cfg(test)]

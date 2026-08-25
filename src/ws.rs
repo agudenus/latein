@@ -310,6 +310,50 @@ pub trait PrintObserver: Send + Sync {
     fn observe(&self, print: &TradePrint, received: Instant);
 }
 
+/// Several observers behind one [`BookStore`] hook (R1).
+///
+/// The store deliberately holds a single observer slot, and that stays true: this is one
+/// observer that forwards. It exists because the tape now answers two different questions —
+/// M8 asks "would our resting arbitrage leg have been traded through?", R1 asks "did a print
+/// cross the in-band quote we would have had out?" — and both need every print.
+///
+/// Order is the order they were handed over, and each one is called even if an earlier one is
+/// slow: a fanout that could drop an observer would silently turn one measurement into a hole
+/// without anything saying so.
+pub struct PrintFanout {
+    observers: Vec<Arc<dyn PrintObserver>>,
+}
+
+impl PrintFanout {
+    pub fn new(observers: Vec<Arc<dyn PrintObserver>>) -> Self {
+        Self { observers }
+    }
+
+    pub fn len(&self) -> usize {
+        self.observers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.observers.is_empty()
+    }
+}
+
+impl std::fmt::Debug for PrintFanout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrintFanout")
+            .field("observers", &self.observers.len())
+            .finish()
+    }
+}
+
+impl PrintObserver for PrintFanout {
+    fn observe(&self, print: &TradePrint, received: Instant) {
+        for observer in &self.observers {
+            observer.observe(print, received);
+        }
+    }
+}
+
 /// Wire form. Every field is optional: the parser decides what a frame is, not serde.
 #[derive(Debug, Deserialize)]
 struct RawFrame {
