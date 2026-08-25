@@ -332,7 +332,12 @@ impl ClobClient<'_> {
             pages += 1;
             let got = page.markets.len();
             out.extend(page.markets);
-            tracing::debug!(page = pages, got, total = out.len(), "fetched sampling markets");
+            tracing::debug!(
+                page = pages,
+                got,
+                total = out.len(),
+                "fetched sampling markets"
+            );
             match page.next_cursor {
                 // A cursor that does not advance would page forever; stop instead.
                 Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
@@ -444,11 +449,14 @@ mod tests {
     fn the_sampling_cursor_terminates_on_the_end_sentinel_and_on_absence() {
         let end = r#"{"data":[],"next_cursor":"LTE="}"#;
         assert_eq!(
-            parse_sampling_markets("test", end).expect("parses").next_cursor,
+            parse_sampling_markets("test", end)
+                .expect("parses")
+                .next_cursor,
             None,
             "LTE= is the CLOB's end-of-pages sentinel and must not be paged on"
         );
-        let bare = r#"[{"condition_id":"0x1","rewards":{"rates":[],"min_size":20,"max_spread":3}}]"#;
+        let bare =
+            r#"[{"condition_id":"0x1","rewards":{"rates":[],"min_size":20,"max_spread":3}}]"#;
         let page = parse_sampling_markets("test", bare).expect("bare array");
         assert_eq!(page.next_cursor, None);
         // An empty (but present) rates array is a real zero pool.

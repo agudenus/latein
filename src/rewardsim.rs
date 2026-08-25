@@ -388,18 +388,8 @@ pub fn evaluate_candidate(
 
 /// In-band competing score for a merged book, both sides, under the documented aggregation.
 pub fn competing_score(merged: &MergedBook, mid: Decimal, params: &RewardParams) -> Decimal {
-    let bid = book_side_score(
-        &merged.bids,
-        mid,
-        params.max_spread_cents,
-        params.min_size,
-    );
-    let ask = book_side_score(
-        &merged.asks,
-        mid,
-        params.max_spread_cents,
-        params.min_size,
-    );
+    let bid = book_side_score(&merged.bids, mid, params.max_spread_cents, params.min_size);
+    let ask = book_side_score(&merged.asks, mid, params.max_spread_cents, params.min_size);
     side_aggregate(mid, bid, ask)
 }
 
@@ -517,6 +507,7 @@ pub struct ClosedEpoch {
 impl ClosedEpoch {
     /// True when this epoch cannot honestly contribute a *net* figure: no print feed, so the
     /// markout side of the ledger was never measured.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn markout_is_a_hole(&self) -> bool {
         self.no_print_feed
     }
@@ -645,6 +636,177 @@ impl MarketEpoch {
     }
 }
 
+// ---------------------------------------------------------------------------------
+// Reporting and the pre-committed kill-line
+// ---------------------------------------------------------------------------------
+
+/// One UTC day's portfolio, aggregated across its markets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayTotals {
+    pub day: NaiveDate,
+    pub markets: usize,
+    pub capital: Decimal,
+    /// What the reward pools would have paid, after the $1/day/market floor.
+    pub gross_paid: Decimal,
+    /// What the pools advertise before the floor eats the sub-$1 markets. Reported beside
+    /// `gross_paid` because the difference *is* the small-account tax.
+    pub gross_before_floor: Decimal,
+    /// Signed markout at the short horizon. Negative is adverse selection.
+    pub markout: Decimal,
+    /// `gross_paid + markout`.
+    pub net: Decimal,
+    pub fills: i64,
+    /// Markets whose epoch had a hole in the print feed — their markout is not evidence.
+    pub markets_with_holes: usize,
+}
+
+/// The pre-committed R1 kill-line, applied to the running mean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewardKillLine {
+    /// The window is complete and the mean beats the line.
+    Pass { mean_net: Decimal },
+    /// The window is complete and it does not. **Dead.**
+    Fail { mean_net: Decimal },
+    /// Fewer than `needed` days measured. Not a pass and not a fail: the report prints the
+    /// running mean and which way it currently points, and says the window is incomplete.
+    Provisional {
+        mean_net: Option<Decimal>,
+        days_measured: usize,
+        needed: u32,
+        would_fail: Option<bool>,
+    },
+}
+
+impl RewardKillLine {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Pass { .. } => "PASS",
+            Self::Fail { .. } => "FAIL",
+            Self::Provisional { .. } => "NO VERDICT YET",
+        }
+    }
+}
+
+/// The R1 section of the daily report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewardsSummary {
+    pub enabled: bool,
+    /// The reported day's own epochs, when they have closed. Epochs close at 00:00 UTC, so a
+    /// report generated *during* a day has none for it — which the section says outright
+    /// rather than printing a day's worth of zeros.
+    pub day: Option<DayTotals>,
+    /// The kill-line window, oldest first.
+    pub window: Vec<DayTotals>,
+    pub mean_net_per_day: Option<Decimal>,
+    pub mean_gross_per_day: Option<Decimal>,
+    pub capital_cap: Decimal,
+    pub kill_line: Decimal,
+    pub window_days: u32,
+    /// Days in the window whose markout is partly a hole.
+    pub days_with_holes: usize,
+    pub verdict: RewardKillLine,
+}
+
+/// Fold one day's epochs into a day total.
+pub fn day_totals(day: NaiveDate, epochs: &[&ClosedEpochSummary]) -> DayTotals {
+    let mut totals = DayTotals {
+        day,
+        markets: epochs.len(),
+        capital: Decimal::ZERO,
+        gross_paid: Decimal::ZERO,
+        gross_before_floor: Decimal::ZERO,
+        markout: Decimal::ZERO,
+        net: Decimal::ZERO,
+        fills: 0,
+        markets_with_holes: 0,
+    };
+    for epoch in epochs {
+        totals.capital += epoch.capital;
+        totals.gross_paid += epoch.gross_paid_usd;
+        totals.gross_before_floor += epoch.gross_usd;
+        totals.markout += epoch.markout_short_usd;
+        // Credited from the row's own column, never re-derived: the daemon decided what this
+        // epoch paid, once.
+        totals.net += epoch.net_usd;
+        totals.fills += epoch.fills;
+        if epoch.no_print_feed {
+            totals.markets_with_holes += 1;
+        }
+    }
+    totals
+}
+
+/// A closed epoch as the report reads it back — the subset of the row the arithmetic needs.
+///
+/// A separate, tiny type on purpose: the summary can then be tested without a database, and
+/// it can only ever *add up* verdicts the daemon already wrote, never re-derive one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedEpochSummary {
+    pub day: NaiveDate,
+    pub capital: Decimal,
+    pub gross_usd: Decimal,
+    pub gross_paid_usd: Decimal,
+    pub markout_short_usd: Decimal,
+    pub net_usd: Decimal,
+    pub fills: i64,
+    pub no_print_feed: bool,
+}
+
+/// Build the R1 section from closed epochs.
+///
+/// `window` must be every closed epoch in the kill-line window (any order). A day with no
+/// closed epoch at all is a **missing** day, not a zero day: it is left out of the mean and
+/// counted against the window's completeness, because a daemon that was down did not measure
+/// a zero — it measured nothing.
+pub fn summarize_epochs(
+    enabled: bool,
+    day: NaiveDate,
+    window: &[ClosedEpochSummary],
+    cfg: &RewardSimConfig,
+) -> RewardsSummary {
+    let mut by_day: BTreeMap<NaiveDate, Vec<&ClosedEpochSummary>> = BTreeMap::new();
+    for epoch in window {
+        by_day.entry(epoch.day).or_default().push(epoch);
+    }
+    let days: Vec<DayTotals> = by_day
+        .iter()
+        .map(|(d, epochs)| day_totals(*d, epochs))
+        .collect();
+
+    let measured = days.len();
+    let mean_net = (measured > 0).then(|| {
+        (days.iter().map(|d| d.net).sum::<Decimal>() / Decimal::from(measured)).round_dp(4)
+    });
+    let mean_gross = (measured > 0).then(|| {
+        (days.iter().map(|d| d.gross_paid).sum::<Decimal>() / Decimal::from(measured)).round_dp(4)
+    });
+    let verdict = match (mean_net, measured as u32 >= cfg.kill_line_window_days) {
+        (Some(mean), true) if mean > cfg.kill_line_net_usd_per_day => {
+            RewardKillLine::Pass { mean_net: mean }
+        }
+        (Some(mean), true) => RewardKillLine::Fail { mean_net: mean },
+        (mean, _) => RewardKillLine::Provisional {
+            mean_net: mean,
+            days_measured: measured,
+            needed: cfg.kill_line_window_days,
+            would_fail: mean.map(|m| m <= cfg.kill_line_net_usd_per_day),
+        },
+    };
+
+    RewardsSummary {
+        enabled,
+        day: days.iter().find(|d| d.day == day).cloned(),
+        days_with_holes: days.iter().filter(|d| d.markets_with_holes > 0).count(),
+        window: days,
+        mean_net_per_day: mean_net,
+        mean_gross_per_day: mean_gross,
+        capital_cap: cfg.capital_cap_usd,
+        kill_line: cfg.kill_line_net_usd_per_day,
+        window_days: cfg.kill_line_window_days,
+        verdict,
+    }
+}
+
 /// Counters for the health line and `runtime_status`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RewardStatsSnapshot {
@@ -743,14 +905,6 @@ impl RewardSimulator {
     pub fn portfolio_tokens(&self) -> Vec<TokenId> {
         let inner = self.lock();
         let mut out: Vec<TokenId> = inner.index.keys().cloned().collect();
-        out.sort();
-        out
-    }
-
-    /// The current portfolio's condition ids, in a stable order.
-    pub fn portfolio(&self) -> Vec<String> {
-        let inner = self.lock();
-        let mut out: Vec<String> = inner.epochs.keys().cloned().collect();
         out.sort();
         out
     }
@@ -1362,7 +1516,8 @@ mod tests {
         assert_eq!(thin_score.expected_net, Decimal::ZERO);
 
         // A measured markout history is subtracted before ranking, and can veto a market.
-        let with_history = evaluate_candidate(&rich, &books, &cfg, Some(dec!(-500))).expect("score");
+        let with_history =
+            evaluate_candidate(&rich, &books, &cfg, Some(dec!(-500))).expect("score");
         assert!(with_history.expected_net < Decimal::ZERO);
         let mut only_bad = vec![with_history];
         assert!(
@@ -1422,7 +1577,11 @@ mod tests {
         sim.observe_at(&sell("y1", dec!(0.47), dec!(999)), t(20));
         // A print above our bid never reaches us.
         sim.observe_at(&sell("n1", dec!(0.60), dec!(999)), t(21));
-        assert_eq!(sim.stats().fills, 1, "one fill per side per sample interval");
+        assert_eq!(
+            sim.stats().fills,
+            1,
+            "one fill per side per sample interval"
+        );
 
         // The short horizon matures five minutes after the fill (t=10), not five minutes
         // after the sample: at t=320 it is due, and the midpoint has not moved, so the
@@ -1507,6 +1666,128 @@ mod tests {
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].day, midday.date_naive());
         assert_eq!(sim.markout_history("c1"), Some(Decimal::ZERO));
+    }
+
+    fn epoch_summary(
+        day: &str,
+        net: Decimal,
+        gross_paid: Decimal,
+        hole: bool,
+    ) -> ClosedEpochSummary {
+        ClosedEpochSummary {
+            day: NaiveDate::parse_from_str(day, "%Y-%m-%d").expect("day"),
+            capital: dec!(98),
+            gross_usd: gross_paid + dec!(0.5),
+            gross_paid_usd: gross_paid,
+            markout_short_usd: net - gross_paid,
+            net_usd: net,
+            fills: 3,
+            no_print_feed: hole,
+        }
+    }
+
+    /// The kill-line: a complete window that clears the line, one that does not, and — the
+    /// case that matters most — a window with missing days, which is **not** a pass and not a
+    /// set of zeros.
+    #[test]
+    fn the_kill_line_needs_a_complete_window_and_never_invents_a_zero_day() {
+        let mut cfg = cfg();
+        cfg.kill_line_window_days = 3;
+        let day = |n: u32| NaiveDate::from_ymd_opt(2026, 9, n).expect("day");
+
+        // Three measured days, mean net $2/day: above the $1 line.
+        let good = [
+            epoch_summary("2026-09-01", dec!(1.50), dec!(4), false),
+            epoch_summary("2026-09-02", dec!(2.00), dec!(4), false),
+            epoch_summary("2026-09-03", dec!(2.50), dec!(4), false),
+        ];
+        let s = summarize_epochs(true, day(3), &good, &cfg);
+        assert_eq!(s.window.len(), 3);
+        assert_eq!(s.mean_net_per_day, Some(dec!(2)));
+        assert_eq!(s.mean_gross_per_day, Some(dec!(4)));
+        assert_eq!(s.verdict, RewardKillLine::Pass { mean_net: dec!(2) });
+        assert_eq!(s.verdict.label(), "PASS");
+        // The reported day's own totals are picked out of the window.
+        let today = s.day.expect("the day's own row");
+        assert_eq!(today.net, dec!(2.50));
+        assert_eq!(today.markets, 1);
+
+        // The same window at a tenth of the net: dead, exactly at the pre-committed rule.
+        let thin: Vec<ClosedEpochSummary> = good
+            .iter()
+            .map(|e| ClosedEpochSummary {
+                net_usd: dec!(0.20),
+                ..e.clone()
+            })
+            .collect();
+        let s = summarize_epochs(true, day(3), &thin, &cfg);
+        assert_eq!(
+            s.verdict,
+            RewardKillLine::Fail {
+                mean_net: dec!(0.2)
+            }
+        );
+
+        // Exactly at the line is a fail: the rule is "net ≤ $1/day is dead".
+        let at_line: Vec<ClosedEpochSummary> = good
+            .iter()
+            .map(|e| ClosedEpochSummary {
+                net_usd: Decimal::ONE,
+                ..e.clone()
+            })
+            .collect();
+        assert_eq!(
+            summarize_epochs(true, day(3), &at_line, &cfg).verdict,
+            RewardKillLine::Fail {
+                mean_net: Decimal::ONE
+            }
+        );
+
+        // Two of three days measured: no verdict, and the mean is over the days that exist —
+        // a day the daemon did not run measured *nothing*, not zero earnings. (Counting the
+        // missing day as $0 would show a mean of $1.17 here and read as a fail.)
+        let partial = [good[0].clone(), good[2].clone()];
+        let s = summarize_epochs(true, day(3), &partial, &cfg);
+        assert_eq!(s.mean_net_per_day, Some(dec!(2)));
+        assert_eq!(
+            s.verdict,
+            RewardKillLine::Provisional {
+                mean_net: Some(dec!(2)),
+                days_measured: 2,
+                needed: 3,
+                would_fail: Some(false),
+            }
+        );
+        assert_eq!(s.verdict.label(), "NO VERDICT YET");
+
+        // Several markets on one day add up into one day's totals, and a market with a hole
+        // in its print feed marks the day.
+        let one_day = [
+            epoch_summary("2026-09-03", dec!(1.00), dec!(3), false),
+            epoch_summary("2026-09-03", dec!(-0.50), dec!(2), true),
+        ];
+        let s = summarize_epochs(true, day(3), &one_day, &cfg);
+        let totals = s.day.expect("the day");
+        assert_eq!(totals.markets, 2);
+        assert_eq!(totals.net, dec!(0.50));
+        assert_eq!(totals.gross_paid, dec!(5));
+        assert_eq!(totals.capital, dec!(196));
+        assert_eq!(totals.markets_with_holes, 1);
+        assert_eq!(s.days_with_holes, 1);
+
+        // Nothing measured at all: no mean, no verdict, and nothing claimed.
+        let s = summarize_epochs(true, day(3), &[], &cfg);
+        assert!(s.day.is_none());
+        assert_eq!(s.mean_net_per_day, None);
+        assert!(matches!(
+            s.verdict,
+            RewardKillLine::Provisional {
+                mean_net: None,
+                days_measured: 0,
+                would_fail: None,
+                ..
+            }
+        ));
     }
 
     /// Only a SELL print can fill a resting buy, and only at or through our price.

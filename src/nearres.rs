@@ -128,11 +128,6 @@ impl ResolutionOutcome {
             _ => Self::Undetermined,
         }
     }
-
-    /// Whether this outcome can enter the loss-rate and yield arithmetic at all.
-    pub fn is_determined(self) -> bool {
-        !matches!(self, Self::Undetermined)
-    }
 }
 
 /// The verdict for one observation. Written once, when resolution is first observed.
@@ -271,10 +266,6 @@ impl NearResObserver {
         self.cfg.enabled
     }
 
-    pub fn config(&self) -> &NearResConfig {
-        &self.cfg
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, ObserverState> {
         self.state
             .lock()
@@ -359,9 +350,8 @@ impl NearResObserver {
                         counters.at_capacity += 1;
                         continue;
                     }
-                    let hours =
-                        (Decimal::from((end_date - now).num_minutes()) / Decimal::from(60))
-                            .round_dp(2);
+                    let hours = (Decimal::from((end_date - now).num_minutes()) / Decimal::from(60))
+                        .round_dp(2);
                     let qualification = Qualification {
                         token_id: token.clone(),
                         condition_id: market.condition_id.clone(),
@@ -439,8 +429,7 @@ impl NearResObserver {
                     // Still trading: nothing has happened yet, so nothing is written.
                     continue;
                 }
-                let hours = Decimal::from((now - q.qualified_at).num_minutes())
-                    / Decimal::from(60);
+                let hours = Decimal::from((now - q.qualified_at).num_minutes()) / Decimal::from(60);
                 let resolution = Resolution {
                     token_id: token.clone(),
                     condition_id: fact.condition_id.clone(),
@@ -532,6 +521,10 @@ pub struct NearResSummary {
     /// configured recycling overhead.
     pub cycle_hours: Option<Decimal>,
     pub annual_yield_pct: Option<Decimal>,
+    /// The pre-committed thresholds, carried so the report states the rule it applied rather
+    /// than re-reading a config that may have been edited since.
+    pub kill_line_loss_one_in: u32,
+    pub kill_line_annual_yield_pct: Decimal,
     pub verdict: KillLine,
 }
 
@@ -564,6 +557,8 @@ pub fn summarize(
         mean_hours_to_payout: None,
         cycle_hours: None,
         annual_yield_pct: None,
+        kill_line_loss_one_in: cfg.kill_line_loss_one_in,
+        kill_line_annual_yield_pct: cfg.kill_line_annual_yield_pct,
         verdict: KillLine::NotEnoughData {
             resolutions: 0,
             needed: cfg.min_resolutions_for_verdict,
@@ -599,7 +594,8 @@ pub fn summarize(
     let n = Decimal::from(summary.resolutions);
     let losses = Decimal::from(summary.lost + summary.split);
     summary.loss_rate = Some((losses / n).round_dp(4));
-    summary.loss_rate_ci_pct = wilson_interval_pct(summary.lost + summary.split, summary.resolutions);
+    summary.loss_rate_ci_pct =
+        wilson_interval_pct(summary.lost + summary.split, summary.resolutions);
     summary.mean_ask = Some((summary.capital / n).round_dp(4));
     let mean_hours = (hours / n).round_dp(2);
     summary.mean_hours_to_payout = Some(mean_hours);
@@ -703,9 +699,12 @@ mod tests {
 
     fn fee_model() -> FeeModel {
         FeeModel::new(
-            [("politics".to_string(), dec!(0.04)), ("other".to_string(), dec!(0.05))]
-                .into_iter()
-                .collect(),
+            [
+                ("politics".to_string(), dec!(0.04)),
+                ("other".to_string(), dec!(0.05)),
+            ]
+            .into_iter()
+            .collect(),
         )
     }
 
@@ -741,7 +740,10 @@ mod tests {
                 OrderBook::new(
                     TokenId::new(token),
                     vec![PriceLevel::new(ask - dec!(0.01), dec!(500))],
-                    vec![PriceLevel::new(ask, dec!(300)), PriceLevel::new(ask + dec!(0.005), dec!(200))],
+                    vec![
+                        PriceLevel::new(ask, dec!(300)),
+                        PriceLevel::new(ask + dec!(0.005), dec!(200)),
+                    ],
                 )
                 .normalized(),
             );
@@ -762,14 +764,23 @@ mod tests {
         assert!(!observer.in_band(dec!(1.00)));
 
         // …and end to end through the qualifier, at both boundaries at once.
-        let (qualified, counters) = observer.qualify(&universe(24), &books(dec!(0.96), dec!(0.99)), &fee_model(), now());
+        let (qualified, counters) = observer.qualify(
+            &universe(24),
+            &books(dec!(0.96), dec!(0.99)),
+            &fee_model(),
+            now(),
+        );
         assert_eq!(qualified.len(), 2);
         assert_eq!(counters.qualified, 2);
         assert_eq!(counters.outside_price_band, 0);
 
         let observer = NearResObserver::new(&cfg());
-        let (qualified, counters) =
-            observer.qualify(&universe(24), &books(dec!(0.9599), dec!(0.9901)), &fee_model(), now());
+        let (qualified, counters) = observer.qualify(
+            &universe(24),
+            &books(dec!(0.9599), dec!(0.9901)),
+            &fee_model(),
+            now(),
+        );
         assert!(qualified.is_empty());
         assert_eq!(counters.outside_price_band, 2);
     }
@@ -778,7 +789,12 @@ mod tests {
     #[test]
     fn a_qualification_records_the_executable_entry_and_never_repeats() {
         let observer = NearResObserver::new(&cfg());
-        let (first, _) = observer.qualify(&universe(48), &books(dec!(0.97), dec!(0.50)), &fee_model(), now());
+        let (first, _) = observer.qualify(
+            &universe(48),
+            &books(dec!(0.97), dec!(0.50)),
+            &fee_model(),
+            now(),
+        );
         assert_eq!(first.len(), 1, "only the 97¢ side is in band");
         let q = &first[0];
         assert_eq!(q.ask, dec!(0.97));
@@ -794,8 +810,12 @@ mod tests {
 
         // A second pass over a better book must not produce a second observation, and must
         // not revise the first.
-        let (second, counters) =
-            observer.qualify(&universe(48), &books(dec!(0.98), dec!(0.50)), &fee_model(), now());
+        let (second, counters) = observer.qualify(
+            &universe(48),
+            &books(dec!(0.98), dec!(0.50)),
+            &fee_model(),
+            now(),
+        );
         assert!(second.is_empty());
         assert_eq!(counters.already_tracked, 1);
         assert_eq!(observer.open_count(), 1);
@@ -806,12 +826,14 @@ mod tests {
     fn qualification_needs_a_known_end_date_inside_the_horizon() {
         let observer = NearResObserver::new(&cfg());
         let mut far = universe(200);
-        let (q, counters) = observer.qualify(&far, &books(dec!(0.97), dec!(0.97)), &fee_model(), now());
+        let (q, counters) =
+            observer.qualify(&far, &books(dec!(0.97), dec!(0.97)), &fee_model(), now());
         assert!(q.is_empty());
         assert_eq!(counters.too_far_out, 2);
 
         far.events[0].end_date = None;
-        let (q, counters) = observer.qualify(&far, &books(dec!(0.97), dec!(0.97)), &fee_model(), now());
+        let (q, counters) =
+            observer.qualify(&far, &books(dec!(0.97), dec!(0.97)), &fee_model(), now());
         assert!(q.is_empty());
         assert_eq!(counters.no_end_date, 2);
     }
@@ -823,7 +845,8 @@ mod tests {
             prices
                 .map(|p| format!("\"{}\"", p.replace('"', "\\\"")))
                 .unwrap_or_else(|| "null".into()),
-            uma.map(|u| format!("\"{u}\"")).unwrap_or_else(|| "null".into()),
+            uma.map(|u| format!("\"{u}\""))
+                .unwrap_or_else(|| "null".into()),
         );
         serde_json::from_str(&body).expect("raw market")
     }
@@ -837,14 +860,15 @@ mod tests {
         assert!(good.closed);
         assert!(!good.disputed);
 
-        let disputed =
-            resolution_facts(&raw_market(Some(r#"["0","1"]"#), true, Some("Disputed"))).expect("facts");
+        let disputed = resolution_facts(&raw_market(Some(r#"["0","1"]"#), true, Some("Disputed")))
+            .expect("facts");
         assert!(disputed.disputed);
         assert_eq!(disputed.uma_status.as_deref(), Some("disputed"));
 
         // Still trading: prices are a market quote, not a payout — but they sum to 1, so the
         // `closed` flag is what stops them being read as a resolution.
-        let open = resolution_facts(&raw_market(Some(r#"["0.97","0.03"]"#), false, None)).expect("facts");
+        let open =
+            resolution_facts(&raw_market(Some(r#"["0.97","0.03"]"#), false, None)).expect("facts");
         assert!(!open.closed);
 
         // Nonsense vectors are refused outright.
@@ -855,7 +879,9 @@ mod tests {
             None
         );
         assert_eq!(
-            resolution_facts(&raw_market(None, true, None)).expect("facts").payouts,
+            resolution_facts(&raw_market(None, true, None))
+                .expect("facts")
+                .payouts,
             None
         );
     }
@@ -864,7 +890,12 @@ mod tests {
     #[test]
     fn an_unreadable_resolution_is_a_hole_and_an_open_market_stays_open() {
         let observer = NearResObserver::new(&cfg());
-        observer.qualify(&universe(1), &books(dec!(0.97), dec!(0.50)), &fee_model(), now());
+        observer.qualify(
+            &universe(1),
+            &books(dec!(0.97), dec!(0.50)),
+            &fee_model(),
+            now(),
+        );
         let later = now() + Duration::hours(6);
 
         // Open, unreadable → nothing written, still tracked.
@@ -887,7 +918,12 @@ mod tests {
     #[test]
     fn the_outcome_index_decides_who_won() {
         let observer = NearResObserver::new(&cfg());
-        let (q, _) = observer.qualify(&universe(1), &books(dec!(0.97), dec!(0.50)), &fee_model(), now());
+        let (q, _) = observer.qualify(
+            &universe(1),
+            &books(dec!(0.97), dec!(0.50)),
+            &fee_model(),
+            now(),
+        );
         let facts = resolution_facts(&raw_market(r#"["1","0"]"#.into(), true, Some("resolved")))
             .expect("facts");
         let (outcome, payout) = classify(&q[0], &facts);
@@ -900,11 +936,16 @@ mod tests {
         assert_eq!(classify(&other, &facts).0, ResolutionOutcome::Lost);
 
         // A split resolution is not a win.
-        let split = resolution_facts(&raw_market(r#"["0.5","0.5"]"#.into(), true, None)).expect("facts");
+        let split =
+            resolution_facts(&raw_market(r#"["0.5","0.5"]"#.into(), true, None)).expect("facts");
         assert_eq!(classify(&q[0], &split).0, ResolutionOutcome::Split);
     }
 
-    fn observation(ask: Decimal, outcome: ResolutionOutcome, hours: Decimal) -> ResolvedObservation {
+    fn observation(
+        ask: Decimal,
+        outcome: ResolutionOutcome,
+        hours: Decimal,
+    ) -> ResolvedObservation {
         ResolvedObservation {
             token_id: "t".into(),
             event_slug: "e".into(),

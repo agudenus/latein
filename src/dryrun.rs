@@ -62,18 +62,24 @@ use tokio::time::Instant as TokioInstant;
 use crate::alert::{format_opportunity, AlertStats, Alerter, Delivery, EventLog, Priority};
 use crate::clob::ClobClient;
 use crate::config::{Config, REPORTED_CATEGORIES};
+use crate::costs::FeeModel;
 use crate::detect;
 use crate::gamma::{GammaClient, PaginationState};
 use crate::http::HttpClient;
 use crate::makersim::{MakerSimulator, NotOpened, Opened};
+use crate::nearres::{self, NearResObserver, NearResSummary};
+use crate::rewardsim::{
+    self, CandidateScore, ClosedEpochSummary, RewardCandidate, RewardKillLine, RewardParams,
+    RewardSimulator, RewardsSummary,
+};
 use crate::store::{
     CycleStats, LifecycleOutcome, LifecycleStatus, MakerSimRow, OpportunityRow, RuntimeStatus,
     ScanTotals, Store,
 };
 use crate::types::{BookMap, Opportunity, Side, TokenId, Universe};
 use crate::ws::{
-    self, BookStore, DirtyBatch, StreamHealth, StreamManager, StreamStatsSnapshot,
-    DIVERGENCE_SAMPLE,
+    self, BookStore, DirtyBatch, PrintFanout, PrintObserver, StreamHealth, StreamManager,
+    StreamStatsSnapshot, DIVERGENCE_SAMPLE,
 };
 
 /// Phase A is dry-run only. Live execution does not exist yet — not behind a flag, not
@@ -148,11 +154,55 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
         );
     }
 
+    // Measurement Phase R. Both instruments are created before anything else so their `Arc`s
+    // are the ones the stream pool feeds and the loop samples — one of each per process.
+    let rewardsim = Arc::new(RewardSimulator::new(&cfg.rewardsim));
+    if rewardsim.enabled() {
+        tracing::info!(
+            capital_cap_usd = %cfg.rewardsim.capital_cap_usd,
+            quote_spread_cents = %cfg.rewardsim.quote_spread_cents,
+            quote_size_shares = %cfg.rewardsim.quote_size_shares,
+            sample_interval_secs = cfg.rewardsim.sample_interval_secs,
+            kill_line_net_usd_per_day = %cfg.rewardsim.kill_line_net_usd_per_day,
+            "R1 rewards farming simulation on: a two-sided quote is SCORED and marked out \
+             against the tape on each selected market. No quote is posted and no order is \
+             ever placed."
+        );
+    }
+    let nearres_observer = Arc::new(NearResObserver::new(&cfg.nearres));
+    if nearres_observer.enabled() {
+        // A restart must not re-qualify a market that already has an observation row (the
+        // insert-only schema would refuse it anyway) nor lose the ones still in flight.
+        match (
+            store.nearres_resolved_tokens(),
+            store.nearres_open_observations(),
+        ) {
+            (Ok(resolved), Ok(open)) => {
+                tracing::info!(
+                    resolved = resolved.len(),
+                    still_open = open.len(),
+                    min_ask = %cfg.nearres.min_ask,
+                    max_ask = %cfg.nearres.max_ask,
+                    max_hours_to_resolution = cfg.nearres.max_hours_to_resolution,
+                    "R2 near-resolution observation on (pure observation — nothing about our \
+                     own orders)"
+                );
+                nearres_observer.reseed(resolved, open);
+            }
+            (Err(err), _) | (_, Err(err)) => tracing::warn!(
+                %err,
+                "could not re-seed the near-resolution study from the database — markets \
+                 already observed will be skipped by the insert-only schema, not re-measured"
+            ),
+        }
+    }
+
     let hb = Arc::new(Heartbeat::new(
         cfg.clone(),
         store.clone(),
         alerter.clone(),
         maker_sim.clone(),
+        rewardsim.clone(),
         DaemonStatus {
             started_at: Utc::now(),
             // Until the first REST call proves otherwise, assume nothing: `rest_ok` starts
@@ -205,6 +255,10 @@ pub async fn run(cfg: Config, max_cycles: Option<u64>) -> Result<()> {
         last_summary_day: None,
         hb,
         maker_sim,
+        rewardsim,
+        nearres: nearres_observer,
+        reward_selected_day: None,
+        last_nearres_lookup: None,
         token_events: HashMap::new(),
         gamma: Arc::new(PaginationState::default()),
     };
@@ -274,6 +328,8 @@ const PHASE_REST_SCAN: &str = "rest_scan";
 const PHASE_REST_SWEEP: &str = "rest_sweep";
 const PHASE_RESYNC: &str = "resync_stale";
 const PHASE_STREAM_DETECT: &str = "stream_detect";
+const PHASE_REWARD_SELECT: &str = "reward_select";
+const PHASE_REWARD_SAMPLE: &str = "reward_sample";
 const PHASE_TICK: &str = "tick";
 
 /// The daemon-memory state the dashboard cannot see any other way.
@@ -366,6 +422,8 @@ struct Heartbeat {
     /// M8. Read-only from here: the heartbeat publishes the simulator's live counts so the
     /// dashboard can show open simulations, which exist only in this process's memory.
     maker_sim: Arc<MakerSimulator>,
+    /// R1, for the same reason: an in-flight epoch exists only in memory until it closes.
+    rewardsim: Arc<RewardSimulator>,
     /// Slow-moving daemon state. A `std` mutex, held for a clone and never across an await.
     status: Mutex<DaemonStatus>,
     stream: Mutex<Option<StreamRefs>>,
@@ -378,6 +436,7 @@ impl Heartbeat {
         store: Arc<Store>,
         alerter: Arc<Alerter>,
         maker_sim: Arc<MakerSimulator>,
+        rewardsim: Arc<RewardSimulator>,
         status: DaemonStatus,
     ) -> Self {
         Self {
@@ -385,6 +444,7 @@ impl Heartbeat {
             store,
             alerter,
             maker_sim,
+            rewardsim,
             status: Mutex::new(status),
             stream: Mutex::new(None),
             progress: Mutex::new(LoopProgress::default()),
@@ -454,6 +514,7 @@ impl Heartbeat {
             .unwrap_or_default();
         let alerts = self.alerter.stats();
         let sims = self.maker_sim.stats();
+        let rewards = self.rewardsim.stats();
         let row = RuntimeStatus {
             mode: self.cfg.mode.clone(),
             started_at: crate::store::now_str(status.started_at),
@@ -506,6 +567,14 @@ impl Heartbeat {
             maker_sims_untracked: sims.untracked,
             maker_sim_prints_matched: sims.prints_matched,
             maker_sim_print_feed_live: self.maker_sim.print_feed_live(),
+            rewardsim_enabled: self.rewardsim.enabled(),
+            rewardsim_markets_quoted: rewards.markets_quoted,
+            rewardsim_portfolio: self.rewardsim.portfolio_len() as i64,
+            rewardsim_samples_scored: rewards.samples_scored,
+            rewardsim_samples_lost: rewards.samples_lost,
+            rewardsim_fills: rewards.fills,
+            rewardsim_epochs_closed: rewards.epochs_closed,
+            rewardsim_print_feed_live: rewards.print_feed_live,
             net_floor_default_taker: self
                 .cfg
                 .net_floor_taker(&crate::types::Category::new("default"))
@@ -604,6 +673,16 @@ struct Daemon {
     /// M8: the maker-fill simulator. The daemon opens simulations and persists closed ones;
     /// the stream's socket tasks feed it prints through [`ws::PrintObserver`].
     maker_sim: Arc<MakerSimulator>,
+    /// R1: the rewards farming simulator. Same shape as the maker simulator — the loop
+    /// samples and persists, the socket tasks feed it prints through the same hook.
+    rewardsim: Arc<RewardSimulator>,
+    /// R2: the near-resolution observer. No print feed and no timers of its own; it qualifies
+    /// markets from the books a scan already fetched.
+    nearres: Arc<NearResObserver>,
+    /// The UTC day the reward portfolio was last chosen for. Selection is a daily decision,
+    /// which is also the epoch's period.
+    reward_selected_day: Option<NaiveDate>,
+    last_nearres_lookup: Option<Instant>,
     /// token id → index into `universe.events`. Rebuilt on every universe refresh; this is
     /// what turns "this book moved" into "re-evaluate exactly this event".
     token_events: HashMap<TokenId, usize>,
@@ -770,8 +849,7 @@ impl Daemon {
                 Some(manager) => {
                     // A pool with no live connection is not a print feed, whatever the
                     // transport pill says: no socket, no prints, no evidence (M8).
-                    self.maker_sim
-                        .set_print_feed(manager.health().live_connections() > 0);
+                    self.set_print_feed(manager.health().live_connections() > 0);
                     // Cheap every tick: anything explicitly stale or behind a shard gap.
                     self.resync_stale(manager, &universe, stale_after).await;
                     // Slow and thorough: the whole universe over REST, a divergence
@@ -849,6 +927,10 @@ impl Daemon {
             // Close and persist whatever the maker simulator finished with this tick. Before
             // the summary, so a verdict reached in this tick is in the day it belongs to.
             self.maker_sim_tick(Utc::now()).await;
+            // Measurement Phase R rides the same tick: R1 samples its portfolio on its own
+            // cadence, R2 follows up the observations whose end date has passed.
+            self.rewardsim_tick(&universe, stream.as_ref()).await;
+            self.nearres_lookup().await;
             self.maybe_daily_summary(summary_time).await;
             // One full iteration behind us: the loop is not merely alive, it is round-tripping.
             self.hb.note_tick();
@@ -897,6 +979,24 @@ impl Daemon {
                 untracked = sims.untracked,
                 prints_matched = sims.prints_matched,
                 "maker-fill simulation stopping"
+            );
+        }
+
+        // R1's open epochs get their verdict from what the day had shown by now — the same
+        // discipline as the maker simulator, and for the same reason: losing them silently
+        // would delete the denominator of the net figure.
+        if self.rewardsim.enabled() {
+            self.rewardsim.set_print_feed(false);
+            self.rewardsim.close_all(Utc::now());
+            self.persist_reward_rows().await;
+            let rewards = self.rewardsim.stats();
+            tracing::info!(
+                markets_quoted = rewards.markets_quoted,
+                samples_scored = rewards.samples_scored,
+                samples_lost = rewards.samples_lost,
+                fills = rewards.fills,
+                epochs_closed = rewards.epochs_closed,
+                "rewards farming simulation stopping"
             );
         }
 
@@ -999,13 +1099,32 @@ impl Daemon {
             Some(manager) => {
                 manager
                     .books()
-                    .set_print_observer(Some(self.maker_sim.clone()));
-                self.maker_sim.set_print_feed(true);
+                    .set_print_observer(Some(self.print_readers()));
+                self.set_print_feed(true);
             }
-            None => self.maker_sim.set_print_feed(false),
+            None => self.set_print_feed(false),
         }
         self.hb.set_stream(stream.map(stream_refs));
         self.hb.publish(Utc::now());
+    }
+
+    /// The two readers of the trade tape, behind one `BookStore` hook.
+    ///
+    /// M8 asks whether the queue in front of a resting arbitrage leg traded out; R1 asks
+    /// whether a print crossed the in-band quote we would have had resting. Both need every
+    /// print, and the store holds a single observer slot — so the fanout is the observer.
+    fn print_readers(&self) -> Arc<dyn PrintObserver> {
+        Arc::new(PrintFanout::new(vec![
+            self.maker_sim.clone(),
+            self.rewardsim.clone(),
+        ]))
+    }
+
+    /// Tell both print-driven measurements whether a feed is running. Turning it off marks
+    /// their open windows as holes rather than letting them close as honest zeros.
+    fn set_print_feed(&self, live: bool) {
+        self.maker_sim.set_print_feed(live);
+        self.rewardsim.set_print_feed(live);
     }
 
     /// Close whatever the maker simulator has finished with, and persist it.
@@ -1105,6 +1224,453 @@ impl Daemon {
             ),
             Opened::No(_) => {}
         }
+    }
+
+    // -----------------------------------------------------------------------------
+    // R1 — rewards farming simulation
+    // -----------------------------------------------------------------------------
+
+    /// One tick of the rewards simulator: roll the epoch if the UTC day turned, re-select the
+    /// portfolio if it is due, take a scoring sample if one is due, and persist whatever
+    /// closed.
+    async fn rewardsim_tick(&mut self, universe: &Universe, stream: Option<&StreamManager>) {
+        if !self.rewardsim.enabled() {
+            return;
+        }
+        let now = Utc::now();
+        // The epoch is the venue's: one UTC day, closing at 00:00. Rolling it is what makes
+        // a day's row final.
+        let rolled = self.rewardsim.roll_epoch(now);
+        if rolled {
+            self.persist_reward_rows().await;
+        }
+        if rolled || self.reward_selected_day != Some(now.date_naive()) {
+            self.reselect_reward_portfolio(universe, now).await;
+        }
+        if self.rewardsim.sample_due(now) {
+            let tokens = self.rewardsim.portfolio_tokens();
+            if !tokens.is_empty() {
+                if let Some(books) = self.books_for(&tokens, stream, PHASE_REWARD_SAMPLE).await {
+                    let scored = self.rewardsim.sample(&books, now);
+                    tracing::debug!(
+                        markets = self.rewardsim.portfolio_len(),
+                        scored,
+                        books = books.len(),
+                        "rewards sample taken (simulated — no quote is posted)"
+                    );
+                }
+            }
+        }
+        self.persist_reward_rows().await;
+    }
+
+    /// Books for a handful of tokens: the stream's own state when it has all of them,
+    /// otherwise one REST batch. The reward portfolio is ~40 tokens, so this is cheap either
+    /// way — and a *partial* stream snapshot is not used, because a missing book would read
+    /// as a lost sample when the data was simply somewhere else.
+    async fn books_for(
+        &self,
+        tokens: &[TokenId],
+        stream: Option<&StreamManager>,
+        phase: &'static str,
+    ) -> Option<BookMap> {
+        if let Some(manager) = stream {
+            let snapshot = manager.books().snapshot_of(tokens);
+            if snapshot.len() == tokens.len() {
+                return Some(snapshot);
+            }
+        }
+        match self.fetch_books_noting_progress(tokens, phase).await {
+            Ok(books) => Some(books),
+            Err(err) => {
+                tracing::warn!(%err, tokens = tokens.len(), phase, "book fetch failed");
+                None
+            }
+        }
+    }
+
+    /// Choose the day's reward portfolio and log it.
+    ///
+    /// Recomputed daily, which is also the epoch's period: a market that stays in the
+    /// portfolio keeps its epoch (re-selection is not a new day), and one that drops out has
+    /// its epoch closed where it stands.
+    async fn reselect_reward_portfolio(&mut self, universe: &Universe, now: chrono::DateTime<Utc>) {
+        let candidates = self.reward_candidates(universe).await;
+        if candidates.is_empty() {
+            tracing::warn!(
+                events = universe.events.len(),
+                "no reward-eligible candidates found — the rewards simulator has nothing to \
+                 quote today (check the CLOB rewards endpoint and Gamma's clobRewards field)"
+            );
+            self.reward_selected_day = Some(now.date_naive());
+            return;
+        }
+        let tokens: Vec<TokenId> = candidates
+            .iter()
+            .flat_map(|c| [c.yes_token.clone(), c.no_token.clone()])
+            .collect();
+        let Some(books) = self.books_for(&tokens, None, PHASE_REWARD_SELECT).await else {
+            // No books, no honest ranking. Keep yesterday's portfolio rather than choosing
+            // one from stale prices, and try again on the next tick.
+            return;
+        };
+        let cfg = self.rewardsim.config().clone();
+        let mut scores: Vec<CandidateScore> = candidates
+            .iter()
+            .filter_map(|c| {
+                rewardsim::evaluate_candidate(
+                    c,
+                    &books,
+                    &cfg,
+                    self.rewardsim.markout_history(&c.condition_id),
+                )
+            })
+            .collect();
+        let chosen = rewardsim::select_portfolio(&mut scores, &cfg);
+
+        let capital: Decimal = chosen.iter().map(|s| s.quote.capital).sum();
+        let expected_gross: Decimal = chosen.iter().map(|s| s.expected_gross_paid).sum();
+        let expected_net: Decimal = chosen.iter().map(|s| s.expected_net).sum();
+        tracing::info!(
+            day = %now.date_naive(),
+            candidates = candidates.len(),
+            scored = scores.len(),
+            chosen = chosen.len(),
+            capital_committed = %usd(capital),
+            capital_cap = %cfg.capital_cap_usd,
+            expected_gross_per_day = %usd(expected_gross),
+            expected_net_per_day = %usd(expected_net),
+            "rewards portfolio chosen for the day (simulated)"
+        );
+        for score in &chosen {
+            tracing::info!(
+                event = %score.candidate.event_slug,
+                condition = %score.candidate.condition_id,
+                source = score.candidate.source,
+                pool_daily = %score.candidate.params.pool_daily,
+                max_spread_cents = %score.candidate.params.max_spread_cents,
+                min_size = %score.candidate.params.min_size,
+                quote_cents = %score.quote.s_cents,
+                shares = %score.quote.shares,
+                capital = %usd(score.quote.capital),
+                share_of_pool = %score.share.round_dp(4),
+                expected_gross_per_day = %usd(score.expected_gross_paid),
+                expected_net_per_day = %usd(score.expected_net),
+                "rewards portfolio market"
+            );
+        }
+        self.alerter.events().append(
+            "rewards_portfolio",
+            json!({
+                "day": now.date_naive().to_string(),
+                "candidates": candidates.len(),
+                "chosen": chosen.len(),
+                "capital_committed": capital,
+                "capital_cap": cfg.capital_cap_usd,
+                "expected_gross_per_day": expected_gross,
+                "expected_net_per_day": expected_net,
+                "markets": chosen.iter().map(|s| json!({
+                    "condition_id": s.candidate.condition_id,
+                    "event_slug": s.candidate.event_slug,
+                    "source": s.candidate.source,
+                    "pool_daily": s.candidate.params.pool_daily,
+                    "max_spread_cents": s.candidate.params.max_spread_cents,
+                    "min_size": s.candidate.params.min_size,
+                    "quote_spread_cents": s.quote.s_cents,
+                    "shares": s.quote.shares,
+                    "capital": s.quote.capital,
+                    "mid": s.mid,
+                    "competing_score": s.competing_score,
+                    "share": s.share,
+                    "expected_gross_per_day": s.expected_gross_paid,
+                    "expected_net_per_day": s.expected_net,
+                    "markout_history": s.markout_history,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+
+        self.rewardsim.set_portfolio(&chosen, now);
+        self.reward_selected_day = Some(now.date_naive());
+        // Markets that just left the portfolio closed their epochs inside `set_portfolio`.
+        self.persist_reward_rows().await;
+    }
+
+    /// The reward-eligible candidate set: the CLOB rewards endpoint where it answers, the
+    /// per-market Gamma fields where it does not.
+    ///
+    /// Both sources are recorded per candidate (`source`), because they can disagree and a
+    /// number whose provenance is unknown is not evidence.
+    async fn reward_candidates(&mut self, universe: &Universe) -> Vec<RewardCandidate> {
+        let max_pages = self.cfg.rewardsim.max_candidate_pages;
+        let fetched = {
+            let clob = ClobClient::new(&self.http, &self.cfg);
+            clob.fetch_reward_markets(max_pages).await
+        };
+        let reward_markets = match fetched {
+            Ok(markets) => {
+                self.note_rest(true);
+                markets
+            }
+            Err(err) => {
+                self.note_rest(false);
+                // TODO(verify-live): this endpoint has never been reached from a dev
+                // container. On the Pi it either works or this line names it every day.
+                tracing::warn!(
+                    %err,
+                    "the CLOB /sampling-markets endpoint did not answer — falling back to \
+                     Gamma's per-market rewards fields for the candidate set"
+                );
+                Vec::new()
+            }
+        };
+        let by_condition: HashMap<&str, &crate::clob::RewardMarket> = reward_markets
+            .iter()
+            .map(|m| (m.condition_id.as_str(), m))
+            .collect();
+
+        let mut out: Vec<RewardCandidate> = Vec::new();
+        for event in &universe.events {
+            for market in &event.markets {
+                let (params, source) = match by_condition.get(market.condition_id.as_str()) {
+                    Some(rm) => (
+                        reward_params(rm.max_spread_cents, rm.min_size, rm.daily_rate),
+                        "sampling-markets",
+                    ),
+                    None => (
+                        reward_params(
+                            market.trading.rewards_max_spread,
+                            market.trading.rewards_min_size,
+                            market.trading.rewards_daily_rate,
+                        ),
+                        "gamma",
+                    ),
+                };
+                let Some(params) = params else { continue };
+                out.push(RewardCandidate {
+                    condition_id: market.condition_id.clone(),
+                    event_slug: event.slug.clone(),
+                    question: market.question.clone(),
+                    category: event.category.as_str().to_string(),
+                    yes_token: market.yes_token().clone(),
+                    no_token: market.no_token().clone(),
+                    params,
+                    source,
+                });
+            }
+        }
+        // The pool is the first-order term in the ranking, so a truncated candidate set
+        // should keep the fattest pools rather than an arbitrary slice.
+        out.sort_by(|a, b| {
+            b.params
+                .pool_daily
+                .cmp(&a.params.pool_daily)
+                .then_with(|| a.condition_id.cmp(&b.condition_id))
+        });
+        out.truncate(self.cfg.rewardsim.max_candidates);
+        out
+    }
+
+    /// Persist closed epochs and matured fills.
+    async fn persist_reward_rows(&mut self) {
+        for epoch in self.rewardsim.drain_closed() {
+            match self.store.record_reward_epoch(&epoch) {
+                Ok(true) => tracing::info!(
+                    day = %epoch.day,
+                    event = %epoch.event_slug,
+                    condition = %epoch.condition_id,
+                    samples = format!("{}/{}", epoch.samples_scored, epoch.samples_expected),
+                    samples_lost = epoch.samples_lost,
+                    gross = %usd(epoch.gross_usd),
+                    gross_paid = %usd(epoch.gross_paid_usd),
+                    fills = epoch.fills,
+                    markout_short = %usd(epoch.markout_short_usd),
+                    markout_long = %usd(epoch.markout_long_usd),
+                    fills_pending = epoch.fills_pending,
+                    net = %usd(epoch.net_usd),
+                    no_print_feed = epoch.no_print_feed,
+                    "rewards epoch closed (simulated — no quote was ever posted)"
+                ),
+                Ok(false) => tracing::debug!(
+                    day = %epoch.day,
+                    condition = %epoch.condition_id,
+                    "a reward epoch for this market and day is already recorded — the schema \
+                     refused the second verdict, which is what it is for"
+                ),
+                Err(err) => tracing::warn!(%err, "could not persist a reward epoch"),
+            }
+            self.alerter.events().append(
+                "rewards_epoch",
+                json!({
+                    "day": epoch.day.to_string(),
+                    "condition_id": epoch.condition_id,
+                    "event_slug": epoch.event_slug,
+                    "pool_daily": epoch.params.pool_daily,
+                    "capital": epoch.capital,
+                    "samples_scored": epoch.samples_scored,
+                    "samples_lost": epoch.samples_lost,
+                    "gross_usd": epoch.gross_usd,
+                    "gross_paid_usd": epoch.gross_paid_usd,
+                    "fills": epoch.fills,
+                    "markout_short_usd": epoch.markout_short_usd,
+                    "markout_long_usd": epoch.markout_long_usd,
+                    "fills_pending": epoch.fills_pending,
+                    "net_usd": epoch.net_usd,
+                    "no_print_feed": epoch.no_print_feed,
+                }),
+            );
+        }
+        let now = Utc::now();
+        for fill in self.rewardsim.drain_fills() {
+            if let Err(err) = self.store.record_reward_fill(&fill, now) {
+                tracing::warn!(%err, "could not persist a simulated reward fill");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------------
+    // R2 — near-resolution observation
+    // -----------------------------------------------------------------------------
+
+    /// Qualify markets from the books a scan has just fetched. Pure observation: an entry is
+    /// recorded once, at the first moment its executable ask was in the band.
+    fn nearres_scan(&mut self, universe: &Universe, books: &BookMap) {
+        if !self.nearres.enabled() {
+            return;
+        }
+        let fees = FeeModel::new(self.cfg.fees.clone());
+        let (qualified, counters) = self.nearres.qualify(universe, books, &fees, Utc::now());
+        if qualified.is_empty() {
+            return;
+        }
+        for q in &qualified {
+            match self.store.record_nearres_observation(q) {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!(
+                    token = %q.token_id,
+                    "this token already has an observation row — a market qualifies once"
+                ),
+                Err(err) => tracing::warn!(%err, "could not persist a near-resolution observation"),
+            }
+            self.alerter.events().append(
+                "nearres_qualified",
+                json!({
+                    "token_id": q.token_id.as_str(),
+                    "condition_id": q.condition_id,
+                    "event_slug": q.event_slug,
+                    "question": q.question,
+                    "outcome": q.outcome,
+                    "category": q.category,
+                    "ask": q.ask,
+                    "ask_size": q.ask_size,
+                    "ask_depth": q.ask_depth,
+                    "best_bid": q.best_bid,
+                    "fee_per_share": q.fee_per_share,
+                    "net_if_won": q.net_if_won(),
+                    "hours_to_resolution": q.hours_to_resolution,
+                    "end_date": crate::store::now_str(q.end_date),
+                }),
+            );
+        }
+        tracing::info!(
+            qualified = counters.qualified,
+            examined = counters.tokens_examined,
+            outside_band = counters.outside_price_band,
+            no_book = counters.no_book,
+            too_far_out = counters.too_far_out,
+            tracking = self.nearres.open_count(),
+            "near-resolution observations recorded (observation only — no order implied)"
+        );
+    }
+
+    /// Follow the observations whose end date has passed to their resolution.
+    async fn nearres_lookup(&mut self) {
+        if !self.nearres.enabled() {
+            return;
+        }
+        let interval = Duration::from_secs(self.cfg.nearres.resolution_poll_secs.max(1));
+        if self
+            .last_nearres_lookup
+            .is_some_and(|last| last.elapsed() < interval)
+        {
+            return;
+        }
+        let now = Utc::now();
+        // A batch per poll: the study is measured in days, so there is no reason to hammer.
+        let due = self
+            .nearres
+            .due_for_lookup(now, self.cfg.nearres.resolution_batch_size);
+        self.last_nearres_lookup = Some(Instant::now());
+        if due.is_empty() {
+            return;
+        }
+        let batch_size = self.cfg.nearres.resolution_batch_size;
+        let fetched = {
+            let gamma = GammaClient::with_state(&self.http, &self.cfg, self.gamma.clone());
+            gamma.fetch_markets_by_condition(&due, batch_size).await
+        };
+        let markets = match fetched {
+            Ok(markets) => {
+                self.note_rest(true);
+                markets
+            }
+            Err(err) => {
+                self.note_rest(false);
+                tracing::warn!(
+                    %err,
+                    conditions = due.len(),
+                    "near-resolution lookup failed — those observations stay open (an \
+                     unanswered lookup is not an outcome)"
+                );
+                return;
+            }
+        };
+        let facts: Vec<nearres::ResolutionFacts> = markets
+            .iter()
+            .filter_map(nearres::resolution_facts)
+            .collect();
+        let settled = self.nearres.apply_lookups(&facts, now);
+        if settled.is_empty() {
+            tracing::debug!(
+                conditions = due.len(),
+                returned = markets.len(),
+                "no near-resolution observation settled this pass"
+            );
+            return;
+        }
+        let (mut won, mut lost, mut undetermined) = (0usize, 0usize, 0usize);
+        for (q, resolution) in &settled {
+            match resolution.outcome {
+                nearres::ResolutionOutcome::Won => won += 1,
+                nearres::ResolutionOutcome::Undetermined => undetermined += 1,
+                _ => lost += 1,
+            }
+            if let Err(err) = self.store.record_nearres_resolution(resolution) {
+                tracing::warn!(%err, "could not persist a near-resolution verdict");
+            }
+            self.alerter.events().append(
+                "nearres_resolved",
+                json!({
+                    "token_id": resolution.token_id.as_str(),
+                    "condition_id": resolution.condition_id,
+                    "event_slug": q.event_slug,
+                    "outcome": resolution.outcome.as_str(),
+                    "payout": resolution.payout,
+                    "ask": q.ask,
+                    "fee_per_share": q.fee_per_share,
+                    "hours_to_payout": resolution.hours_to_payout,
+                    "uma_status": resolution.uma_status,
+                    "disputed": resolution.disputed,
+                }),
+            );
+        }
+        tracing::info!(
+            settled = settled.len(),
+            won,
+            lost,
+            undetermined,
+            still_open = self.nearres.open_count(),
+            "near-resolution observations settled"
+        );
     }
 
     /// Fetch books, reporting progress on every batch that lands.
@@ -1236,6 +1802,8 @@ impl Daemon {
         };
 
         self.note_rest(true);
+        // R2 rides the books this sweep already paid for.
+        self.nearres_scan(universe, &books);
         let (opportunities, counters) = detect::scan_counted(&self.cfg, universe, &books);
         // REST detection has no triggering frame, so it has no latency to report.
         let new_opportunities = self
@@ -1502,6 +2070,9 @@ impl Daemon {
         self.log_stream_pulse(manager, last_pulse);
         manager.books().apply_rest(&tokens, &books, Instant::now());
 
+        // The full sweep is the one place with every book in hand, which is exactly what R2
+        // needs: a 96–99¢ ask anywhere in the universe, not only where a gap was detected.
+        self.nearres_scan(universe, &books);
         let (opportunities, counters) = detect::scan_counted(&self.cfg, universe, &books);
         let new_opportunities = self
             .process_opportunities(&opportunities, &books, None)
@@ -1770,6 +2341,26 @@ async fn recv_batch(stream: Option<&mut StreamManager>) -> Option<DirtyBatch> {
 /// them. Counting the ones we *did* catch on their way out is the cheap evidence that the
 /// cadence — not the market — is the limit. Fixing it (a dedicated fast poller for the
 /// crypto series) is the crypto-engine milestone, deliberately not this one.
+/// Fold a market's three reward fields into [`RewardParams`], or refuse.
+///
+/// All three are required and all three must be positive: a market with a band but no pool
+/// pays nothing, and one with a pool but no band cannot be scored. "The API said nothing" is
+/// never turned into a zero or a default here — it simply is not a candidate.
+fn reward_params(
+    max_spread_cents: Option<Decimal>,
+    min_size: Option<Decimal>,
+    pool_daily: Option<Decimal>,
+) -> Option<RewardParams> {
+    let max_spread_cents = max_spread_cents.filter(|v| *v > Decimal::ZERO)?;
+    let min_size = min_size.filter(|s| *s > Decimal::ZERO)?;
+    let pool_daily = pool_daily.filter(|p| *p > Decimal::ZERO)?;
+    Some(RewardParams {
+        max_spread_cents,
+        min_size,
+        pool_daily,
+    })
+}
+
 pub fn short_lived_crypto_events(
     universe: &Universe,
     universe_refresh_secs: u64,
@@ -1980,6 +2571,10 @@ pub struct DailySummary {
     /// section, because merging it into either P&L number above would destroy the one thing
     /// it is for: the three figures have three different bases.
     pub maker_sim: MakerSimSummary,
+    /// R1 — rewards farming, net of markout, against its pre-committed kill-line.
+    pub rewards: RewardsSummary,
+    /// R2 — the near-resolution study, against its two pre-committed kill-lines.
+    pub nearres: NearResSummary,
 }
 
 /// The maker-fill simulator's day, aggregated (M8).
@@ -2161,6 +2756,15 @@ pub fn summarize(
         scan,
         alerts: None,
         maker_sim: MakerSimSummary::default(),
+        // Phase R's sections are filled in by `emit_daily_summary`, which has the database.
+        // Empty here means "not measured", which is what an empty section prints.
+        rewards: rewardsim::summarize_epochs(
+            false,
+            day,
+            &[],
+            &crate::config::RewardSimConfig::default(),
+        ),
+        nearres: nearres::summarize(false, 0, 0, &[], &crate::config::NearResConfig::default()),
     }
 }
 
@@ -2285,6 +2889,234 @@ impl DailySummary {
         out
     }
 
+    /// The R1 section: the day's simulated rewards farming, net of adverse selection, and
+    /// the running mean against the kill-line that was written down before any of it ran.
+    fn rewards_markdown(&self) -> String {
+        let r = &self.rewards;
+        let mut out = String::from("\n## Rewards farming (simulated)\n\n");
+        if !r.enabled {
+            out.push_str(
+                "- **not measured**: `rewardsim.enabled = false`. An absence of measurement, \
+                 not a net of zero.\n",
+            );
+            return out;
+        }
+        match &r.day {
+            Some(day) => {
+                out.push_str(&format!(
+                    "- epoch for {}: **{} market(s)**, ${:.2} of simulated quoting capital\n\
+                     - gross (advertised pools, before the $1/day/market floor): ${:.2}\n\
+                     - gross **paid** (after the floor): ${:.2}\n\
+                     - markout on simulated fills ({} fills): ${:.2}\n\
+                     - **portfolio net: ${:.2}/day**\n",
+                    day.day,
+                    day.markets,
+                    usd(day.capital),
+                    usd(day.gross_before_floor),
+                    usd(day.gross_paid),
+                    day.fills,
+                    usd(day.markout),
+                    usd(day.net),
+                ));
+                if day.markets_with_holes > 0 {
+                    out.push_str(&format!(
+                        "- **{} market(s) closed with a hole in the trade-print feed**: their \
+                         markout is an absence of measurement, not an absence of adverse \
+                         selection.\n",
+                        day.markets_with_holes
+                    ));
+                }
+            }
+            None => {
+                let last = match r.window.last() {
+                    Some(d) => format!("the most recent closed epoch day is {}", d.day),
+                    None => "no epoch has closed yet".to_string(),
+                };
+                out.push_str(&format!(
+                    "- no closed epoch for {}. Epochs close at **00:00 UTC**, as the venue's \
+                     do, so the day a report is generated *inside* has none yet — {last}.\n",
+                    self.day
+                ));
+            }
+        }
+
+        // "n/a" must not become "n/a/day": a missing mean is not a rate.
+        let mean = |v: Option<Decimal>| {
+            v.map(|m| format!("${:.2}/day", usd(m)))
+                .unwrap_or_else(|| "n/a".into())
+        };
+        out.push_str(&format!(
+            "- {}-day window: {} day(s) measured · mean gross paid {} · **mean net {}** \
+             at a ${:.2} cap\n",
+            r.window_days,
+            r.window.len(),
+            mean(r.mean_gross_per_day),
+            mean(r.mean_net_per_day),
+            usd(r.capital_cap),
+        ));
+        if r.days_with_holes > 0 {
+            out.push_str(&format!(
+                "- {} of those day(s) contain a market whose print feed had a hole.\n",
+                r.days_with_holes
+            ));
+        }
+
+        // The kill-line, stated plainly, in the terms it was pre-committed in.
+        out.push_str(&format!(
+            "\n**KILL-LINE ({}): {}** — pre-committed: net ≤ ${:.2}/day at ${:.2} across {} \
+             days is dead.\n",
+            self.day,
+            r.verdict.label(),
+            usd(r.kill_line),
+            usd(r.capital_cap),
+            r.window_days,
+        ));
+        match &r.verdict {
+            RewardKillLine::Pass { mean_net } => out.push_str(&format!(
+                "The {}-day mean net is ${:.2}/day, above the line. The strategy survives this \
+                 test; it has not been shown to make money at live-fill accuracy.\n",
+                r.window_days,
+                usd(*mean_net)
+            )),
+            RewardKillLine::Fail { mean_net } => out.push_str(&format!(
+                "The {}-day mean net is ${:.2}/day, at or below the line. **On the \
+                 pre-committed rule this instrument is dead** — no live probe follows from it.\n",
+                r.window_days,
+                usd(*mean_net)
+            )),
+            RewardKillLine::Provisional {
+                mean_net,
+                days_measured,
+                needed,
+                would_fail,
+            } => {
+                out.push_str(&format!(
+                    "Only {days_measured} of {needed} days are measured, so there is no verdict \
+                     yet. A day the daemon did not run is a **missing** day, not a zero day, \
+                     and is left out of the mean rather than counted as no earnings.\n"
+                ));
+                if let (Some(mean), Some(fails)) = (mean_net, would_fail) {
+                    out.push_str(&format!(
+                        "Running mean so far: ${:.2}/day — on today's evidence the window would \
+                         {}.\n",
+                        usd(*mean),
+                        if *fails { "**FAIL**" } else { "pass" }
+                    ));
+                }
+            }
+        }
+        out.push_str(
+            "\nHow the number is built, and what it refuses to assume: our score is the \
+             documented quadratic `((v−s)/v)² × shares` on a two-sided quote (`v` in cents \
+             from the size-cutoff-adjusted midpoint), aggregated by the published `Q_min` \
+             rule; our share of a sample is that against the in-band score resting on the \
+             live book, with the NO side mirrored into YES coordinates and **added**, because \
+             ignoring it would shrink the competition and flatter us. The day's denominator \
+             is 1 440 samples whether or not we were up, so downtime costs score exactly as \
+             it would live. The advertised pool is a **configured cap, not a payout**, and \
+             the $1/day/market floor is applied — a market that would pay $0.40 pays nothing. \
+             Adverse selection is measured, not assumed: a SELL print crossing our in-band buy \
+             fills us at our own limit, and the markout is `mid(t+5m) − fill`, signed. **Net = \
+             gross paid + markout.** Nothing was quoted and no order was ever placed.\n",
+        );
+        out
+    }
+
+    /// The R2 section: what near-certain outcomes actually did, and whether there are enough
+    /// of them to say anything yet.
+    fn nearres_markdown(&self) -> String {
+        let n = &self.nearres;
+        let mut out = String::from("\n## Near-resolution observation\n\n");
+        if !n.enabled {
+            out.push_str(
+                "- **not measured**: `nearres.enabled = false`. An absence of measurement, not \
+                 a loss rate of zero.\n",
+            );
+            return out;
+        }
+        out.push_str(&format!(
+            "- qualified (executable ask in band, end date inside the horizon): **{}** · \
+             still open: {} · resolved: {}\n\
+             - won: {} · lost: {} · split: {} · undetermined: {} · disputed: {}\n",
+            n.qualified, n.open, n.resolutions, n.won, n.lost, n.split, n.undetermined, n.disputed
+        ));
+        if n.resolutions == 0 {
+            out.push_str(
+                "- nothing has resolved yet, so there is no loss rate and no yield. The \
+                 observations above are entries that existed on the book, nothing more.\n",
+            );
+            return out;
+        }
+        out.push_str(&format!(
+            "- realised loss rate at executable prices: **{:.2}%** of {} resolution(s)\n",
+            n.loss_rate.unwrap_or(Decimal::ZERO) * Decimal::ONE_HUNDRED,
+            n.resolutions,
+        ));
+        if let Some((low, high)) = n.loss_rate_ci_pct {
+            out.push_str(&format!(
+                "- 95% Wilson interval on that rate: {low:.2}% – {high:.2}%\n"
+            ));
+        }
+        out.push_str(&format!(
+            "- capital (one share per observation): ${:.2} · payout ${:.2} · fees ${:.4} · \
+             **net ${:.4}**\n\
+             - mean entry ask {} · mean time to payout {} h · recycling period used {} h\n\
+             - annualised net yield at that recycling speed: **{}**\n",
+            usd(n.capital),
+            usd(n.payout),
+            n.fees,
+            n.net,
+            n.mean_ask
+                .map(|a| format!("{a}"))
+                .unwrap_or_else(|| "n/a".into()),
+            n.mean_hours_to_payout
+                .map(|h| format!("{h}"))
+                .unwrap_or_else(|| "n/a".into()),
+            n.cycle_hours
+                .map(|h| format!("{h}"))
+                .unwrap_or_else(|| "n/a".into()),
+            n.annual_yield_pct
+                .map(|y| format!("{y}%/yr"))
+                .unwrap_or_else(|| "n/a".into()),
+        ));
+        out.push_str(&format!(
+            "\n**KILL-LINE ({}): {}** — pre-committed: a loss rate worse than 1-in-{}, or an \
+             annualised net yield below {}%/yr, is dead.\n",
+            self.day,
+            n.verdict.label(),
+            n.kill_line_loss_one_in,
+            n.kill_line_annual_yield_pct,
+        ));
+        match &n.verdict {
+            nearres::KillLine::Pass => {
+                out.push_str("Both tests pass at a sample size large enough to distinguish them.\n")
+            }
+            nearres::KillLine::Fail(why) => out.push_str(&format!(
+                "{why}. **On the pre-committed rule this instrument is dead.**\n"
+            )),
+            nearres::KillLine::NotEnoughData {
+                resolutions,
+                needed,
+            } => out.push_str(&format!(
+                "**{resolutions} resolution(s) is too small a sample for the loss-rate test.** \
+                 Distinguishing a 1-in-40 loss rate from a 1-in-10 one needs on the order of \
+                 {needed}; below that the Wilson interval above is the honest statement and \
+                 the verdict is neither a pass nor a fail. Do not read the point estimate as \
+                 the answer.\n"
+            )),
+        }
+        out.push_str(
+            "\nWhat this is: pure observation of other people's markets. No quote, no queue \
+             position, no fill model — the ask recorded is the **executable** best ask that \
+             was on the book at the moment the market entered the band, and the outcome is \
+             whatever the API later stated. A market whose outcome the API does not state is \
+             `undetermined` and is excluded from every number above rather than counted as a \
+             win. Time to payout is measured at the resolution poll's granularity, so it is \
+             an upper bound by at most one poll interval.\n",
+        );
+        out
+    }
+
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("# polyarb daily summary — {} (UTC)\n\n", self.day));
@@ -2389,6 +3221,11 @@ impl DailySummary {
         ));
 
         out.push_str(&self.maker_sim_markdown());
+        // Measurement Phase R. Deliberately after the Phase A sections and never merged with
+        // them: these are different instruments answering different questions, and the whole
+        // reason the arbitrage scanner keeps running is that it costs nothing to leave on.
+        out.push_str(&self.rewards_markdown());
+        out.push_str(&self.nearres_markdown());
 
         out.push_str("\n## Simulated P&L\n\n");
         out.push_str(&format!(
@@ -2501,6 +3338,8 @@ pub async fn emit_daily_summary(
         .context("could not read the day's maker-fill simulations")?;
     let mut summary = summarize(day, &rows, scan, cfg.risk.per_trade_cap_usd);
     summary.maker_sim = summarize_maker_sims(cfg.maker_sim.enabled, &sims);
+    summary.rewards = rewards_summary(cfg, store, day)?;
+    summary.nearres = nearres_summary(cfg, store)?;
     summary.alerts = Some(alerter.stats());
     let markdown = summary.to_markdown();
 
@@ -2521,6 +3360,14 @@ pub async fn emit_daily_summary(
         "maker_sims_opened": summary.maker_sim.opened,
         "maker_sims_filled": summary.maker_sim.filled,
         "maker_sim_fill_rate_pct": summary.maker_sim.fill_rate_pct,
+        "rewards_net_per_day": summary.rewards.day.as_ref().map(|d| d.net),
+        "rewards_gross_paid_per_day": summary.rewards.day.as_ref().map(|d| d.gross_paid),
+        "rewards_mean_net_per_day": summary.rewards.mean_net_per_day,
+        "rewards_kill_line": summary.rewards.verdict.label(),
+        "nearres_resolutions": summary.nearres.resolutions,
+        "nearres_loss_rate": summary.nearres.loss_rate,
+        "nearres_annual_yield_pct": summary.nearres.annual_yield_pct,
+        "nearres_kill_line": summary.nearres.verdict.label(),
         "report_path": path.display().to_string(),
     });
     if send {
@@ -2536,6 +3383,67 @@ pub async fn emit_daily_summary(
         alerter.events().append("daily_summary", payload);
     }
     Ok(summary)
+}
+
+/// Build the R1 section's inputs: every closed epoch in the kill-line window.
+///
+/// The window starts `kill_line_window_days − 1` days before the reported day, so a report
+/// for day D covers D−13 … D at the shipped 14-day setting. Days with no closed epoch simply
+/// do not appear — they are missing measurements, not zero-earning days, and
+/// [`rewardsim::summarize_epochs`] keeps them out of the mean on purpose.
+fn rewards_summary(cfg: &Config, store: &Store, day: NaiveDate) -> Result<RewardsSummary> {
+    let span = i64::from(cfg.rewardsim.kill_line_window_days.max(1)).saturating_sub(1);
+    let from = day
+        .checked_sub_signed(chrono::Duration::days(span))
+        .unwrap_or(day);
+    let rows = store
+        .reward_epochs_since(from)
+        .context("could not read the reward epochs")?;
+    let window: Vec<ClosedEpochSummary> = rows
+        .into_iter()
+        // `reward_epochs_since` has no upper bound (there is nothing after today to read),
+        // but a report generated for a past date must not borrow evidence from its future.
+        .filter(|row| row.day <= day)
+        .map(|row| ClosedEpochSummary {
+            day: row.day,
+            capital: row.capital,
+            gross_usd: row.gross_usd,
+            gross_paid_usd: row.gross_paid_usd,
+            markout_short_usd: row.markout_short_usd,
+            net_usd: row.net_usd,
+            fills: row.fills,
+            no_print_feed: row.no_print_feed,
+        })
+        .collect();
+    Ok(rewardsim::summarize_epochs(
+        cfg.rewardsim.enabled,
+        day,
+        &window,
+        &cfg.rewardsim,
+    ))
+}
+
+/// Build the R2 section's inputs.
+///
+/// The study is cumulative rather than daily on purpose: a 1-in-40 loss rate needs every
+/// resolution the soak has ever seen, and slicing it by day would guarantee the sample is
+/// always too small to say anything.
+fn nearres_summary(cfg: &Config, store: &Store) -> Result<NearResSummary> {
+    let resolved = store
+        .nearres_resolved()
+        .context("could not read the near-resolution verdicts")?;
+    let qualified = store
+        .nearres_observation_count()
+        .context("could not count the near-resolution observations")?
+        .max(0) as usize;
+    let open = qualified.saturating_sub(resolved.len());
+    Ok(nearres::summarize(
+        cfg.nearres.enabled,
+        qualified,
+        open,
+        &resolved,
+        &cfg.nearres,
+    ))
 }
 
 fn write_report(dir: &str, day: NaiveDate, markdown: &str) -> Result<PathBuf> {
@@ -2590,11 +3498,13 @@ mod tests {
         let events = Arc::new(EventLog::open(Path::new(&cfg.storage.log_dir)).expect("log"));
         let alerter = Arc::new(Alerter::new(&cfg.alerts, events));
         let maker_sim = Arc::new(MakerSimulator::new(&cfg.maker_sim));
+        let rewardsim = Arc::new(RewardSimulator::new(&cfg.rewardsim));
         let hb = Arc::new(Heartbeat::new(
             Arc::new(cfg),
             store.clone(),
             alerter,
             maker_sim,
+            rewardsim,
             DaemonStatus {
                 started_at: Utc::now(),
                 rest_ok: true,
@@ -3162,6 +4072,143 @@ mod tests {
         assert!(blind
             .to_markdown()
             .contains("**1 sim(s) closed with no trade-print feed**"));
+    }
+
+    /// R1's section states the day's net, the running mean, and the kill-line verdict in the
+    /// words it was pre-committed in — including the case that matters most, an incomplete
+    /// window, which is neither a pass nor a fail.
+    #[test]
+    fn the_rewards_section_prints_net_the_running_mean_and_a_plain_kill_line() {
+        let cfg = crate::config::RewardSimConfig {
+            kill_line_window_days: 3,
+            ..crate::config::RewardSimConfig::default()
+        };
+        let epoch = |d: &str, net: Decimal, gross: Decimal| ClosedEpochSummary {
+            day: NaiveDate::parse_from_str(d, "%Y-%m-%d").expect("day"),
+            capital: dec!(1960),
+            gross_usd: gross + dec!(1),
+            gross_paid_usd: gross,
+            markout_short_usd: net - gross,
+            net_usd: net,
+            fills: 9,
+            no_print_feed: false,
+        };
+        let today = NaiveDate::parse_from_str("2026-09-03", "%Y-%m-%d").expect("day");
+
+        // A complete window, under the line: the report must say the strategy is dead in
+        // those words, not hedge it.
+        let mut s = summarize(today, &[], ScanTotals::default(), dec!(50));
+        s.day = today;
+        s.rewards = rewardsim::summarize_epochs(
+            true,
+            today,
+            &[
+                epoch("2026-09-01", dec!(0.10), dec!(3)),
+                epoch("2026-09-02", dec!(0.40), dec!(3)),
+                epoch("2026-09-03", dec!(0.70), dec!(4)),
+            ],
+            &cfg,
+        );
+        let md = s.to_markdown();
+        assert!(md.contains("## Rewards farming (simulated)"));
+        assert!(md.contains("**portfolio net: $0.70/day**"));
+        assert!(md.contains("gross **paid** (after the floor): $4.00"));
+        assert!(md.contains("gross (advertised pools, before the $1/day/market floor): $5.00"));
+        assert!(md.contains("**mean net $0.40/day**"));
+        assert!(md.contains("**KILL-LINE (2026-09-03): FAIL**"));
+        assert!(md.contains("**On the pre-committed rule this instrument is dead**"));
+        // The caveats that make the number worth reading travel with it.
+        assert!(md.contains("configured cap, not a payout"));
+        assert!(md.contains("1 440 samples whether or not we were up"));
+        assert!(md.contains("Net = gross paid + markout"));
+
+        // An incomplete window: no verdict, the running mean, and which way it points.
+        let mut s = summarize(today, &[], ScanTotals::default(), dec!(50));
+        s.day = today;
+        s.rewards = rewardsim::summarize_epochs(
+            true,
+            today,
+            &[epoch("2026-09-03", dec!(3.00), dec!(4))],
+            &cfg,
+        );
+        let md = s.to_markdown();
+        assert!(md.contains("**KILL-LINE (2026-09-03): NO VERDICT YET**"));
+        assert!(md.contains("Only 1 of 3 days are measured"));
+        assert!(md.contains("missing** day, not a zero day"));
+        assert!(md.contains("the window would pass"));
+
+        // A day whose epoch has not closed yet says so rather than printing zeros.
+        let mut s = summarize(today, &[], ScanTotals::default(), dec!(50));
+        s.day = today;
+        s.rewards = rewardsim::summarize_epochs(
+            true,
+            today,
+            &[epoch("2026-09-02", dec!(3.00), dec!(4))],
+            &cfg,
+        );
+        let md = s.to_markdown();
+        assert!(md.contains("no closed epoch for 2026-09-03"));
+        assert!(md.contains("the most recent closed epoch day is 2026-09-02"));
+
+        // Switched off: an absence of measurement, never a net of zero.
+        let mut s = summarize(today, &[], ScanTotals::default(), dec!(50));
+        s.rewards = rewardsim::summarize_epochs(false, today, &[], &cfg);
+        let md = s.to_markdown();
+        assert!(md.contains("**not measured**: `rewardsim.enabled = false`"));
+        assert!(!md.contains("portfolio net:"));
+    }
+
+    /// R2's section prints the count first, refuses a verdict on a small sample, and says why
+    /// in the report rather than leaving a reader to notice.
+    #[test]
+    fn the_near_resolution_section_refuses_a_verdict_on_a_small_sample() {
+        use crate::nearres::{ResolutionOutcome, ResolvedObservation};
+        let cfg = crate::config::NearResConfig {
+            min_resolutions_for_verdict: 40,
+            ..crate::config::NearResConfig::default()
+        };
+        let obs = |outcome: ResolutionOutcome| ResolvedObservation {
+            token_id: "t".into(),
+            event_slug: "e".into(),
+            category: "politics".into(),
+            ask: dec!(0.97),
+            fee_per_share: dec!(0.001164),
+            payout: match outcome {
+                ResolutionOutcome::Won => Some(Decimal::ONE),
+                ResolutionOutcome::Lost => Some(Decimal::ZERO),
+                _ => None,
+            },
+            outcome,
+            hours_to_payout: dec!(20),
+            disputed: false,
+        };
+
+        let mut s = summarize(day(), &[], ScanTotals::default(), dec!(50));
+        let rows: Vec<ResolvedObservation> = (0..5).map(|_| obs(ResolutionOutcome::Won)).collect();
+        s.nearres = nearres::summarize(true, 9, 4, &rows, &cfg);
+        let md = s.to_markdown();
+        assert!(md.contains("## Near-resolution observation"));
+        assert!(md.contains("still open: 4 · resolved: 5"));
+        assert!(md.contains("realised loss rate at executable prices: **0.00%** of 5"));
+        assert!(md.contains("95% Wilson interval"));
+        assert!(md.contains("**KILL-LINE"));
+        assert!(md.contains("NO VERDICT"));
+        assert!(md.contains("**5 resolution(s) is too small a sample"));
+        assert!(md.contains("Do not read the point estimate as the answer."));
+
+        // Nothing resolved: no rate, no yield, and no pretending otherwise.
+        let mut s = summarize(day(), &[], ScanTotals::default(), dec!(50));
+        s.nearres = nearres::summarize(true, 3, 3, &[], &cfg);
+        let md = s.to_markdown();
+        assert!(md.contains("nothing has resolved yet"));
+        assert!(!md.contains("realised loss rate"));
+
+        // Switched off.
+        let mut s = summarize(day(), &[], ScanTotals::default(), dec!(50));
+        s.nearres = nearres::summarize(false, 0, 0, &[], &cfg);
+        assert!(s
+            .to_markdown()
+            .contains("**not measured**: `nearres.enabled = false`"));
     }
 
     /// A category that saw nothing is still a finding. Crypto in particular must appear at

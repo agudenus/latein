@@ -297,7 +297,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
     (2, "detection latency", SCHEMA_V2),
     (3, "runtime status and funnel counters", SCHEMA_V3),
     (4, "maker fill simulations", SCHEMA_V4),
-    (5, "measurement phase R: rewards farming and near-resolution study", SCHEMA_V5),
+    (
+        5,
+        "measurement phase R: rewards farming and near-resolution study",
+        SCHEMA_V5,
+    ),
 ];
 
 /// The schema version the dashboard needs to read (`runtime_status` + funnel counters, and
@@ -309,6 +313,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
 pub const DASHBOARD_MIN_SCHEMA: i64 = 4;
 
 /// The newest migration this build ships. `schema_version()` reaches it after `open`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const CURRENT_SCHEMA: i64 = MIGRATIONS.len() as i64;
 
 // ---------------------------------------------------------------------------------
@@ -640,6 +645,20 @@ pub struct RuntimeStatus {
     /// Whether a trade-print feed is running at all. False in REST-only fallback, where no
     /// simulation can fill and every verdict is flagged `no_print_feed`.
     pub maker_sim_print_feed_live: bool,
+    /// R1 — the rewards simulator's live state. An in-flight epoch exists only in the
+    /// daemon's memory (only closed ones reach `reward_epochs`), so this is the only way a
+    /// reader sees the portfolio at all.
+    pub rewardsim_enabled: bool,
+    pub rewardsim_markets_quoted: u64,
+    /// Markets in the portfolio right now.
+    pub rewardsim_portfolio: i64,
+    pub rewardsim_samples_scored: u64,
+    /// Samples attempted that produced no score. A lost sample is a lost share of the day's
+    /// epoch, exactly as downtime is live — never quietly dropped from the average.
+    pub rewardsim_samples_lost: u64,
+    pub rewardsim_fills: u64,
+    pub rewardsim_epochs_closed: u64,
+    pub rewardsim_print_feed_live: bool,
     /// `scan.floors.default.taker` as an exact decimal string — the "net floor" the
     /// opportunity table's note quotes. A string, because it is money.
     pub net_floor_default_taker: String,
@@ -1165,9 +1184,12 @@ impl Store {
     }
 
     /// Closed reward epochs for one UTC day.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reward_epochs_for_day(&self, day: NaiveDate) -> Result<Vec<RewardEpochRow>> {
-        self.reward_epochs_where("day = ?1 ORDER BY net_usd DESC, condition_id ASC",
-            params![day.to_string()])
+        self.reward_epochs_where(
+            "day = ?1 ORDER BY net_usd DESC, condition_id ASC",
+            params![day.to_string()],
+        )
     }
 
     /// Closed reward epochs on or after `from`, oldest first — the kill-line's window.
@@ -1453,8 +1475,10 @@ impl Store {
     /// How many observations exist in total (the study's denominator of qualifications).
     pub fn nearres_observation_count(&self) -> Result<i64> {
         let conn = self.lock();
-        conn.query_row("SELECT COUNT(*) FROM nearres_observations", [], |r| r.get(0))
-            .map_err(|e| self.err(e))
+        conn.query_row("SELECT COUNT(*) FROM nearres_observations", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| self.err(e))
     }
 
     /// Fold one scan cycle into its UTC-hour bucket (low cardinality: 24 rows/day).
@@ -2162,10 +2186,12 @@ pub(crate) mod tests {
             .query_row("SELECT MAX(version) FROM migrations", [], |r| r.get(0))
             .expect("max");
         assert_eq!(latest, CURRENT_SCHEMA);
-        assert!(
-            CURRENT_SCHEMA >= DASHBOARD_MIN_SCHEMA,
-            "the dashboard's minimum can never exceed what the daemon migrates to"
-        );
+        const {
+            assert!(
+                CURRENT_SCHEMA >= DASHBOARD_MIN_SCHEMA,
+                "the dashboard's minimum can never exceed what the daemon migrates to"
+            )
+        };
         // v3's `runtime_status` is a single-row table by constraint, and the two funnel
         // counters default to 0 so an older bucket reads as "not measured", not as a zero
         // that means something.
@@ -2314,6 +2340,206 @@ pub(crate) mod tests {
             .maker_sims_for_day(opened.date_naive().succ_opt().unwrap())
             .expect("other day")
             .is_empty());
+    }
+
+    /// R1/R2 — migration v5 round-trips both instruments' rows with their money intact as
+    /// exact decimal strings, and refuses a second verdict for the same measurement.
+    #[test]
+    fn phase_r_rows_round_trip_and_a_second_verdict_is_refused() {
+        use crate::nearres::{Qualification, Resolution, ResolutionOutcome};
+        use crate::rewardsim::{ClosedEpoch, RewardParams, SimulatedFill};
+        use crate::types::TokenId;
+        use chrono::{Duration, TimeZone};
+
+        let store = Store::in_memory().expect("db");
+        store.migrate().expect("second migrate");
+        assert_eq!(store.schema_version().expect("version"), CURRENT_SCHEMA);
+
+        let opened = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let epoch = ClosedEpoch {
+            day: opened.date_naive(),
+            condition_id: "0xcond".into(),
+            event_slug: "an-event".into(),
+            question: "Q?".into(),
+            category: "politics".into(),
+            params: RewardParams {
+                max_spread_cents: d!(3.5),
+                min_size: d!(50),
+                pool_daily: d!(30),
+            },
+            s_cents: d!(1),
+            shares: d!(100),
+            capital: d!(98.00),
+            samples_scored: 1_400,
+            samples_expected: 1_440,
+            samples_lost: 40,
+            share_sum: d!(210.5),
+            our_score_sum: d!(78750),
+            competing_score_sum: d!(236250),
+            gross_usd: d!(4.3854),
+            gross_paid_usd: d!(4.3854),
+            fills: 12,
+            fill_shares: d!(640),
+            markout_short_usd: d!(-5.20),
+            markout_long_usd: d!(-9.75),
+            fills_marked_short: 12,
+            fills_marked_long: 11,
+            fills_pending: 1,
+            net_usd: d!(-0.8146),
+            no_print_feed: false,
+            opened_at: opened,
+            closed_at: opened + Duration::hours(24),
+        };
+        assert!(store.record_reward_epoch(&epoch).expect("insert"));
+        assert!(
+            !store.record_reward_epoch(&epoch).expect("second insert"),
+            "the (day, condition) unique index must refuse a second verdict for one epoch"
+        );
+
+        let rows = store
+            .reward_epochs_for_day(opened.date_naive())
+            .expect("read back");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.pool_daily, d!(30));
+        assert_eq!(row.capital, d!(98.00));
+        assert_eq!(row.samples_scored, 1_400);
+        assert_eq!(row.samples_lost, 40);
+        assert_eq!(row.gross_paid_usd, d!(4.3854));
+        assert_eq!(row.markout_short_usd, d!(-5.20));
+        assert_eq!(row.fills_pending, 1);
+        assert_eq!(row.net_usd, d!(-0.8146));
+        assert!(!row.no_print_feed);
+        // Money is TEXT, never REAL.
+        {
+            let conn = store.lock();
+            let kind: String = conn
+                .query_row("SELECT typeof(net_usd) FROM reward_epochs", [], |r| {
+                    r.get(0)
+                })
+                .expect("typeof");
+            assert_eq!(kind, "text");
+            let stored: String = conn
+                .query_row("SELECT markout_short_usd FROM reward_epochs", [], |r| {
+                    r.get(0)
+                })
+                .expect("raw");
+            assert_eq!(stored, "-5.20");
+        }
+        // A day the daemon never quoted has no row at all — a missing measurement, which is
+        // exactly what the report must not read as a zero-earning day.
+        assert!(store
+            .reward_epochs_for_day(opened.date_naive().succ_opt().unwrap())
+            .expect("other day")
+            .is_empty());
+
+        store
+            .record_reward_fill(
+                &SimulatedFill {
+                    condition_id: "0xcond".into(),
+                    token_id: TokenId::new("7001"),
+                    yes_side: true,
+                    price: d!(0.49),
+                    size: d!(100),
+                    mid_at_fill: d!(0.50),
+                    filled_at: opened + Duration::minutes(30),
+                    markout_short: Some(d!(-0.02)),
+                    markout_long: Some(d!(-0.04)),
+                },
+                opened + Duration::minutes(90),
+            )
+            .expect("insert fill");
+
+        // --- R2: two tables, because a qualification and a verdict are two facts ---------
+        let qualification = Qualification {
+            token_id: TokenId::new("9001"),
+            condition_id: "0xnear".into(),
+            event_slug: "near-event".into(),
+            question: "Will it?".into(),
+            outcome: "Yes".into(),
+            outcome_index: 0,
+            category: "politics".into(),
+            ask: d!(0.97),
+            ask_size: d!(300),
+            ask_depth: d!(500),
+            best_bid: Some(d!(0.96)),
+            fee_rate: d!(0.04),
+            fee_per_share: d!(0.001164),
+            end_date: opened + Duration::hours(20),
+            hours_to_resolution: d!(20),
+            qualified_at: opened,
+        };
+        assert!(store
+            .record_nearres_observation(&qualification)
+            .expect("insert"));
+        assert!(
+            !store
+                .record_nearres_observation(&qualification)
+                .expect("second insert"),
+            "a market qualifies once, at the first moment its ask was in band"
+        );
+        assert_eq!(store.nearres_observation_count().expect("count"), 1);
+
+        let open = store.nearres_open_observations().expect("open");
+        assert_eq!(
+            open.len(),
+            1,
+            "unresolved observations must survive a restart"
+        );
+        assert_eq!(open[0], qualification, "…with their entry prices unchanged");
+        assert!(store.nearres_resolved().expect("resolved").is_empty());
+
+        let resolution = Resolution {
+            token_id: TokenId::new("9001"),
+            condition_id: "0xnear".into(),
+            outcome: ResolutionOutcome::Won,
+            payout: Some(Decimal::ONE),
+            hours_to_payout: d!(21.5),
+            uma_status: Some("resolved".into()),
+            disputed: false,
+            resolved_at: opened + Duration::hours(22),
+        };
+        assert!(store
+            .record_nearres_resolution(&resolution)
+            .expect("insert"));
+        assert!(
+            !store
+                .record_nearres_resolution(&resolution)
+                .expect("second insert"),
+            "a verdict is written once and never revised"
+        );
+        assert!(store.nearres_open_observations().expect("open").is_empty());
+        let resolved = store.nearres_resolved().expect("resolved");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].ask, d!(0.97));
+        assert_eq!(resolved[0].outcome, ResolutionOutcome::Won);
+        assert_eq!(resolved[0].payout, Some(Decimal::ONE));
+        assert_eq!(resolved[0].hours_to_payout, d!(21.5));
+        assert_eq!(resolved[0].fee_per_share, d!(0.001164));
+
+        // An undetermined verdict stores a NULL payout: "we could not see it" and "it paid
+        // zero" are different facts, and the loss rate depends on the difference.
+        let unknown = Resolution {
+            token_id: TokenId::new("9002"),
+            payout: None,
+            outcome: ResolutionOutcome::Undetermined,
+            ..resolution
+        };
+        store
+            .record_nearres_observation(&Qualification {
+                token_id: TokenId::new("9002"),
+                ..qualification
+            })
+            .expect("insert");
+        store.record_nearres_resolution(&unknown).expect("insert");
+        let resolved = store.nearres_resolved().expect("resolved");
+        assert_eq!(resolved.len(), 2);
+        let hole = resolved
+            .iter()
+            .find(|r| r.token_id == "9002")
+            .expect("the undetermined row");
+        assert_eq!(hole.payout, None);
+        assert_eq!(hole.outcome, ResolutionOutcome::Undetermined);
     }
 
     /// A v1 database (no latency column) must migrate in place, keeping its rows.

@@ -329,10 +329,12 @@ impl PrintFanout {
         Self { observers }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.observers.len()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.observers.is_empty()
     }
@@ -2362,6 +2364,50 @@ mod tests {
             store.apply_frame(&frame, now);
         }
         assert_eq!(spy.0.lock().unwrap().len(), 2);
+    }
+
+    /// R1 — the fanout: two measurements, one hook, and **every** observer sees every print.
+    ///
+    /// The store holds a single observer slot by design. Since Measurement Phase R two
+    /// different questions are asked of the same tape (M8's queue rule and R1's in-band
+    /// crossing), and an observer silently dropped here would turn one of them into a hole
+    /// with nothing to say so.
+    #[test]
+    fn the_print_fanout_delivers_every_print_to_every_observer() {
+        #[derive(Default)]
+        struct Spy(Mutex<usize>);
+        impl PrintObserver for Spy {
+            fn observe(&self, _print: &TradePrint, _received: Instant) {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+
+        let first = Arc::new(Spy::default());
+        let second = Arc::new(Spy::default());
+        let fanout = Arc::new(PrintFanout::new(vec![first.clone(), second.clone()]));
+        assert_eq!(fanout.len(), 2);
+        assert!(!fanout.is_empty());
+        assert!(PrintFanout::new(Vec::new()).is_empty());
+
+        let store = BookStore::new();
+        store.set_print_observer(Some(fanout));
+        let now = Instant::now();
+        for frame in frames_of(LIVE_TRADE_PRINT) {
+            store.apply_frame(&frame, now);
+        }
+        assert_eq!(*first.0.lock().unwrap(), 1);
+        assert_eq!(
+            *second.0.lock().unwrap(),
+            1,
+            "a second observer must not be starved by the first"
+        );
+
+        // …and again, so a fanout that consumed its observers on first use would show up.
+        for frame in frames_of(LIVE_TRADE_PRINT) {
+            store.apply_frame(&frame, now);
+        }
+        assert_eq!(*first.0.lock().unwrap(), 2);
+        assert_eq!(*second.0.lock().unwrap(), 2);
     }
 
     /// The cross-check earns its keep only if it can fire. It counts and stops there — the

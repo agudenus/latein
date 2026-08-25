@@ -400,7 +400,10 @@ pub struct MarketTrading {
 
 impl MarketTrading {
     /// True when this market advertises a reward pool *and* both qualification parameters,
-    /// which is the minimum needed to score a quote at all.
+    /// which is the minimum needed to score a quote at all. The candidate builder in
+    /// `dryrun` applies the same three tests through `reward_params`, which additionally
+    /// converts them; this is the readable form of the predicate.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reward_eligible(&self) -> bool {
         self.rewards_daily_rate.is_some_and(|r| r > Decimal::ZERO)
             && self.rewards_max_spread.is_some_and(|v| v > Decimal::ZERO)
@@ -817,6 +820,45 @@ mod tests {
         };
         assert_eq!(m.yes_token().as_str(), "b");
         assert_eq!(m.no_token().as_str(), "a");
+    }
+
+    /// R1 — reward eligibility needs all three parameters, and each one absent means "the
+    /// API said nothing", never a zero or a default.
+    #[test]
+    fn reward_eligibility_needs_a_pool_a_band_and_a_minimum_size() {
+        let full = MarketTrading {
+            rewards_min_size: Some(dec!(50)),
+            rewards_max_spread: Some(dec!(3.5)),
+            rewards_daily_rate: Some(dec!(30)),
+            ..MarketTrading::default()
+        };
+        assert!(full.reward_eligible());
+
+        for missing in [
+            MarketTrading {
+                rewards_daily_rate: None,
+                ..full.clone()
+            },
+            MarketTrading {
+                rewards_max_spread: None,
+                ..full.clone()
+            },
+            MarketTrading {
+                rewards_min_size: None,
+                ..full.clone()
+            },
+            // A market listed as reward-eligible with an unfunded pool pays nothing.
+            MarketTrading {
+                rewards_daily_rate: Some(Decimal::ZERO),
+                ..full.clone()
+            },
+        ] {
+            assert!(
+                !missing.reward_eligible(),
+                "{missing:?} must not be eligible"
+            );
+        }
+        assert!(!MarketTrading::default().reward_eligible());
     }
 
     /// The precedence rules for the API-provided fee data, one case each. These decide

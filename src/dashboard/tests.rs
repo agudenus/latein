@@ -82,6 +82,15 @@ fn healthy_status() -> RuntimeStatus {
         maker_sims_untracked: 0,
         maker_sim_prints_matched: 219,
         maker_sim_print_feed_live: true,
+        // Measurement Phase R: present in the row, read by nothing on this page yet.
+        rewardsim_enabled: true,
+        rewardsim_markets_quoted: 6,
+        rewardsim_portfolio: 4,
+        rewardsim_samples_scored: 2_880,
+        rewardsim_samples_lost: 12,
+        rewardsim_fills: 37,
+        rewardsim_epochs_closed: 8,
+        rewardsim_print_feed_live: true,
         net_floor_default_taker: "0.005".into(),
     }
 }

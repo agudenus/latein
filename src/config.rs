@@ -1796,7 +1796,10 @@ mod tests {
 
         let mut cfg = base.clone();
         cfg.rewardsim.quote_spread_cents = Decimal::ZERO;
-        assert!(cfg.validate().is_err(), "quoting at the midpoint is not a quote");
+        assert!(
+            cfg.validate().is_err(),
+            "quoting at the midpoint is not a quote"
+        );
 
         let mut cfg = base.clone();
         cfg.rewardsim.markout_short_secs = cfg.rewardsim.markout_long_secs;
@@ -1807,7 +1810,10 @@ mod tests {
 
         let mut cfg = base.clone();
         cfg.nearres.min_ask = dec!(0.995);
-        assert!(cfg.validate().is_err(), "min_ask above max_ask is not a band");
+        assert!(
+            cfg.validate().is_err(),
+            "min_ask above max_ask is not a band"
+        );
 
         let mut cfg = base.clone();
         cfg.nearres.min_resolutions_for_verdict = 0;
@@ -1822,7 +1828,8 @@ mod tests {
         cfg.rewardsim.quote_spread_cents = Decimal::ZERO;
         cfg.nearres.enabled = false;
         cfg.nearres.min_resolutions_for_verdict = 0;
-        cfg.validate().expect("a disabled instrument needs no knobs");
+        cfg.validate()
+            .expect("a disabled instrument needs no knobs");
     }
 
     /// The four M6.1 knobs, each one the fix for something a live overnight run did wrong.

@@ -302,10 +302,6 @@ pub struct RawMarket {
     /// "undisputed".
     #[serde(default, rename = "umaResolutionStatus")]
     pub uma_resolution_status: Option<String>,
-    /// `hasReviewedDates` / `resolvedBy` and friends vary by payload; `resolvedBy` is the
-    /// one consistently present, and it is captured for the record only.
-    #[serde(default, rename = "resolvedBy")]
-    pub resolved_by: Option<String>,
 
     // ---- activity figures (M6.4) -------------------------------------------------
     // Present on live Gamma market objects in several spellings, and *all* optional: the
@@ -339,9 +335,9 @@ pub struct RawMarket {
 
 /// One entry of `clobRewards[]`: `{"rewardsDailyRate": 30, "startDate": …, "endDate": …}`.
 ///
-/// Only the rate is read. The dates are captured because a configured pool can expire
-/// mid-week (`rewards_config` carries `start_date`/`end_date`), which is one of the ways a
-/// portfolio chosen this morning is worth nothing this evening.
+/// Only the rate is read, and it is read fresh on every daily re-selection — which is how a
+/// configured pool that expires mid-week (the config carries start/end dates we do not keep)
+/// stops being counted: the market simply drops out of tomorrow's candidate set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawClobReward {
     #[serde(
@@ -350,10 +346,6 @@ pub struct RawClobReward {
         deserialize_with = "de_opt_decimal"
     )]
     pub rewards_daily_rate: Option<rust_decimal::Decimal>,
-    #[serde(default, rename = "startDate")]
-    pub start_date: Option<String>,
-    #[serde(default, rename = "endDate")]
-    pub end_date: Option<String>,
 }
 
 /// `{"exponent": 1, "rate": 0.04, "takerOnly": true, "rebateRate": 0.25}`.
@@ -653,7 +645,9 @@ fn rewards_daily_rate(m: &RawMarket) -> Option<rust_decimal::Decimal> {
     let rates = m.clob_rewards.as_ref()?;
     let mut total = None;
     for entry in rates {
-        if let Some(rate) = entry.rewards_daily_rate.filter(|r| *r >= rust_decimal::Decimal::ZERO)
+        if let Some(rate) = entry
+            .rewards_daily_rate
+            .filter(|r| *r >= rust_decimal::Decimal::ZERO)
         {
             total = Some(total.unwrap_or(rust_decimal::Decimal::ZERO) + rate);
         }
