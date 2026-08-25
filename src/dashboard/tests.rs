@@ -769,6 +769,17 @@ async fn the_maker_lower_bound_travels_as_a_string_and_is_labelled_apart() {
     assert_eq!(sims["value"], "6 open · fill rate 50%");
     assert_eq!(sims["dot"], "ok");
 
+    // R1's rail row: the portfolio and its sampling, from `runtime_status` — the only place
+    // an in-flight epoch exists at all.
+    let rewards = json["pipeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Rewards sim")
+        .expect("the rail names the rewards simulator");
+    assert_eq!(rewards["value"], "4 market(s) · 2,880 samples · 37 fills");
+    assert_eq!(rewards["dot"], "ok");
+
     let (_, html) = get(app, "/").await;
     assert!(html.contains("Simulated maker P&amp;L"));
     assert!(

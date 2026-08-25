@@ -799,6 +799,38 @@ fn pipeline(
         }
     });
 
+    // R1. Same shape and same reasoning as the maker-sim row: an in-flight epoch exists only
+    // in the daemon's memory, so the portfolio count comes from `runtime_status`. The `warn`
+    // dot means quotes are being scored while no print feed is running — the gross side of
+    // the ledger is accumulating and the markout side is a hole, which is exactly the
+    // situation the daily report has to flag.
+    //
+    // R2 is deliberately absent from this page: its numbers are cumulative over the whole
+    // study and answering them costs a query per poll, which is not what a 3-second refresh
+    // is for. The daily report is where the near-resolution study is read.
+    rows.push(if s.rewardsim_enabled {
+        PipelineRow {
+            dot: if s.rewardsim_portfolio > 0 && !s.rewardsim_print_feed_live {
+                "warn"
+            } else {
+                "ok"
+            },
+            name: "Rewards sim",
+            value: format!(
+                "{} market(s) · {} samples · {} fills",
+                thousands(s.rewardsim_portfolio),
+                thousands(s.rewardsim_samples_scored as i64),
+                thousands(s.rewardsim_fills as i64),
+            ),
+        }
+    } else {
+        PipelineRow {
+            dot: "warn",
+            name: "Rewards sim",
+            value: "disabled in config".into(),
+        }
+    });
+
     rows.push(PipelineRow {
         dot: "ok",
         name: "Store",
