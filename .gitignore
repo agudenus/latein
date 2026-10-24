@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .venv/
 .env
+data/atlas/
+data/matchups.csv
+data/era_leak_rows.csv

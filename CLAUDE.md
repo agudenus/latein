@@ -9,6 +9,15 @@ Project owner: **Alex**, plays **Kingdom 377**, which sits in group **K236 to K4
 Context handed over from a Claude (Cowork) session on 2026-09-19. Everything below
 is established, not speculation, unless explicitly flagged.
 
+> **UPDATE 2026-10-24, read first.** The ks-atlas KvK 1 to 19 history arrived
+> and overturns parts of sections 1, 3 and 4. See `docs/ATLAS_FINDINGS_OCT2026.md`.
+> In short: published groups are the smallest **unit**, not the pool. Each KvK
+> pools a unit with a changing set of adjacent units, so which units combine is
+> the new open problem. Inside a pool, pairing is near uniform by cohort and
+> weakly sorted by battle record (r = +0.34). The rematch gap is at least 3 KvKs,
+> confirmed. The optimizer opponent lists show the **first 10 KvKs**. They were
+> never frozen at KvK 16. The Atlas raw data is gitignored because the repo is public.
+
 ---
 
 ## 1. The model as it currently stands
@@ -297,6 +306,13 @@ scripts/analyze_groups.py     leak rate analysis, reproduces the §3 tables
 web/predictor.html            published artifact source, data already inlined
 web/predictor_tpl.html        template with /*DATA*/ marker
 docs/WHAT_CHANGED_SEP2026.md  the September update write up
+docs/ATLAS_FINDINGS_OCT2026.md Atlas data findings, supersedes parts of 1, 3, 4
+data/atlas/                   raw Atlas export, GITIGNORED (admin data, public repo)
+data/matchups.csv             normalised matchups, GITIGNORED
+data/pools_by_kvk.json        real pools per KvK derived from matchups
+scripts/ingest_atlas.py       raw export -> data/matchups.csv
+scripts/era_leak.py, derive_pools.py, pool_tests.py, backtest_record.py
+predictions/                  pre-registered predictions and scoring
 ```
 
 Run the analysis with `python3 scripts/analyze_groups.py` from the project root.
