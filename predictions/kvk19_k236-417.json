@@ -1,0 +1,43 @@
+{
+  "registered": "2026-09-26",
+  "kvk": 19,
+  "matchmaking": "2026-10-10",
+  "group": [
+    236,
+    417
+  ],
+  "group_size": 182,
+  "k377": {
+    "P_opponent_inside_group": ">= 0.95",
+    "candidates_before_cooldown": 181,
+    "candidates_after_cooldown": 178,
+    "P_each_candidate_uniform": 0.00562,
+    "P_opponent_in_other_block": {
+      "block": [
+        236,
+        309
+      ],
+      "uniform_null": 0.416,
+      "note": "if pairing is uniform inside the group. Well below this means Stage 2 keeps some block or power locality."
+    },
+    "known_past_opponents_in_group": [
+      348,
+      356,
+      368,
+      373,
+      375,
+      395,
+      407,
+      412
+    ],
+    "cooldown_exclusions": "KvK 16, 17, 18 opponents, to be supplied by Alex"
+  },
+  "group_wide": {
+    "expected_pairings": 91,
+    "leak_outside_group_max": 1,
+    "cross_block_share_uniform_null": 0.485,
+    "rematches_within_cooldown": 0,
+    "byes_expected": 0,
+    "needs": "full KvK 19 pairings, from the Atlas data or the optimizer once its opponent lists unfreeze"
+  }
+}

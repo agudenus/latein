@@ -1,17 +1,7 @@
-# Rust
-/target/
-
-# Secrets — never commit credentials (see CLAUDE.md security rules)
+__pycache__/
+*.pyc
+.venv/
 .env
-.env.*
-!.env.example
-
-# Runtime data
-/data/
-*.sqlite
-*.sqlite-wal
-*.sqlite-shm
-*.sqlite3
-*.db
-/reports/
-/logs/
+data/atlas/
+data/matchups.csv
+data/era_leak_rows.csv
